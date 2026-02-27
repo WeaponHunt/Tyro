@@ -1,0 +1,7 @@
+# Memory database
+talkrobot/mem_db/
+talkrobot/logs/
+talkrobot/__pycache__/
+talkrobot/**/__pycache__/
+.DS_Store
+*.pyc
