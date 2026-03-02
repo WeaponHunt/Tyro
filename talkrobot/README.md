@@ -4,8 +4,8 @@
 
 ## 功能特性
 
-- 🎤 **语音输入**: 按住Q键录音,松开结束
-- 🔊 **语音输出**: 自动将回复转为语音播放
+- 🎤 **语音输入**: 支持按键模式（按住Q键录音）和持续监听模式（自动检测语音）
+- 🔊 **语音输出**: 自动将回复转为语音播放（可通过 `--no-tts` 关闭）
 - 🧠 **智能对话**: 基于Qwen大模型的自然对话
 - 💾 **长期记忆**: 自动记录对话历史并智能检索
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
@@ -35,7 +35,7 @@ talkrobot/
 ## 安装依赖
 
 ```bash
-pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile
+pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
 ```
 
 ## 使用方法
@@ -45,13 +45,23 @@ pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile
 ```bash
 cd /home/acir/Tyro
 
-# 使用默认用户启动
+# 使用默认用户启动（默认按键模式）
 python -m talkrobot.main
 
 # 指定用户启动
 python -m talkrobot.main --user ljc
 # 或
 python -m talkrobot.main chat --user ljc
+
+# 关闭TTS语音播放（仅显示文字回复）
+python -m talkrobot.main --user ljc --no-tts
+python -m talkrobot.main chat --user ljc --no-tts
+
+# 使用持续监听模式（无需按键，直接说话即可）
+python -m talkrobot.main --user ljc --listen-mode continuous
+
+# 使用按键模式（按住Q键说话，默认行为）
+python -m talkrobot.main --user ljc --listen-mode push
 ```
 
 ### 2. 手动添加记忆
@@ -88,14 +98,31 @@ python -m talkrobot.tests.test_memory
 - `TTS_VOICE`: TTS音色选择
 - `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
+- `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
+- `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
+- `VAD_SILENCE_DURATION`: 静默多久判定说话结束（秒）
+- `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
 
 ## 操作说明
+
+### 按键模式 (`--listen-mode push`，默认)
 
 1. 启动程序后,等待所有模块初始化完成
 2. 按住 `Q` 键开始说话
 3. 松开 `Q` 键结束录音
 4. 系统自动识别、生成回复并播放语音
 5. 按 `Ctrl+C` 退出程序
+
+### 持续监听模式 (`--listen-mode continuous`)
+
+1. 启动程序后,等待所有模块初始化完成
+2. 直接对麦克风说话，系统通过 Silero VAD 自动检测语音
+3. 停顿超过设定时间（默认1.5秒）后视为说话结束
+4. 系统自动识别、生成回复并播放语音
+5. **机器人说话时会自动屏蔽麦克风**，避免机器人听到自己的回复
+6. 按 `Ctrl+C` 退出程序
+
+> **提示**: 持续监听模式使用 [Silero VAD](https://github.com/snakers4/silero-vad) 进行语音检测，相关参数可在 `config.py` 中调整。
 
 ## 模块说明
 

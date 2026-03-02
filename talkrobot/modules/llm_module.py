@@ -8,7 +8,7 @@ from loguru import logger
 class LLMModule:
     """大语言模型模块"""
     
-    def __init__(self, api_key: str, base_url: str, model: str, system_prompt: str):
+    def __init__(self, api_key: str, base_url: str, model: str, system_prompt: str, expression_prompt: str = ""):
         """
         初始化LLM模块
         
@@ -17,11 +17,12 @@ class LLMModule:
             base_url: API地址
             model: 模型名称
             system_prompt: 系统提示词
+            expression_prompt: 表情指令提示词（追加到 system_prompt 后）
         """
         logger.info(f"正在初始化LLM模块: model={model}")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
-        self.system_prompt = system_prompt
+        self.system_prompt = system_prompt + expression_prompt
         logger.info("LLM模块初始化完成")
     
     def generate_response(self, user_input: str, context: str = "") -> str:

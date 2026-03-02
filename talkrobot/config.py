@@ -11,6 +11,18 @@ class Config:
     SAMPLE_RATE = 16000
     CHANNELS = 1
     
+    # 监听模式: "push"=按住Q键说话, "continuous"=持续监听
+    DEFAULT_LISTEN_MODE = "push"
+    
+    # 持续监听模式 VAD 配置 (Silero VAD)
+    VAD_CHECK_INTERVAL = 0.25        # VAD 检测间隔（秒），每隔此时间检测一次语音
+    VAD_SILENCE_DURATION = 1      # 静默多少秒后判定说话结束
+    VAD_MIN_SPEECH_DURATION = 0.3    # 最短语音时长（秒），过短的丢弃
+    
+    # 音频过滤配置（ASR 前置检查）
+    AUDIO_MIN_DURATION = 0.5          # 最短音频时长（秒），低于此值不送 ASR
+    AUDIO_MIN_RMS = 0                 # 最低音量 (RMS)，低于此值视为静音
+    
     # ASR 配置
     ASR_MODEL = "iic/SenseVoiceSmall"
     ASR_DEVICE = "cuda"  # 或 "cpu"
@@ -22,10 +34,15 @@ class Config:
     TTS_SAMPLE_RATE = 24000
     
     # LLM 配置
-    LLM_API_KEY = "sk-9d42be35fbba4ef8ab8d217c2a613869"
+    LLM_API_KEY = "put your api key here"
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_MODEL = "qwen-plus"
     
+    # 表情服务器配置
+    EXPRESSION_SERVER_URL = "http://localhost:8001"
+    EXPRESSION_DEFAULT = "neutral"
+    EXPRESSION_ENABLED = True  # 是否启用表情功能
+
     # Memory 基础数据库路径
     MEMORY_DB_BASE_PATH = os.path.join(os.path.dirname(__file__), "mem_db")
     
@@ -33,7 +50,7 @@ class Config:
     DEFAULT_USER = "default"
     
     # 系统提示词
-    SYSTEM_PROMPT = "你名叫Tyro,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题。"
+    SYSTEM_PROMPT = "你名叫Tyro,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题,请尽量不要生成英文。"
     
     @classmethod
     def get_user_id(cls, user: str) -> str:
