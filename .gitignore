@@ -3,5 +3,7 @@ talkrobot/mem_db/
 talkrobot/logs/
 talkrobot/__pycache__/
 talkrobot/**/__pycache__/
+expression_video/*.mp4
+note.txt
 .DS_Store
 *.pyc
