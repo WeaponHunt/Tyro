@@ -2,6 +2,8 @@
 语音合成(TTS)模块
 负责将文本转换为语音
 """
+import threading
+
 from kokoro import KPipeline
 import sounddevice as sd
 import numpy as np
@@ -23,7 +25,16 @@ class TTSModule:
         self.pipeline = KPipeline(lang_code=lang_code)
         self.voice = voice
         self.speed = speed
+        self._interrupted = threading.Event()
         logger.info("TTS模块初始化完成")
+    
+    def stop(self):
+        """打断当前TTS播放"""
+        self._interrupted.set()
+        try:
+            sd.stop()
+        except Exception as e:
+            logger.debug(f"TTS stop 调用 sd.stop 异常(可忽略): {e}")
     
     def synthesize(self, text: str, play_audio: bool = True) -> list:
         """
@@ -38,20 +49,60 @@ class TTSModule:
         """
         try:
             logger.info(f"正在合成语音: {text}")
+            self._interrupted.clear()
+            
             generator = self.pipeline(text, voice=self.voice, speed=self.speed)
             
             audio_chunks = []
-            for i, (gs, ps, audio) in enumerate(generator):
-                audio_chunks.append(audio)
-                
-                # 实时播放
-                if play_audio:
-                    sd.play(audio, 24000)
-                    sd.wait()
+            try:
+                for i, (gs, ps, audio) in enumerate(generator):
+                    # 每个循环开头检查是否被打断
+                    if self._interrupted.is_set():
+                        logger.info("TTS播放被打断，停止合成（生成前）")
+                        break
                     
-                logger.debug(f"第 {i} 段合成完成")
+                    audio_chunks.append(audio)
+                    
+                    # 实时播放
+                    if play_audio:
+                        logger.debug(f"播放第{i}段音频，长度{len(audio)}")
+                        sd.play(audio, 24000, blocking=False)
+                        
+                        # 使用轮询等待播放完成，每 10ms 检查一次是否被中断
+                        total_samples = len(audio)
+                        played_samples = 0
+                        while played_samples < total_samples:
+                            if self._interrupted.is_set():
+                                logger.info("TTS播放被打断，停止播放（播放中）")
+                                sd.stop()
+                                break
+                            
+                            stream = sd.get_stream()
+                            if stream is None or not stream.active:
+                                logger.debug(f"第{i}段播放完成")
+                                break
+                            
+                            # 估算已播放的样本数
+                            try:
+                                played_samples = int(stream.latency[1] * 24000)
+                            except:
+                                pass
+                            
+                            sd.sleep(10)
+                        
+                        # 播放完成后再检查一次
+                        if self._interrupted.is_set():
+                            logger.info("TTS播放被打断，停止合成（播放后）")
+                            break
+                    
+                    logger.debug(f"第 {i} 段完成")
+            except GeneratorExit:
+                logger.debug("生成器已关闭")
             
-            logger.info("语音合成完成")
+            if self._interrupted.is_set():
+                logger.info("语音合成被用户打断")
+            else:
+                logger.info("语音合成完成")
             return audio_chunks
             
         except Exception as e:

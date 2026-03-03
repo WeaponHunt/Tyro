@@ -16,7 +16,6 @@ AVAILABLE_EXPRESSIONS = [
     "scared",      # 害怕
     "surprised",   # 惊讶
     "more-happy",  # 非常开心
-    "neutral",     # 平静/中性
     "dizzy",       # 头晕/困惑
     "evil_smile",  # 坏笑
     "nauty_smile", # 调皮笑

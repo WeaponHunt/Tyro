@@ -59,13 +59,14 @@ def _stop_expression_server():
 
 def _setup_logger():
     """配置日志"""
+    level = "DEBUG" if Config.DEBUG else "INFO"
     logger.remove()
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level:8}</level> | <level>{message}</level>",
-        level="INFO"
+        level=level
     )
-    logger.add("talkrobot/logs/robot_{time}.log", rotation="1 day", retention="7 days")
+    logger.add("talkrobot/logs/robot_{time}.log", rotation="1 day", retention="7 days", level=level)
 
 
 def run_chat(args):
@@ -77,6 +78,10 @@ def run_chat(args):
     from talkrobot.core.conversation_manager import ConversationManager
 
     user = args.user
+    memory_module = None
+    tts_module = None
+    audio_recorder = None
+    conversation_manager = None
 
     try:
         _setup_logger()
@@ -134,6 +139,7 @@ def run_chat(args):
             channels=Config.CHANNELS,
             listen_mode=listen_mode,
             vad_check_interval=Config.VAD_CHECK_INTERVAL,
+            pre_speech_duration=Config.VAD_PRE_SPEECH_DURATION,
             silence_duration=Config.VAD_SILENCE_DURATION,
             min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
         )
@@ -162,16 +168,52 @@ def run_chat(args):
     except KeyboardInterrupt:
         print("\n\n👋 程序已退出,再见!")
         logger.info("用户主动退出程序")
-        # 等待所有内存任务完成
-        if 'memory_module' in locals():
-            memory_module.shutdown()
-        _stop_expression_server()
+        
+        # Debug模式：打印所有线程堆栈
+        if Config.DEBUG:
+            import threading
+            import traceback
+            print("\n" + "="*60)
+            print("🐛 DEBUG模式 - 线程堆栈信息:")
+            print("="*60)
+            for thread in threading.enumerate():
+                print(f"\n线程: {thread.name} (ID: {thread.ident}, Alive: {thread.is_alive()})")
+                if thread.ident:
+                    frame = sys._current_frames().get(thread.ident)
+                    if frame:
+                        print("堆栈:")
+                        traceback.print_stack(frame)
+            print("="*60 + "\n")
+        
     except Exception as e:
         logger.error(f"程序运行出错: {e}", exc_info=True)
         print(f"\n❌ 程序出错: {e}")
-        # 异常发生时也要关闭线程池
-        if 'memory_module' in locals():
-            memory_module.shutdown()
+    finally:
+        # 统一收尾：先停播放，再停录音，再等待处理线程，最后关闭外部资源
+        if tts_module is not None:
+            try:
+                tts_module.stop()
+            except Exception as e:
+                logger.warning(f"停止TTS异常: {e}")
+
+        if audio_recorder is not None:
+            try:
+                audio_recorder.stop()
+            except Exception as e:
+                logger.warning(f"停止录音器异常: {e}")
+
+        if conversation_manager is not None:
+            try:
+                conversation_manager.shutdown(timeout=5.0)
+            except Exception as e:
+                logger.warning(f"关闭对话管理器异常: {e}")
+
+        if memory_module is not None:
+            try:
+                memory_module.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭记忆模块异常: {e}")
+
         _stop_expression_server()
 
 
@@ -234,6 +276,10 @@ def main():
         default=Config.DEFAULT_LISTEN_MODE,
         help="监听模式: push=按住Q键说话, continuous=持续监听 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
     )
+    chat_parser.add_argument(
+        "--debug", action="store_true", default=False,
+        help="启用调试模式，输出详细日志，Ctrl+C时显示线程堆栈"
+    )
 
     # 子命令: add-memory
     mem_parser = subparsers.add_parser("add-memory", help="手动为指定用户添加记忆")
@@ -260,8 +306,15 @@ def main():
         default=None,
         help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听"
     )
+    parser.add_argument(
+        "--debug", action="store_true", default=False,
+        help="(兼容旧版) 启用调试模式"
+    )
 
     args = parser.parse_args()
+    
+    # 设置全局DEBUG标志
+    Config.DEBUG = getattr(args, 'debug', False)
 
     if args.command == "add-memory":
         run_add_memory(args)
