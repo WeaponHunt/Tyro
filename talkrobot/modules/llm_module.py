@@ -2,6 +2,8 @@
 大语言模型(LLM)模块
 负责生成对话回复
 """
+from typing import Iterator, List, Dict
+
 from openai import OpenAI
 from loguru import logger
 
@@ -24,6 +26,21 @@ class LLMModule:
         self.model = model
         self.system_prompt = system_prompt + expression_prompt
         logger.info("LLM模块初始化完成")
+
+    def _build_messages(self, user_input: str, context: str = "") -> List[Dict[str, str]]:
+        """构建发送给大模型的消息列表。"""
+        messages = [
+            {"role": "system", "content": self.system_prompt}
+        ]
+
+        if context:
+            messages.append({
+                "role": "system",
+                "content": f"关于用户的相关背景信息:\n{context}"
+            })
+
+        messages.append({"role": "user", "content": user_input})
+        return messages
     
     def generate_response(self, user_input: str, context: str = "") -> str:
         """
@@ -37,19 +54,7 @@ class LLMModule:
             str: AI回复
         """
         try:
-            messages = [
-                {"role": "system", "content": self.system_prompt}
-            ]
-            
-            # 添加上下文
-            if context:
-                messages.append({
-                    "role": "system", 
-                    "content": f"相关背景信息:\n{context}"
-                })
-            
-            # 添加用户输入
-            messages.append({"role": "user", "content": user_input})
+            messages = self._build_messages(user_input, context)
             
             logger.info(f"正在生成回复,用户输入: {user_input}")
             
@@ -65,3 +70,39 @@ class LLMModule:
         except Exception as e:
             logger.error(f"LLM生成回复出错: {e}")
             return "抱歉,我现在无法回答您的问题。"
+
+    def generate_response_stream(self, user_input: str, context: str = "") -> Iterator[str]:
+        """
+        流式生成对话回复（按增量文本逐段返回）
+
+        Args:
+            user_input: 用户输入
+            context: 上下文信息(来自记忆)
+
+        Yields:
+            str: 流式增量文本片段
+        """
+        try:
+            messages = self._build_messages(user_input, context)
+            logger.info(f"正在流式生成回复,用户输入: {user_input}")
+
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True}
+            )
+
+            for chunk in completion:
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+
+            logger.info("流式回复生成完成")
+
+        except Exception as e:
+            logger.error(f"LLM流式生成回复出错: {e}")
+            yield "抱歉,我现在无法回答您的问题。"

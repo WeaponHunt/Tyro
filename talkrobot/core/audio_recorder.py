@@ -401,6 +401,8 @@ class AudioRecorder:
         else:
             print("📌 操作说明 [持续监听模式 - Silero VAD]:")
             print("   - 直接说话即可，系统自动检测语音")
+            print("   - 说“你好”进入响应模式，机器人才会回复")
+            print("   - 说“再见”退出响应模式，后续语音将忽略")
             print("   - 停顿超过 {:.1f} 秒视为说话结束".format(self.silence_duration))
             print("   - 机器人说话时会自动屏蔽麦克风")
             print("   - 按 'S' 键打断语音播放")

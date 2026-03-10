@@ -5,9 +5,11 @@
 ## 功能特性
 
 - 🎤 **语音输入**: 支持按键模式（按住Q键录音）和持续监听模式（自动检测语音）
+- ⌨️ **文本输入**: 支持 `--no-asr` 模式，直接在终端键盘输入对话
 - 🔊 **语音输出**: 自动将回复转为语音播放（可通过 `--no-tts` 关闭）
 - 🧠 **智能对话**: 基于Qwen大模型的自然对话
 - 💾 **长期记忆**: 自动记录对话历史并智能检索
+- 🪟 **滑动窗口记忆**: 可配置最近 n 轮对话上下文，与检索记忆一起提供给大模型
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
 - 👥 **多用户隔离**: 不同用户的记忆数据独立存储
 
@@ -62,6 +64,15 @@ python -m talkrobot.main --user ljc --listen-mode continuous
 
 # 使用按键模式（按住Q键说话，默认行为）
 python -m talkrobot.main --user ljc --listen-mode push
+
+# 使用 no-asr 模式（禁用语音识别，改为终端输入）
+python -m talkrobot.main --user ljc --no-asr
+
+# 启用流式回复（边生成边播报）
+python -m talkrobot.main --user ljc --streaming
+
+# 设置滑动窗口轮数（让模型额外看到最近 5 轮对话）
+python -m talkrobot.main --user ljc --history-rounds 5
 ```
 
 ### 2. 手动添加记忆
@@ -99,9 +110,12 @@ python -m talkrobot.tests.test_memory
 - `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
+- `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
 - `VAD_SILENCE_DURATION`: 静默多久判定说话结束（秒）
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
+
+> 启动参数 `--streaming` 可启用流式回复生成。
 
 ## 操作说明
 
@@ -116,13 +130,21 @@ python -m talkrobot.tests.test_memory
 ### 持续监听模式 (`--listen-mode continuous`)
 
 1. 启动程序后,等待所有模块初始化完成
-2. 直接对麦克风说话，系统通过 Silero VAD 自动检测语音
-3. 停顿超过设定时间（默认1.5秒）后视为说话结束
-4. 系统自动识别、生成回复并播放语音
-5. **机器人说话时会自动屏蔽麦克风**，避免机器人听到自己的回复
-6. 按 `Ctrl+C` 退出程序
+2. 先说“你好”进入响应模式（未唤醒时不会回复）
+3. 进入响应模式后，系统通过 Silero VAD 自动检测语音并回复
+4. 停顿超过设定时间（默认1.5秒）后视为说话结束
+5. 说“再见”可退出响应模式，退出后将忽略后续语音
+6. **机器人说话时会自动屏蔽麦克风**，避免机器人听到自己的回复
+7. 按 `Ctrl+C` 退出程序
 
 > **提示**: 持续监听模式使用 [Silero VAD](https://github.com/snakers4/silero-vad) 进行语音检测，相关参数可在 `config.py` 中调整。
+
+### 终端输入模式 (`--no-asr`)
+
+1. 启动程序后,等待模块初始化完成
+2. 在终端提示符 `你:` 后直接输入内容并回车
+3. 系统基于输入文本生成回复（可选TTS播放）
+4. 输入 `q` / `quit` / `exit` 退出程序
 
 ## 模块说明
 
@@ -135,6 +157,7 @@ python -m talkrobot.tests.test_memory
 - 使用 Kokoro TTS
 - 支持多种音色
 - 实时流式播放
+- 支持字符串与生成器输入
 
 ### LLMModule (大语言模型)
 - 使用阿里Qwen模型

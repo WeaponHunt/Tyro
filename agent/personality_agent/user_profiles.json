@@ -1,0 +1,46 @@
+{
+  "ljc": {
+    "profile": {
+      "city": "欢乐谷",
+      "name": "我"
+    },
+    "events": [
+      {
+        "event": "去欢乐谷",
+        "event_time": "2026-03-05",
+        "time_relation": "past",
+        "recorded_at": "2026-03-06 15:07:22",
+        "confidence": 0,
+        "source_text": "我昨天去欢乐谷了"
+      },
+      {
+        "event": "没去欢乐谷",
+        "event_time": "2026-03-05",
+        "time_relation": "past",
+        "recorded_at": "2026-03-06 15:07:31",
+        "confidence": 0,
+        "source_text": "我昨天没去欢乐谷呀"
+      }
+    ]
+  },
+  "demo_user": {
+    "profile": {
+      "personality": [
+        "外向"
+      ],
+      "interests": [
+        "跑步"
+      ]
+    },
+    "events": [
+      {
+        "event": "和同事聚餐",
+        "event_time": "2026-03-05",
+        "time_relation": "past",
+        "recorded_at": "2026-03-06 15:51:09",
+        "confidence": 10,
+        "source_text": "我昨晚和同事聚餐了"
+      }
+    ]
+  }
+}

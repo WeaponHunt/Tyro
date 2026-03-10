@@ -16,6 +16,7 @@ from talkrobot.modules.memory_module import MemoryModule
 # 全局变量：表情服务器子进程
 _expression_server_process = None
 
+os.environ['HF_HUB_OFFLINE'] = '1'
 
 def _start_expression_server():
     """自动启动表情服务器子进程"""
@@ -71,10 +72,8 @@ def _setup_logger():
 
 def run_chat(args):
     """启动对话机器人"""
-    from talkrobot.modules.asr_module import ASRModule
     from talkrobot.modules.tts_module import TTSModule
     from talkrobot.modules.llm_module import LLMModule
-    from talkrobot.core.audio_recorder import AudioRecorder
     from talkrobot.core.conversation_manager import ConversationManager
 
     user = args.user
@@ -91,10 +90,14 @@ def run_chat(args):
         logger.info("="*50)
 
         # 1. 初始化各个模块
-        asr_module = ASRModule(
-            model_name=Config.ASR_MODEL,
-            device=Config.ASR_DEVICE
-        )
+        no_asr_mode = getattr(args, "no_asr", False)
+        asr_module = None
+        if not no_asr_mode:
+            from talkrobot.modules.asr_module import ASRModule
+            asr_module = ASRModule(
+                model_name=Config.ASR_MODEL,
+                device=Config.ASR_DEVICE
+            )
 
         tts_module = TTSModule(
             lang_code=Config.TTS_LANG_CODE,
@@ -132,17 +135,29 @@ def run_chat(args):
         # 2. 创建对话管理器
         tts_enabled = not args.no_tts
         listen_mode = getattr(args, 'listen_mode', None) or Config.DEFAULT_LISTEN_MODE
+        history_rounds = getattr(args, 'history_rounds', None)
+        if history_rounds is None:
+            history_rounds = Config.SLIDING_WINDOW_ROUNDS
+        if history_rounds < 0:
+            raise ValueError("history-rounds 不能小于 0")
 
-        # 3. 创建音频录制器
-        audio_recorder = AudioRecorder(
-            sample_rate=Config.SAMPLE_RATE,
-            channels=Config.CHANNELS,
-            listen_mode=listen_mode,
-            vad_check_interval=Config.VAD_CHECK_INTERVAL,
-            pre_speech_duration=Config.VAD_PRE_SPEECH_DURATION,
-            silence_duration=Config.VAD_SILENCE_DURATION,
-            min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
-        )
+        if no_asr_mode and listen_mode != Config.DEFAULT_LISTEN_MODE:
+            logger.warning("no-asr 模式下 listen-mode 参数无效，将使用终端文本输入")
+
+        # 3. 创建音频录制器（no-asr 模式下跳过）
+        if not no_asr_mode:
+            from talkrobot.core.audio_recorder import AudioRecorder
+            audio_recorder = AudioRecorder(
+                sample_rate=Config.SAMPLE_RATE,
+                channels=Config.CHANNELS,
+                listen_mode=listen_mode,
+                vad_check_interval=Config.VAD_CHECK_INTERVAL,
+                pre_speech_duration=Config.VAD_PRE_SPEECH_DURATION,
+                silence_duration=Config.VAD_SILENCE_DURATION,
+                min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
+            )
+        else:
+            audio_recorder = None
 
         conversation_manager = ConversationManager(
             asr_module=asr_module,
@@ -150,20 +165,39 @@ def run_chat(args):
             llm_module=llm_module,
             memory_module=memory_module,
             tts_enabled=tts_enabled,
+            streaming=getattr(args, 'streaming', False),
             expression_module=expression_module,
             audio_recorder=audio_recorder,
             audio_min_duration=Config.AUDIO_MIN_DURATION,
             audio_min_rms=Config.AUDIO_MIN_RMS,
             sample_rate=Config.SAMPLE_RATE,
+            debug_timing=Config.DEBUG,
+            history_rounds=history_rounds,
         )
 
         logger.info("所有模块初始化完成!")
         logger.info("="*50)
 
-        # 4. 启动录音并开始对话
-        audio_recorder.start(
-            on_audio_complete=conversation_manager.process_audio_async
-        )
+        # 4. 开始对话：语音模式 or 终端文本模式
+        if no_asr_mode:
+            print("\n⌨️ 已启用 no-asr 模式：请直接在终端输入文本对话")
+            print("   输入 q / quit / exit 退出\n")
+            while True:
+                try:
+                    user_text = input("你: ").strip()
+                except EOFError:
+                    break
+
+                if not user_text:
+                    continue
+                if user_text.lower() in ("q", "quit", "exit"):
+                    break
+
+                conversation_manager.process_text(user_text)
+        else:
+            audio_recorder.start(
+                on_audio_complete=conversation_manager.process_audio_async
+            )
 
     except KeyboardInterrupt:
         print("\n\n👋 程序已退出,再见!")
@@ -277,8 +311,20 @@ def main():
         help="监听模式: push=按住Q键说话, continuous=持续监听 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
     )
     chat_parser.add_argument(
+        "--no-asr", action="store_true", default=False,
+        help="禁用ASR语音输入，改为终端键盘输入文本对话"
+    )
+    chat_parser.add_argument(
         "--debug", action="store_true", default=False,
         help="启用调试模式，输出详细日志，Ctrl+C时显示线程堆栈"
+    )
+    chat_parser.add_argument(
+        "--history-rounds", type=int, default=Config.SLIDING_WINDOW_ROUNDS,
+        help=f"滑动窗口对话轮数（仅包含最近历史，不含当前轮，0=关闭，默认: {Config.SLIDING_WINDOW_ROUNDS}）"
+    )
+    chat_parser.add_argument(
+        "--streaming", action="store_true", default=False,
+        help="启用流式回复生成（边生成边TTS播放）"
     )
 
     # 子命令: add-memory
@@ -307,8 +353,20 @@ def main():
         help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听"
     )
     parser.add_argument(
+        "--no-asr", action="store_true", default=False,
+        help="(兼容旧版) 禁用ASR语音输入，改为终端键盘输入"
+    )
+    parser.add_argument(
         "--debug", action="store_true", default=False,
         help="(兼容旧版) 启用调试模式"
+    )
+    parser.add_argument(
+        "--history-rounds", type=int, default=None,
+        help="(兼容旧版) 滑动窗口对话轮数（0=关闭）"
+    )
+    parser.add_argument(
+        "--streaming", action="store_true", default=False,
+        help="(兼容旧版) 启用流式回复生成"
     )
 
     args = parser.parse_args()

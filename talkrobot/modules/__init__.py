@@ -2,12 +2,6 @@
 TalkRobot 功能模块
 """
 
-from talkrobot.modules.asr_module import ASRModule
-from talkrobot.modules.tts_module import TTSModule
-from talkrobot.modules.llm_module import LLMModule
-from talkrobot.modules.memory_module import MemoryModule
-from talkrobot.modules.expression_module import ExpressionModule
-
 __all__ = [
     "ASRModule",
     "TTSModule",
@@ -15,3 +9,22 @@ __all__ = [
     "MemoryModule",
     "ExpressionModule",
 ]
+
+
+def __getattr__(name):
+    if name == "ASRModule":
+        from talkrobot.modules.asr_module import ASRModule
+        return ASRModule
+    if name == "TTSModule":
+        from talkrobot.modules.tts_module import TTSModule
+        return TTSModule
+    if name == "LLMModule":
+        from talkrobot.modules.llm_module import LLMModule
+        return LLMModule
+    if name == "MemoryModule":
+        from talkrobot.modules.memory_module import MemoryModule
+        return MemoryModule
+    if name == "ExpressionModule":
+        from talkrobot.modules.expression_module import ExpressionModule
+        return ExpressionModule
+    raise AttributeError(f"module 'talkrobot.modules' has no attribute '{name}'")

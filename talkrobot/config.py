@@ -40,7 +40,7 @@ class Config:
     # LLM 配置
     LLM_API_KEY = "api-key = sk-9d42be35fbba4ef8ab8d217c2a613869"
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    LLM_MODEL = "qwen-plus"
+    LLM_MODEL = "qwen-flash"#"qwen-plus"
     
     # 表情服务器配置
     EXPRESSION_SERVER_URL = "http://localhost:8001"
@@ -52,6 +52,9 @@ class Config:
     
     # 默认用户
     DEFAULT_USER = "default"
+
+    # 滑动窗口记忆：大模型可见的最近对话轮数（0 表示关闭）
+    SLIDING_WINDOW_ROUNDS = 5
     
     # 系统提示词
     SYSTEM_PROMPT = """你名叫Tyro,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题,请尽量不要生成英文。
