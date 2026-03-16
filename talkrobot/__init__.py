@@ -18,15 +18,15 @@ __all__ = [
 
 def __getattr__(name):
     if name == "ASRModule":
-        from talkrobot.modules.asr_module import ASRModule
+        from talkrobot.modules.asr.asr_module import ASRModule
         return ASRModule
     if name == "TTSModule":
-        from talkrobot.modules.tts_module import TTSModule
+        from talkrobot.modules.tts.tts_module import TTSModule
         return TTSModule
     if name == "LLMModule":
-        from talkrobot.modules.llm_module import LLMModule
+        from talkrobot.modules.llm.llm_module import LLMModule
         return LLMModule
     if name == "MemoryModule":
-        from talkrobot.modules.memory_module import MemoryModule
+        from talkrobot.modules.memory.memory_module import MemoryModule
         return MemoryModule
     raise AttributeError(f"module 'talkrobot' has no attribute '{name}'")

@@ -8,15 +8,183 @@ import time
 import subprocess
 import atexit
 import argparse
+import re
+import threading
+from typing import Optional, Dict, Tuple
 from loguru import logger
 
 from talkrobot.config import Config
-from talkrobot.modules.memory_module import MemoryModule
+from talkrobot.modules.memory.memory_module import MemoryModule
 
 # 全局变量：表情服务器子进程
 _expression_server_process = None
 
 os.environ['HF_HUB_OFFLINE'] = '1'
+
+
+class FaceIdentityResolver:
+    """根据当前摄像头识别人脸，解析当前交互对象。"""
+
+    _NON_TARGET_LABELS = {"", "无人脸", "识别中"}
+
+    def __init__(self, enabled: bool, default_user: str, camera_index: int):
+        self.enabled = False
+        self.default_user = default_user
+        self.camera_index = camera_index
+        self.unknown_user = Config.FACE_UNKNOWN_USER
+        self.poll_interval = 0.2
+        self._cap = None
+        self._module = None
+        self._on_user_change = None
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._track_thread = None
+        self._current_user = self.unknown_user
+        self._current_is_familiar = False
+
+        if not enabled:
+            return
+
+        try:
+            import cv2
+            from talkrobot.modules.face_recognize.face_recognition import FaceRecognitionModule
+
+            self._module = FaceRecognitionModule(
+                known_faces_dir=Config.FACE_KNOWN_FACES_DIR,
+                model_name=Config.FACE_MODEL_NAME,
+                use_gpu=Config.FACE_USE_GPU,
+            )
+
+            self._cap = cv2.VideoCapture(camera_index)
+            if not self._cap.isOpened():
+                raise RuntimeError(f"无法打开摄像头: index={camera_index}")
+
+            self.enabled = True
+            logger.info(f"人脸识别已启用，摄像头 index={camera_index}")
+            self._track_thread = threading.Thread(target=self._tracking_loop, daemon=True)
+            self._track_thread.start()
+        except Exception as e:
+            logger.warning(f"人脸识别初始化失败，已回退普通模式: {e}")
+            self.shutdown()
+
+    @staticmethod
+    def _sanitize_user_name(name: str) -> str:
+        clean = re.sub(r"\s+", "_", name.strip())
+        clean = re.sub(r"[^0-9a-zA-Z_\-\u4e00-\u9fff]", "_", clean)
+        return clean or Config.DEFAULT_USER
+
+    def _detect_user_once(self) -> Tuple[str, bool]:
+        """执行单次人脸检测并返回 (用户, 是否熟人)。"""
+        if not self.enabled or self._cap is None or self._module is None:
+            return self.default_user, False
+
+        ok, frame = self._cap.read()
+        if not ok:
+            logger.debug("读取摄像头帧失败，回退陌生人用户")
+            return self.unknown_user, False
+
+        try:
+            result = self._module.process_frame(frame)
+            label = str(result.get("label", "")).strip()
+        except Exception as e:
+            logger.warning(f"人脸识别处理失败，回退陌生人用户: {e}")
+            return self.unknown_user, False
+
+        if label in self._NON_TARGET_LABELS:
+            return self.unknown_user, False
+        if label == "陌生人":
+            return self.unknown_user, False
+        return self._sanitize_user_name(label), True
+
+    def _tracking_loop(self) -> None:
+        """后台持续人脸追踪，检测到对象变化时触发回调。"""
+        while not self._stop_event.is_set():
+            user, is_familiar = self._detect_user_once()
+            changed = False
+            with self._state_lock:
+                if user != self._current_user:
+                    self._current_user = user
+                    self._current_is_familiar = is_familiar
+                    changed = True
+
+            if changed:
+                logger.info(f"人脸交互对象变化: {user}")
+                callback = self._on_user_change
+                if callback is not None:
+                    try:
+                        callback(user, is_familiar)
+                    except Exception as e:
+                        logger.warning(f"人脸用户切换回调异常: {e}")
+
+            self._stop_event.wait(self.poll_interval)
+
+    def set_on_user_change(self, callback) -> None:
+        """设置交互对象变化回调。"""
+        self._on_user_change = callback
+
+    def resolve_user(self) -> str:
+        """返回当前交互对象用户名。"""
+        if not self.enabled:
+            return self.default_user
+        with self._state_lock:
+            return self._current_user
+
+    def is_current_user_familiar(self) -> bool:
+        """返回当前交互对象是否熟人。"""
+        if not self.enabled:
+            return False
+        with self._state_lock:
+            return self._current_is_familiar
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        if self._track_thread is not None and self._track_thread.is_alive():
+            self._track_thread.join(timeout=1.0)
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception as e:
+                logger.warning(f"释放摄像头失败: {e}")
+        self._cap = None
+        self._module = None
+        self._track_thread = None
+        self.enabled = False
+
+
+class UserMemoryRouter:
+    """按用户动态提供记忆模块；无持久记忆时仅启用滑动窗口短期记忆。"""
+
+    def __init__(self):
+        self._cache: Dict[str, Tuple[Optional[MemoryModule], bool]] = {}
+
+    def get_memory_for_user(self, user: str) -> Tuple[Optional[MemoryModule], bool]:
+        user = (user or Config.DEFAULT_USER).strip()
+        if user in self._cache:
+            return self._cache[user]
+
+        has_persistent = Config.has_persistent_memory(user)
+        if not has_persistent:
+            logger.info(f"用户[{user}]不存在长期记忆，使用短期记忆模式")
+            self._cache[user] = (None, False)
+            return self._cache[user]
+
+        module = MemoryModule(
+            config=Config.get_memory_config(user),
+            user_id=Config.get_user_id(user)
+        )
+        self._cache[user] = (module, True)
+        logger.info(f"用户[{user}]已接入长期记忆")
+        return self._cache[user]
+
+    def shutdown(self) -> None:
+        for user, (module, _) in self._cache.items():
+            if module is None:
+                continue
+            try:
+                module.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭用户[{user}]记忆模块异常: {e}")
+
 
 def _start_expression_server():
     """自动启动表情服务器子进程"""
@@ -72,12 +240,14 @@ def _setup_logger():
 
 def run_chat(args):
     """启动对话机器人"""
-    from talkrobot.modules.tts_module import TTSModule
-    from talkrobot.modules.llm_module import LLMModule
+    from talkrobot.modules.tts.tts_module import TTSModule
+    from talkrobot.modules.llm.llm_module import LLMModule
     from talkrobot.core.conversation_manager import ConversationManager
 
     user = args.user
     memory_module = None
+    memory_router = None
+    face_resolver = None
     tts_module = None
     audio_recorder = None
     conversation_manager = None
@@ -93,7 +263,7 @@ def run_chat(args):
         no_asr_mode = getattr(args, "no_asr", False)
         asr_module = None
         if not no_asr_mode:
-            from talkrobot.modules.asr_module import ASRModule
+            from talkrobot.modules.asr.asr_module import ASRModule
             asr_module = ASRModule(
                 model_name=Config.ASR_MODEL,
                 device=Config.ASR_DEVICE
@@ -109,7 +279,7 @@ def run_chat(args):
         expression_module = None
         expression_prompt = ""
         if Config.EXPRESSION_ENABLED:
-            from talkrobot.modules.expression_module import ExpressionModule
+            from talkrobot.modules.expression.expression_module import ExpressionModule
             # 自动启动表情服务器
             _start_expression_server()
             expression_module = ExpressionModule(
@@ -127,10 +297,30 @@ def run_chat(args):
             expression_prompt=expression_prompt
         )
 
-        memory_module = MemoryModule(
-            config=Config.get_memory_config(user),
-            user_id=Config.get_user_id(user)
-        )
+        enable_face = bool(getattr(args, "enable_face", False))
+        memory_provider = None
+        user_resolver = None
+
+        if enable_face:
+            face_resolver = FaceIdentityResolver(
+                enabled=True,
+                default_user=user,
+                camera_index=getattr(args, "face_camera_index", Config.FACE_CAMERA_INDEX),
+            )
+            if face_resolver.enabled:
+                memory_router = UserMemoryRouter()
+                user_resolver = face_resolver.resolve_user
+                memory_provider = memory_router.get_memory_for_user
+                memory_module, _ = memory_provider(user)
+                logger.info("已启用人脸驱动交互对象切换")
+            else:
+                logger.warning("人脸识别不可用，继续使用固定用户模式")
+
+        if memory_provider is None:
+            memory_module = MemoryModule(
+                config=Config.get_memory_config(user),
+                user_id=Config.get_user_id(user)
+            )
 
         # 2. 创建对话管理器
         tts_enabled = not args.no_tts
@@ -173,7 +363,19 @@ def run_chat(args):
             sample_rate=Config.SAMPLE_RATE,
             debug_timing=Config.DEBUG,
             history_rounds=history_rounds,
+            default_user=user,
+            user_resolver=user_resolver,
+            memory_provider=memory_provider,
+            say_hallo=getattr(args, 'say_hallo', False),
+            greeting_cooldown_seconds=getattr(args, 'hallo_cooldown_seconds', 600.0),
         )
+
+        if face_resolver is not None and face_resolver.enabled:
+            face_resolver.set_on_user_change(conversation_manager.on_face_user_change)
+            conversation_manager.on_face_user_change(
+                face_resolver.resolve_user(),
+                face_resolver.is_current_user_familiar(),
+            )
 
         logger.info("所有模块初始化完成!")
         logger.info("="*50)
@@ -242,11 +444,22 @@ def run_chat(args):
             except Exception as e:
                 logger.warning(f"关闭对话管理器异常: {e}")
 
-        if memory_module is not None:
+        if memory_router is not None:
+            try:
+                memory_router.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭多用户记忆路由器异常: {e}")
+        elif memory_module is not None:
             try:
                 memory_module.shutdown()
             except Exception as e:
                 logger.warning(f"关闭记忆模块异常: {e}")
+
+        if face_resolver is not None:
+            try:
+                face_resolver.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭人脸识别异常: {e}")
 
         _stop_expression_server()
 
@@ -326,6 +539,22 @@ def main():
         "--streaming", action="store_true", default=False,
         help="启用流式回复生成（边生成边TTS播放）"
     )
+    chat_parser.add_argument(
+        "--enable-face", action="store_true", default=Config.FACE_ENABLED,
+        help="启用人脸识别并根据识别人脸热切换交互对象"
+    )
+    chat_parser.add_argument(
+        "--face-camera-index", type=int, default=Config.FACE_CAMERA_INDEX,
+        help=f"人脸识别摄像头索引 (默认: {Config.FACE_CAMERA_INDEX})"
+    )
+    chat_parser.add_argument(
+        "--say-hallo", action="store_true", default=False,
+        help="在 continuous 的非响应阶段，检测到熟人时主动问好"
+    )
+    chat_parser.add_argument(
+        "--hallo-cooldown-seconds", type=float, default=600.0,
+        help="主动问好冷却时间（秒），默认600秒=10分钟"
+    )
 
     # 子命令: add-memory
     mem_parser = subparsers.add_parser("add-memory", help="手动为指定用户添加记忆")
@@ -368,6 +597,18 @@ def main():
         "--streaming", action="store_true", default=False,
         help="(兼容旧版) 启用流式回复生成"
     )
+    parser.add_argument(
+        "--enable-face", action="store_true", default=False,
+        help="(兼容旧版) 启用人脸识别并根据识别人脸热切换交互对象"
+    )
+    parser.add_argument(
+        "--face-camera-index", type=int, default=None,
+        help="(兼容旧版) 人脸识别摄像头索引"
+    )
+    parser.add_argument(
+        "--say-hallo", action="store_true", default=False,
+        help="(兼容旧版) 在 continuous 的非响应阶段，检测到熟人时主动问好"
+    )
 
     args = parser.parse_args()
     
@@ -384,6 +625,8 @@ def main():
             args.user = Config.DEFAULT_USER
         if not hasattr(args, 'listen_mode') or args.listen_mode is None:
             args.listen_mode = Config.DEFAULT_LISTEN_MODE
+        if not hasattr(args, 'face_camera_index') or args.face_camera_index is None:
+            args.face_camera_index = Config.FACE_CAMERA_INDEX
         run_chat(args)
 
 

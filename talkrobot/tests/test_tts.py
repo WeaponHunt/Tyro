@@ -4,7 +4,7 @@ TTS模块测试
 import time
 
 from talkrobot.config import Config
-from talkrobot.modules.tts_module import TTSModule
+from talkrobot.modules.tts.tts_module import TTSModule
 
 def test_tts():
     """测试TTS模块"""

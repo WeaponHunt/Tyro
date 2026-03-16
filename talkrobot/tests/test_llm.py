@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 from talkrobot.config import Config
-from talkrobot.modules.llm_module import LLMModule
+from talkrobot.modules.llm.llm_module import LLMModule
 
 def _run_single_round(llm: LLMModule, user_input: str) -> float:
     """执行单轮测试并返回生成耗时(秒)"""

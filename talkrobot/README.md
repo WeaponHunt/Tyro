@@ -12,6 +12,7 @@
 - 🪟 **滑动窗口记忆**: 可配置最近 n 轮对话上下文，与检索记忆一起提供给大模型
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
 - 👥 **多用户隔离**: 不同用户的记忆数据独立存储
+- 🧑‍🤝‍🧑 **人脸驱动交互对象**: 可按当前识别人脸自动切换交互用户
 
 ## 项目结构
 
@@ -73,6 +74,15 @@ python -m talkrobot.main --user ljc --streaming
 
 # 设置滑动窗口轮数（让模型额外看到最近 5 轮对话）
 python -m talkrobot.main --user ljc --history-rounds 5
+
+# 启用人脸识别，按当前识别人脸自动热切换交互对象
+python -m talkrobot.main chat --enable-face
+
+# 指定人脸识别摄像头
+python -m talkrobot.main chat --enable-face --face-camera-index 0
+
+# 在 continuous 非响应阶段，见到熟人主动问好
+python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous
 ```
 
 ### 2. 手动添加记忆
@@ -116,6 +126,11 @@ python -m talkrobot.tests.test_memory
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
 
 > 启动参数 `--streaming` 可启用流式回复生成。
+
+> 启动参数 `--enable-face` 启用人脸识别后，会根据当前识别对象自动切换用户；
+> 若该对象不存在长期记忆数据，则自动回退为“仅滑动窗口短期记忆”模式。
+> 若当前帧未检测到有效人脸，也会按“陌生人用户”处理。
+> 启动参数 `--say-hallo` 开启后，仅在 continuous 的非响应阶段检测到熟人时主动问好（称呼基于该用户记忆检索）。
 
 ## 操作说明
 

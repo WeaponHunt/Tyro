@@ -4,7 +4,7 @@ Memory模块测试
 import time
 
 from talkrobot.config import Config
-from talkrobot.modules.memory_module import MemoryModule
+from talkrobot.modules.memory.memory_module import MemoryModule
 
 def test_memory():
     """测试Memory模块"""

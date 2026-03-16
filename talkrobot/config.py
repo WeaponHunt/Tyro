@@ -47,6 +47,19 @@ class Config:
     EXPRESSION_DEFAULT = "neutral"
     EXPRESSION_ENABLED = True  # 是否启用表情功能
 
+    # 人脸识别配置
+    FACE_ENABLED = False
+    FACE_CAMERA_INDEX = 0
+    FACE_USE_GPU = True
+    FACE_MODEL_NAME = "buffalo_s"
+    FACE_UNKNOWN_USER = "guest"
+    FACE_KNOWN_FACES_DIR = os.path.join(
+        os.path.dirname(__file__),
+        "modules",
+        "face_recognize",
+        "known_faces",
+    )
+
     # Memory 基础数据库路径
     MEMORY_DB_BASE_PATH = os.path.join(os.path.dirname(__file__), "mem_db")
     
@@ -74,6 +87,18 @@ class Config:
     def get_memory_db_path(cls, user: str) -> str:
         """根据用户名生成独立的记忆数据库路径"""
         return os.path.join(cls.MEMORY_DB_BASE_PATH, user)
+
+    @classmethod
+    def has_persistent_memory(cls, user: str) -> bool:
+        """判断用户是否已有持久化记忆数据。"""
+        db_path = cls.get_memory_db_path(user)
+        if not os.path.isdir(db_path):
+            return False
+
+        for _, _, files in os.walk(db_path):
+            if files:
+                return True
+        return False
     
     @classmethod
     def get_memory_config(cls, user: str) -> dict:

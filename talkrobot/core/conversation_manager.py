@@ -6,7 +6,7 @@ import numpy as np
 import time
 import re
 from loguru import logger
-from typing import Optional
+from typing import Optional, Callable, Tuple
 import threading
 from pynput import keyboard
 
@@ -21,7 +21,12 @@ class ConversationManager:
                  audio_min_rms: float = 0.005,
                  sample_rate: int = 16000,
                  debug_timing: bool = False,
-                 history_rounds: int = 3):
+                 history_rounds: int = 3,
+                 default_user: str = "default",
+                 user_resolver: Optional[Callable[[], str]] = None,
+                 memory_provider: Optional[Callable[[str], Tuple[Optional[object], bool]]] = None,
+                 say_hallo: bool = False,
+                 greeting_cooldown_seconds: float = 600.0):
         """
         初始化对话管理器
         
@@ -39,6 +44,10 @@ class ConversationManager:
             sample_rate: 采样率（用于计算时长）
             debug_timing: 是否输出各环节耗时（仅调试）
             history_rounds: 滑动窗口历史轮数（0 表示关闭）
+            default_user: 默认交互用户
+            user_resolver: 当前交互用户解析器，返回用户名
+            memory_provider: 根据用户名返回 (memory_module, 是否启用长期记忆)
+            say_hallo: 是否在非响应阶段见到熟人后主动问好
         """
         self.asr = asr_module
         self.tts = tts_module
@@ -53,14 +62,32 @@ class ConversationManager:
         self.sample_rate = sample_rate
         self.debug_timing = debug_timing
         self.history_rounds = max(0, int(history_rounds))
+        self.default_user = default_user
+        self._user_resolver = user_resolver or (lambda: self.default_user)
+        self._memory_provider = memory_provider
         self._worker_threads = []
         self._worker_lock = threading.Lock()
+        self._user_state_lock = threading.Lock()
+        self._proactive_lock = threading.Lock()
         self._history_lock = threading.Lock()
-        self._recent_dialogue_rounds = []  # list[(user_text, assistant_text)]
+        self._recent_dialogue_rounds_by_user = {}  # dict[user, list[(user_text, assistant_text)]]
+        self._active_user = self.default_user
+        self._active_user_has_long_term_memory = True
+        self._active_user_initialized = False
+        self._pending_user_switch_notice = ""
         self._is_continuous_mode = bool(audio_recorder and audio_recorder.listen_mode == "continuous")
         self._response_enabled = not self._is_continuous_mode
         self._wake_word = "你好"
         self._sleep_word = "再见"
+        self._say_hallo = bool(say_hallo)
+        self._greeting_response_window_seconds = 10.0
+        self._pending_greeting_deadline: Optional[float] = None
+        self._greeting_cooldown_seconds = float(greeting_cooldown_seconds)
+        self._last_greet_ts_by_user = {}
+
+        if self._memory_provider is None:
+            self._memory_provider = lambda _: (memory_module, True)
+        self._switch_user_if_needed(self.default_user, silent=True)
         
         expr_status = '开启' if (expression_module and expression_module.is_available) else '关闭'
         logger.info(
@@ -70,13 +97,170 @@ class ConversationManager:
         if self._is_continuous_mode:
             logger.info("continuous 模式已启用响应开关：说“你好”进入响应，说“再见”退出响应")
 
-    def _build_sliding_window_context(self) -> str:
+    def _resolve_active_user(self) -> str:
+        """解析当前交互用户。"""
+        try:
+            user = self._user_resolver()
+        except Exception as e:
+            logger.warning(f"用户解析失败，回退默认用户: {e}")
+            user = self.default_user
+
+        if not user or not str(user).strip():
+            return self.default_user
+        return str(user).strip()
+
+    def _switch_user_if_needed(self, user: str, silent: bool = False) -> None:
+        """当用户变化时切换记忆模块与会话上下文。"""
+        with self._user_state_lock:
+            if not user:
+                user = self.default_user
+
+            if user == self._active_user and self._active_user_initialized:
+                return
+
+            previous_user = self._active_user if self._active_user_initialized else None
+
+            if previous_user is not None and previous_user != user:
+                with self._history_lock:
+                    self._recent_dialogue_rounds_by_user.clear()
+                self._pending_user_switch_notice = (
+                    f"会话对象已切换：上一位交互对象是[{previous_user}]，当前对象是[{user}]。"
+                    "请不要把上一位对象的对话内容当作当前对象的个人信息。"
+                )
+
+            memory_module, has_long_term_memory = self._memory_provider(user)
+            self.memory = memory_module
+            self._active_user = user
+            self._active_user_has_long_term_memory = bool(has_long_term_memory and memory_module is not None)
+            self._active_user_initialized = True
+
+        if not silent:
+            print(f"🧑 当前交互对象: {self._active_user}")
+            if not self._active_user_has_long_term_memory:
+                print("📝 当前对象无长期记忆，已切换为仅滑动窗口短期记忆模式")
+
+        logger.info(
+            f"已切换交互对象: user={self._active_user}, "
+            f"long_term_memory={'开启' if self._active_user_has_long_term_memory else '关闭'}"
+        )
+
+    def switch_active_user(self, user: str) -> None:
+        """供外部线程调用的用户切换入口（如人脸追踪线程）。"""
+        self._switch_user_if_needed(user)
+
+    def on_face_user_change(self, user: str, is_familiar: bool = False) -> None:
+        """人脸追踪回调入口：切换对象，并在条件满足时主动问好。"""
+        self._switch_user_if_needed(user)
+
+        if not self._say_hallo:
+            return
+        if not is_familiar:
+            return
+        if not self._is_continuous_mode:
+            return
+        if self._response_enabled:
+            return
+
+        self._say_hello_to_familiar_user()
+
+    def _say_hello_to_familiar_user(self) -> None:
+        """在非响应阶段，对熟人执行一次主动问好。"""
+        with self._proactive_lock:
+            if not self._is_continuous_mode or self._response_enabled:
+                return
+
+            now = time.time()
+            last_greet_ts = self._last_greet_ts_by_user.get(self._active_user)
+            if last_greet_ts is not None:
+                elapsed = now - last_greet_ts
+                if elapsed < self._greeting_cooldown_seconds:
+                    remaining = self._greeting_cooldown_seconds - elapsed
+                    logger.info(
+                        f"say_hallo 命中冷却: user={self._active_user}, 剩余{remaining:.1f}s，跳过主动问好"
+                    )
+                    return
+
+            if not self._active_user_has_long_term_memory or self.memory is None:
+                logger.info("say_hallo 已启用，但当前熟人无长期记忆，跳过主动问好")
+                return
+
+            try:
+                memory_context = self.memory.search_memory("这个用户叫什么名字？我应该如何称呼TA？")
+            except Exception as e:
+                logger.warning(f"say_hallo 记忆检索失败: {e}")
+                memory_context = ""
+
+            if not memory_context:
+                logger.info("say_hallo 未检索到可用姓名记忆，跳过主动问好")
+                return
+
+            greeting_instruction = (
+                "你刚见到一位熟人。请仅基于提供的记忆判断对方称呼，"
+                "用一句简短自然的中文主动问好。"
+                "如果记忆里无法确认名字，直接说“你好，欢迎回来”。"
+                "不要编造额外信息，不要提及你在检索记忆。"
+            )
+
+            try:
+                raw_response = self.llm.generate_response(greeting_instruction, memory_context).strip()
+            except Exception as e:
+                logger.warning(f"say_hallo LLM 生成失败: {e}")
+                return
+
+            if not raw_response:
+                return
+
+            expression_name = None
+            if self.expression and self.expression.is_available:
+                from talkrobot.modules.expression.expression_module import ExpressionModule
+                response, expression_name = ExpressionModule.parse_expression_from_response(raw_response)
+            else:
+                response = raw_response
+
+            response = response.strip()
+            if not response:
+                return
+
+            logger.info(f"say_hallo 主动问好: user={self._active_user}, response={response}")
+
+            if expression_name and self.expression and self.expression.is_available:
+                self.expression.set_expression(expression_name)
+
+            print(f"🤖 主动问好: {response}")
+
+            self._last_greet_ts_by_user[self._active_user] = time.time()
+
+            # 将主动问好写入短期滑动窗口，便于后续上下文连续
+            self._append_dialogue_round(self._active_user, "（机器人主动问好）", response)
+
+            # 开启“问好后应答窗口”：5秒内用户应答可直接进入响应模式
+            self._pending_greeting_deadline = time.time() + self._greeting_response_window_seconds
+
+            if self.tts_enabled and self.tts is not None:
+                if self.audio_recorder:
+                    self.audio_recorder.is_tts_playing = True
+                try:
+                    self.tts.synthesize(response, play_audio=True)
+                finally:
+                    if self.audio_recorder:
+                        self.audio_recorder.is_tts_playing = False
+
+            if expression_name and self.expression and self.expression.is_available:
+                self.expression.reset_expression()
+
+    def _consume_user_switch_notice(self) -> str:
+        """取出并清空一次性用户切换提示。"""
+        notice = self._pending_user_switch_notice
+        self._pending_user_switch_notice = ""
+        return notice
+
+    def _build_sliding_window_context(self, user: str) -> str:
         """构建最近 n 轮对话窗口文本。"""
         if self.history_rounds <= 0:
             return ""
 
         with self._history_lock:
-            rounds = list(self._recent_dialogue_rounds)
+            rounds = list(self._recent_dialogue_rounds_by_user.get(user, []))
 
         if not rounds:
             return ""
@@ -87,15 +271,27 @@ class ConversationManager:
             lines.append(f"第{idx}轮 机器人: {assistant_text}")
         return "\n".join(lines)
 
-    def _append_dialogue_round(self, user_text: str, assistant_text: str) -> None:
+    def _append_dialogue_round(self, user: str, user_text: str, assistant_text: str) -> None:
         """将一轮对话写入滑动窗口。"""
         if self.history_rounds <= 0:
             return
 
         with self._history_lock:
-            self._recent_dialogue_rounds.append((user_text, assistant_text))
-            if len(self._recent_dialogue_rounds) > self.history_rounds:
-                self._recent_dialogue_rounds = self._recent_dialogue_rounds[-self.history_rounds:]
+            rounds = self._recent_dialogue_rounds_by_user.setdefault(user, [])
+            rounds.append((user_text, assistant_text))
+            if len(rounds) > self.history_rounds:
+                self._recent_dialogue_rounds_by_user[user] = rounds[-self.history_rounds:]
+
+    def _clear_sliding_window(self, user: Optional[str] = None) -> None:
+        """清空指定用户（默认当前用户）的滑动窗口短期记忆。"""
+        if self.history_rounds <= 0:
+            return
+
+        target_user = user or self._active_user
+        with self._history_lock:
+            if target_user in self._recent_dialogue_rounds_by_user:
+                self._recent_dialogue_rounds_by_user[target_user] = []
+                logger.info(f"已清空滑动窗口短期记忆: user={target_user}")
 
     @staticmethod
     def _merge_context(memory_context, sliding_window_context: str) -> str:
@@ -131,9 +327,20 @@ class ConversationManager:
 
         normalized_text = self._normalize_text(user_text)
 
+        # 主动问好后的短窗口：5秒内用户若应答，直接进入响应模式
+        if not self._response_enabled and self._pending_greeting_deadline is not None:
+            if time.time() <= self._pending_greeting_deadline:
+                self._response_enabled = True
+                self._pending_greeting_deadline = None
+                logger.info("检测到问好后5秒内应答，自动进入响应模式")
+                print("✅ 已进入响应模式（已识别为对问好的应答）")
+            else:
+                self._pending_greeting_deadline = None
+
         if not self._response_enabled:
             if self._wake_word in normalized_text:
                 self._response_enabled = True
+                self._pending_greeting_deadline = None
                 logger.info("检测到唤醒词“你好”，进入响应模式")
                 print("✅ 已进入响应模式")
             else:
@@ -142,7 +349,22 @@ class ConversationManager:
                 return False
 
         if self._sleep_word in normalized_text:
+            # 新增：先主动告别
+            farewell = "再见，下次再聊！"
+            print(f"🤖 机器人: {farewell}")
+            logger.info("检测到“再见”，机器人主动告别")
+            if self.tts_enabled and self.tts is not None:
+                if self.audio_recorder:
+                    self.audio_recorder.is_tts_playing = True
+                try:
+                    self.tts.synthesize(farewell, play_audio=True)
+                finally:
+                    if self.audio_recorder:
+                        self.audio_recorder.is_tts_playing = False
+
+            self._clear_sliding_window(self._active_user)
             self._response_enabled = False
+            self._pending_greeting_deadline = None
             logger.info("检测到“再见”，退出响应模式")
             print("🛑 已退出响应模式（后续语音将忽略，说“你好”可重新唤醒）")
             return False
@@ -153,17 +375,32 @@ class ConversationManager:
         """处理已获得的用户文本（来自 ASR 或终端输入）。"""
         logger.debug(f"处理用户文本: {user_text}")
 
+        current_user = self._resolve_active_user()
+        if current_user != self._active_user or not self._active_user_initialized:
+            self._switch_user_if_needed(current_user)
+
         # 2. 异步存储用户输入到记忆 (不阻塞后续流程)
-        logger.debug("开始存储用户输入到记忆")
-        self.memory.add_memory(f"用户说: {user_text}", async_mode=True)
+        if self._active_user_has_long_term_memory and self.memory is not None:
+            logger.debug("开始存储用户输入到记忆")
+            self.memory.add_memory(f"用户说: {user_text}", async_mode=True)
+        else:
+            logger.debug("当前对象无长期记忆，跳过用户输入写入")
 
         # 3. 从记忆中检索相关上下文
-        print("🔍 正在检索相关记忆...")
         logger.debug("开始检索记忆")
         memory_start = time.perf_counter()
-        memory_context = self.memory.search_memory(user_text)
-        sliding_window_context = self._build_sliding_window_context()
+        memory_context = ""
+        if self._active_user_has_long_term_memory and self.memory is not None:
+            print("🔍 正在检索相关记忆...")
+            memory_context = self.memory.search_memory(user_text)
+        else:
+            print("🧠 当前仅使用短期记忆（滑动窗口）...")
+
+        sliding_window_context = self._build_sliding_window_context(self._active_user)
         context = self._merge_context(memory_context, sliding_window_context)
+        switch_notice = self._consume_user_switch_notice()
+        if switch_notice:
+            context = f"{switch_notice}\n\n{context}" if context else switch_notice
         memory_elapsed = time.perf_counter() - memory_start
         self._print_stage_timing("查询相关记忆", memory_elapsed)
         logger.debug(f"记忆检索完成，记忆上下文长度: {len(str(memory_context)) if memory_context else 0}")
@@ -183,7 +420,7 @@ class ConversationManager:
             buffered_prefix = ""
             expression_prefix_finalized = False
 
-            from talkrobot.modules.expression_module import ExpressionModule
+            from talkrobot.modules.expression.expression_module import ExpressionModule
 
             def _handle_stream_chunk(chunk: str) -> str:
                 """处理流式增量，剥离起始表情标签并返回可展示/可播报文本。"""
@@ -294,7 +531,7 @@ class ConversationManager:
 
         # 4.1 解析表情标签
         if self.expression and self.expression.is_available:
-            from talkrobot.modules.expression_module import ExpressionModule
+            from talkrobot.modules.expression.expression_module import ExpressionModule
             response, parsed_expression_name = ExpressionModule.parse_expression_from_response(raw_response)
             if not expression_name:
                 expression_name = parsed_expression_name
@@ -312,11 +549,14 @@ class ConversationManager:
             self.expression.set_expression(expression_name)
 
         # 5. 异步存储机器人回复到记忆 (不阻塞后续流程)
-        logger.debug("开始存储机器人回复到记忆")
-        self.memory.add_memory(f"机器人回复: {response}", async_mode=True)
+        if self._active_user_has_long_term_memory and self.memory is not None:
+            logger.debug("开始存储机器人回复到记忆")
+            self.memory.add_memory(f"机器人回复: {response}", async_mode=True)
+        else:
+            logger.debug("当前对象无长期记忆，跳过机器人回复写入")
 
         # 5.1 更新滑动窗口
-        self._append_dialogue_round(user_text, response)
+        self._append_dialogue_round(self._active_user, user_text, response)
 
         # 6. TTS: 文字转语音并播放
         if self.tts_enabled and not tts_played_in_streaming:

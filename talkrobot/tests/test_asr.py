@@ -6,7 +6,7 @@ import numpy as np
 import time
 import os
 from talkrobot.config import Config
-from talkrobot.modules.asr_module import ASRModule
+from talkrobot.modules.asr.asr_module import ASRModule
 
 
 def test_initialization():
