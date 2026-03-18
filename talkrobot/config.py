@@ -66,6 +66,18 @@ class Config:
     # 默认用户
     DEFAULT_USER = "default"
 
+    # 人格配置文件路径
+    PERSONA_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "persona_profiles.json")
+
+    # 全局提示词：对所有用户生效，拼接在用户人格 prompt 后
+    GLOBAL_SYSTEM_PROMPT = """请遵循以下原则：
+        语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
+        音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
+        生成的文本要便于tts朗读，比如”10-15“应该生成为“10到15”避免tts把”-“读成”减“。"""
+
+    # 是否启用后台人格自动更新（LangGraph Agent）
+    ENABLE_PERSONA_AUTO_UPDATE = True
+
     # 滑动窗口记忆：大模型可见的最近对话轮数（0 表示关闭）
     SLIDING_WINDOW_ROUNDS = 5
     

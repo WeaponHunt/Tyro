@@ -25,6 +25,8 @@ class ConversationManager:
                  default_user: str = "default",
                  user_resolver: Optional[Callable[[], str]] = None,
                  memory_provider: Optional[Callable[[str], Tuple[Optional[object], bool]]] = None,
+                 persona_provider: Optional[Callable[[str], str]] = None,
+                 persona_update_handler: Optional[Callable[[str, str, str], None]] = None,
                  say_hallo: bool = False,
                  greeting_cooldown_seconds: float = 600.0):
         """
@@ -47,6 +49,8 @@ class ConversationManager:
             default_user: 默认交互用户
             user_resolver: 当前交互用户解析器，返回用户名
             memory_provider: 根据用户名返回 (memory_module, 是否启用长期记忆)
+            persona_provider: 根据用户名返回人格 system prompt
+            persona_update_handler: 后台人格更新处理器，参数为 (user, user_text, context)
             say_hallo: 是否在非响应阶段见到熟人后主动问好
         """
         self.asr = asr_module
@@ -65,8 +69,12 @@ class ConversationManager:
         self.default_user = default_user
         self._user_resolver = user_resolver or (lambda: self.default_user)
         self._memory_provider = memory_provider
+        self._persona_provider = persona_provider or (lambda _: "")
+        self._persona_update_handler = persona_update_handler
         self._worker_threads = []
+        self._persona_update_threads = []
         self._worker_lock = threading.Lock()
+        self._persona_update_lock = threading.Lock()
         self._user_state_lock = threading.Lock()
         self._proactive_lock = threading.Lock()
         self._history_lock = threading.Lock()
@@ -144,6 +152,51 @@ class ConversationManager:
             f"long_term_memory={'开启' if self._active_user_has_long_term_memory else '关闭'}"
         )
 
+    def _resolve_persona_prompt(self, user: str) -> str:
+        """获取当前用户人格提示词。"""
+        try:
+            prompt = self._persona_provider(user)
+        except Exception as e:
+            logger.warning(f"人格提示词解析失败，回退模块默认 system prompt: {e}")
+            return ""
+
+        if not prompt or not str(prompt).strip():
+            return ""
+        return str(prompt).strip()
+
+    def _start_persona_update_async(self, user: str, user_text: str, context: str) -> float:
+        """异步触发人格更新 agent，不阻塞主回复链路。"""
+        if self._persona_update_handler is None:
+            return 0.0
+
+        schedule_ts = time.perf_counter()
+
+        def _runner():
+            run_start = time.perf_counter()
+            queue_delay = run_start - schedule_ts
+            if self.debug_timing:
+                msg = f"⏱️ 人格更新线程排队耗时: {queue_delay:.3f}s"
+                print(msg)
+                logger.debug(msg)
+
+            try:
+                self._persona_update_handler(user, user_text, context)
+            except Exception as e:
+                logger.warning(f"后台人格更新线程异常: {e}")
+            finally:
+                if self.debug_timing:
+                    run_elapsed = time.perf_counter() - run_start
+                    msg = f"⏱️ 人格更新后台总耗时: {run_elapsed:.3f}s"
+                    print(msg)
+                    logger.debug(msg)
+
+        with self._persona_update_lock:
+            self._persona_update_threads = [t for t in self._persona_update_threads if t.is_alive()]
+            thread = threading.Thread(target=_runner, daemon=True)
+            self._persona_update_threads.append(thread)
+        thread.start()
+        return schedule_ts
+
     def switch_active_user(self, user: str) -> None:
         """供外部线程调用的用户切换入口（如人脸追踪线程）。"""
         self._switch_user_if_needed(user)
@@ -200,9 +253,14 @@ class ConversationManager:
                 "如果记忆里无法确认名字，直接说“你好，欢迎回来”。"
                 "不要编造额外信息，不要提及你在检索记忆。"
             )
+            persona_prompt = self._resolve_persona_prompt(self._active_user)
 
             try:
-                raw_response = self.llm.generate_response(greeting_instruction, memory_context).strip()
+                raw_response = self.llm.generate_response(
+                    greeting_instruction,
+                    memory_context,
+                    system_prompt_override=persona_prompt,
+                ).strip()
             except Exception as e:
                 logger.warning(f"say_hallo LLM 生成失败: {e}")
                 return
@@ -406,11 +464,20 @@ class ConversationManager:
         logger.debug(f"记忆检索完成，记忆上下文长度: {len(str(memory_context)) if memory_context else 0}")
         logger.debug(f"滑动窗口上下文长度: {len(sliding_window_context) if sliding_window_context else 0}")
 
+        # 3.1 并行后台人格更新（不影响当前轮回复）
+        persona_async_schedule_ts = self._start_persona_update_async(self._active_user, user_text, context)
+
         # 4. LLM: 生成回复
         print("🤖 正在思考回复...")
         logger.debug("开始LLM生成回复")
         llm_start = time.perf_counter()
+        if self.debug_timing and persona_async_schedule_ts > 0:
+            overlap_start_delta = llm_start - persona_async_schedule_ts
+            msg = f"⏱️ 人格更新与主回复并行启动差: {overlap_start_delta:.3f}s"
+            print(msg)
+            logger.debug(msg)
         logger.debug(f"💡 输入给LLM的上下文: {context}")
+        persona_prompt = self._resolve_persona_prompt(self._active_user)
         tts_played_in_streaming = False
         expression_name = None
         expression_set_in_streaming = False
@@ -471,7 +538,11 @@ class ConversationManager:
                 return rest
 
             def _stream_with_capture():
-                for chunk in self.llm.generate_response_stream(user_text, context):
+                for chunk in self.llm.generate_response_stream(
+                    user_text,
+                    context,
+                    system_prompt_override=persona_prompt,
+                ):
                     raw_response_parts.append(chunk)
                     clean_chunk = _handle_stream_chunk(chunk)
                     if clean_chunk:
@@ -523,7 +594,11 @@ class ConversationManager:
             print()
             raw_response = "".join(raw_response_parts)
         else:
-            raw_response = self.llm.generate_response(user_text, context)
+            raw_response = self.llm.generate_response(
+                user_text,
+                context,
+                system_prompt_override=persona_prompt,
+            )
 
         llm_elapsed = time.perf_counter() - llm_start
         self._print_stage_timing("大模型生成回复", llm_elapsed)
@@ -715,7 +790,14 @@ class ConversationManager:
             threads = list(self._worker_threads)
             self._worker_threads = []
 
+        with self._persona_update_lock:
+            persona_threads = list(self._persona_update_threads)
+            self._persona_update_threads = []
+
         for thread in threads:
             if thread.is_alive() and thread != threading.current_thread():
                 thread.join(timeout=timeout)
+        for thread in persona_threads:
+            if thread.is_alive() and thread != threading.current_thread():
+                thread.join(timeout=min(timeout, 1.0))
         logger.info("对话管理器已关闭")

@@ -15,6 +15,7 @@ from loguru import logger
 
 from talkrobot.config import Config
 from talkrobot.modules.memory.memory_module import MemoryModule
+from talkrobot.core.persona_manager import PersonaManager
 
 # 全局变量：表情服务器子进程
 _expression_server_process = None
@@ -242,11 +243,14 @@ def run_chat(args):
     """启动对话机器人"""
     from talkrobot.modules.tts.tts_module import TTSModule
     from talkrobot.modules.llm.llm_module import LLMModule
+    from talkrobot.modules.llm.persona_update_agent import PersonaUpdateAgent
     from talkrobot.core.conversation_manager import ConversationManager
 
     user = args.user
     memory_module = None
     memory_router = None
+    persona_manager = None
+    persona_update_agent = None
     face_resolver = None
     tts_module = None
     audio_recorder = None
@@ -296,6 +300,93 @@ def run_chat(args):
             system_prompt=Config.SYSTEM_PROMPT,
             expression_prompt=expression_prompt
         )
+
+        disable_persona_auto_update = bool(getattr(args, "disable_persona_auto_update", False))
+        enable_persona_auto_update = bool(Config.ENABLE_PERSONA_AUTO_UPDATE and not disable_persona_auto_update)
+        logger.info(
+            f"后台人格自动更新: {'开启' if enable_persona_auto_update else '关闭'}"
+            f" (config={Config.ENABLE_PERSONA_AUTO_UPDATE}, cli_disable={disable_persona_auto_update})"
+        )
+
+        persona_manager = PersonaManager(
+            profile_path=Config.PERSONA_PROFILE_PATH,
+            fallback_prompt=Config.SYSTEM_PROMPT,
+        )
+
+        if enable_persona_auto_update:
+            persona_update_agent = PersonaUpdateAgent(
+                llm_client=llm_module.client,
+                model=Config.LLM_MODEL,
+            )
+
+        def _persona_provider(current_user: str) -> str:
+            persona_prompt = persona_manager.get_prompt_for_user(current_user)
+            global_prompt = (Config.GLOBAL_SYSTEM_PROMPT or "").strip()
+            sections = []
+            if persona_prompt and str(persona_prompt).strip():
+                sections.append(str(persona_prompt).strip())
+            if global_prompt:
+                sections.append(global_prompt)
+            if expression_prompt and str(expression_prompt).strip():
+                sections.append(str(expression_prompt).strip())
+            return "\n\n".join(sections)
+
+        persona_update_handler = None
+        if enable_persona_auto_update:
+            def _persona_update_handler(current_user: str, user_text: str, context: str) -> None:
+                handler_start = time.perf_counter()
+                if persona_update_agent is None:
+                    return
+
+                current_prompt = persona_manager.get_prompt_for_user(current_user)
+                agent_start = time.perf_counter()
+                result = persona_update_agent.run(
+                    user=current_user,
+                    user_input=user_text,
+                    context=context,
+                    current_prompt=current_prompt,
+                )
+                agent_elapsed = time.perf_counter() - agent_start
+                logger.debug(
+                    "人格更新handler耗时: "
+                    f"user={current_user}, agent_call={agent_elapsed:.3f}s, "
+                    f"agent_total={float(result.get('total_elapsed_s', 0.0) or 0.0):.3f}s, "
+                    f"graph={float(result.get('graph_elapsed_s', 0.0) or 0.0):.3f}s, "
+                    f"decide={float(result.get('decide_elapsed_s', 0.0) or 0.0):.3f}s, "
+                    f"propose={float(result.get('propose_elapsed_s', 0.0) or 0.0):.3f}s"
+                )
+
+                if not result.get("should_update", False):
+                    reason = result.get("reason", "skip")
+                    logger.debug(f"人格更新跳过: user={current_user}, reason={reason}")
+                    logger.debug(
+                        f"人格更新handler总耗时: user={current_user}, total={time.perf_counter() - handler_start:.3f}s"
+                    )
+                    return
+
+                updated_prompt = str(result.get("updated_prompt", "") or "").strip()
+                if not updated_prompt:
+                    logger.debug(f"人格更新跳过: user={current_user}, reason=empty_prompt")
+                    logger.debug(
+                        f"人格更新handler总耗时: user={current_user}, total={time.perf_counter() - handler_start:.3f}s"
+                    )
+                    return
+
+                persist_start = time.perf_counter()
+                if persona_manager.update_user_prompt(current_user, updated_prompt):
+                    persist_elapsed = time.perf_counter() - persist_start
+                    logger.info(
+                        f"人格提示词已后台更新: user={current_user}, confidence={result.get('confidence', 0):.2f}"
+                    )
+                    logger.debug(
+                        f"人格更新写回耗时: user={current_user}, persist={persist_elapsed:.3f}s"
+                    )
+
+                logger.debug(
+                    f"人格更新handler总耗时: user={current_user}, total={time.perf_counter() - handler_start:.3f}s"
+                )
+
+            persona_update_handler = _persona_update_handler
 
         enable_face = bool(getattr(args, "enable_face", False))
         memory_provider = None
@@ -366,6 +457,8 @@ def run_chat(args):
             default_user=user,
             user_resolver=user_resolver,
             memory_provider=memory_provider,
+            persona_provider=_persona_provider,
+            persona_update_handler=persona_update_handler,
             say_hallo=getattr(args, 'say_hallo', False),
             greeting_cooldown_seconds=getattr(args, 'hallo_cooldown_seconds', 600.0),
         )
@@ -555,6 +648,10 @@ def main():
         "--hallo-cooldown-seconds", type=float, default=600.0,
         help="主动问好冷却时间（秒），默认600秒=10分钟"
     )
+    chat_parser.add_argument(
+        "--disable-persona-auto-update", action="store_true", default=False,
+        help="关闭后台人格自动更新（LangGraph Agent）"
+    )
 
     # 子命令: add-memory
     mem_parser = subparsers.add_parser("add-memory", help="手动为指定用户添加记忆")
@@ -608,6 +705,10 @@ def main():
     parser.add_argument(
         "--say-hallo", action="store_true", default=False,
         help="(兼容旧版) 在 continuous 的非响应阶段，检测到熟人时主动问好"
+    )
+    parser.add_argument(
+        "--disable-persona-auto-update", action="store_true", default=False,
+        help="(兼容旧版) 关闭后台人格自动更新（LangGraph Agent）"
     )
 
     args = parser.parse_args()

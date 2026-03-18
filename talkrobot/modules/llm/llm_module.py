@@ -27,10 +27,11 @@ class LLMModule:
         self.system_prompt = system_prompt + expression_prompt
         logger.info("LLM模块初始化完成")
 
-    def _build_messages(self, user_input: str, context: str = "") -> List[Dict[str, str]]:
+    def _build_messages(self, user_input: str, context: str = "", system_prompt_override: str = "") -> List[Dict[str, str]]:
         """构建发送给大模型的消息列表。"""
+        system_prompt = (system_prompt_override or "").strip() or self.system_prompt
         messages = [
-            {"role": "system", "content": self.system_prompt}
+            {"role": "system", "content": system_prompt}
         ]
 
         if context:
@@ -42,7 +43,7 @@ class LLMModule:
         messages.append({"role": "user", "content": user_input})
         return messages
     
-    def generate_response(self, user_input: str, context: str = "") -> str:
+    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
         """
         生成对话回复
         
@@ -54,7 +55,7 @@ class LLMModule:
             str: AI回复
         """
         try:
-            messages = self._build_messages(user_input, context)
+            messages = self._build_messages(user_input, context, system_prompt_override)
             
             logger.info(f"正在生成回复,用户输入: {user_input}")
             
@@ -71,7 +72,7 @@ class LLMModule:
             logger.error(f"LLM生成回复出错: {e}")
             return "抱歉,我现在无法回答您的问题。"
 
-    def generate_response_stream(self, user_input: str, context: str = "") -> Iterator[str]:
+    def generate_response_stream(self, user_input: str, context: str = "", system_prompt_override: str = "") -> Iterator[str]:
         """
         流式生成对话回复（按增量文本逐段返回）
 
@@ -83,7 +84,7 @@ class LLMModule:
             str: 流式增量文本片段
         """
         try:
-            messages = self._build_messages(user_input, context)
+            messages = self._build_messages(user_input, context, system_prompt_override)
             logger.info(f"正在流式生成回复,用户输入: {user_input}")
 
             completion = self.client.chat.completions.create(

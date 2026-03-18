@@ -119,6 +119,9 @@ python -m talkrobot.tests.test_memory
 - `TTS_VOICE`: TTS音色选择
 - `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
+- `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
+- `GLOBAL_SYSTEM_PROMPT`: 全局提示词（会拼接在用户人格 prompt 后）
+- `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
@@ -126,6 +129,52 @@ python -m talkrobot.tests.test_memory
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
 
 > 启动参数 `--streaming` 可启用流式回复生成。
+
+### 按用户配置人格 Prompt
+
+系统支持按用户名配置不同的人格 prompt。默认配置文件为 `talkrobot/persona_profiles.json`，示例：
+
+```json
+{
+    "default": {
+        "system_prompt": "你是一个友好、简洁的中文助手。"
+    },
+    "ljc": {
+        "system_prompt": "语气更轻松口语化，回答简短直接。"
+    }
+}
+```
+
+生效优先级：
+
+1. 当前用户专属配置（如 `"ljc"`）
+2. `default.system_prompt`
+3. `Config.SYSTEM_PROMPT`（最终兜底）
+
+最终发送给大模型的 system prompt 按以下顺序拼接：
+
+1. 用户人格 prompt（含 default/Config 回退）
+2. `Config.GLOBAL_SYSTEM_PROMPT`
+3. 表情指令 prompt（若启用表情模块）
+
+> 对于新增用户或未手动配置的用户，系统会自动使用默认人格 prompt。
+
+### 后台自动更新人格（LangGraph）
+
+系统支持在单轮对话中后台触发人格更新 Agent（不阻塞当前回复生成）：
+
+- 分支1：判断是否需要更新人格 prompt
+- 分支2：生成候选新版人格 prompt
+
+上述两个分支由 LangGraph 并行执行；若判定通过，会将更新结果写回 `talkrobot/persona_profiles.json`，并在后续轮次生效。
+
+若环境未安装 LangGraph，则自动跳过该能力，不影响原有对话功能。
+
+可通过启动参数临时关闭：
+
+```bash
+python -m talkrobot.main chat --disable-persona-auto-update
+```
 
 > 启动参数 `--enable-face` 启用人脸识别后，会根据当前识别对象自动切换用户；
 > 若该对象不存在长期记忆数据，则自动回退为“仅滑动窗口短期记忆”模式。
