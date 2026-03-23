@@ -6,9 +6,8 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
-from typing import List, Union
+from typing import List, Optional, Union
 
-from kokoro import KPipeline
 import sounddevice as sd
 import numpy as np
 from loguru import logger
@@ -16,21 +15,96 @@ from loguru import logger
 class TTSModule:
     """语音合成模块"""
     
-    def __init__(self, lang_code: str = 'z', voice: str = 'zf_xiaoyi', speed: float = 1.0):
+    def __init__(
+        self,
+        lang_code: str = 'z',
+        voice: str = 'zf_xiaoyi',
+        speed: float = 1.0,
+        provider: str = 'kokoro',
+        language: Optional[str] = None,
+        sample_rate: int = 24000,
+    ):
         """
         初始化TTS模块
         
         Args:
-            lang_code: 语言代码 ('z' 代表中文)
+            lang_code: Kokoro语言代码（兼容保留，默认'z'）
             voice: 音色名称
             speed: 语速
+            provider: TTS后端，支持 'kokoro' / 'easy_tts_server'
+            language: 语言，支持 'zh' / 'en'，不传则沿用 lang_code
+            sample_rate: 采样率
         """
-        logger.info(f"正在初始化TTS模块: lang={lang_code}, voice={voice}")
-        self.pipeline = KPipeline(lang_code=lang_code)
+        self.provider = str(provider).strip().lower()
+        self.language = self._normalize_language(language) if language is not None else None
+        self.sample_rate = sample_rate
         self.voice = voice
         self.speed = speed
+        self.pipeline = None
+        self.easy_tts_engine = None
+
+        logger.info(
+            f"正在初始化TTS模块: provider={self.provider}, language={self.language}, "
+            f"lang_code={lang_code}, voice={voice}"
+        )
+
+        if self.provider == "kokoro":
+            from kokoro import KPipeline
+
+            resolved_lang_code = self._resolve_kokoro_lang_code(self.language, lang_code)
+            self.pipeline = KPipeline(lang_code=resolved_lang_code)
+        elif self.provider == "easy_tts_server":
+            try:
+                from easy_tts_server import create_tts_engine
+            except ImportError as e:
+                raise ImportError(
+                    "使用 easy_tts_server 作为TTS后端时，请先安装依赖: pip install easy_tts_server"
+                ) from e
+
+            self.easy_tts_engine = create_tts_engine()
+            self.sample_rate = self._get_easy_sample_rate(default=sample_rate)
+        else:
+            raise ValueError(f"不支持的TTS后端: {provider}，可选: kokoro / easy_tts_server")
+
         self._interrupted = threading.Event()
         logger.info("TTS模块初始化完成")
+
+    @staticmethod
+    def _normalize_language(language: str) -> str:
+        language = str(language).strip().lower()
+        mapping = {
+            "zh": "zh",
+            "cn": "zh",
+            "chinese": "zh",
+            "z": "zh",
+            "en": "en",
+            "english": "en",
+            "e": "en",
+        }
+        return mapping.get(language, "zh")
+
+    @staticmethod
+    def _resolve_kokoro_lang_code(language: Optional[str], lang_code: str) -> str:
+        if language is not None:
+            return "z" if language == "zh" else "a"
+
+        if lang_code and str(lang_code).strip():
+            normalized = str(lang_code).strip().lower()
+            if normalized in {"zh", "z"}:
+                return "z"
+            if normalized in {"en", "a"}:
+                return "a"
+            return normalized
+
+        return "z"
+
+    def _get_easy_sample_rate(self, default: int) -> int:
+        for attr_name in ("sample_rate", "sampling_rate", "sr"):
+            value = getattr(self.easy_tts_engine, attr_name, None)
+            if isinstance(value, int) and value > 0:
+                logger.info(f"easy_tts_server 采样率: {value}")
+                return value
+        return default
     
     def stop(self):
         """打断当前TTS播放"""
@@ -43,7 +117,7 @@ class TTSModule:
     def _play_audio_chunk(self, audio: np.ndarray, index: int) -> bool:
         """播放单段音频，返回是否被中断。"""
         logger.debug(f"播放第{index}段音频，长度{len(audio)}")
-        sd.play(audio, 24000, blocking=False)
+        sd.play(audio, self.sample_rate, blocking=False)
 
         total_samples = len(audio)
         played_samples = 0
@@ -59,7 +133,7 @@ class TTSModule:
                 break
 
             try:
-                played_samples = int(stream.latency[1] * 24000)
+                played_samples = int(stream.latency[1] * self.sample_rate)
             except Exception:
                 pass
 
@@ -69,30 +143,47 @@ class TTSModule:
 
     def _synthesize_single_text(self, text: str, play_audio: bool, start_index: int = 0) -> tuple[List[np.ndarray], bool]:
         """合成单条文本，返回(音频列表, 是否被中断)。"""
-        audio_chunks: List[np.ndarray] = []
-        generator = self.pipeline(text, voice=self.voice, speed=self.speed)
-        interrupted = False
+        if self.provider == "kokoro":
+            audio_chunks: List[np.ndarray] = []
+            generator = self.pipeline(text, voice=self.voice, speed=self.speed)
+            interrupted = False
 
-        try:
-            for offset, (_gs, _ps, audio) in enumerate(generator):
-                if self._interrupted.is_set():
-                    logger.info("TTS播放被打断，停止合成（生成前）")
-                    interrupted = True
-                    break
-
-                audio_chunks.append(audio)
-
-                if play_audio:
-                    interrupted = self._play_audio_chunk(audio, start_index + offset)
-                    if interrupted:
-                        logger.info("TTS播放被打断，停止合成（播放后）")
+            try:
+                for offset, (_gs, _ps, audio) in enumerate(generator):
+                    if self._interrupted.is_set():
+                        logger.info("TTS播放被打断，停止合成（生成前）")
+                        interrupted = True
                         break
 
-                logger.debug(f"第 {start_index + offset} 段完成")
-        except GeneratorExit:
-            logger.debug("生成器已关闭")
+                    audio_chunks.append(audio)
 
-        return audio_chunks, interrupted
+                    if play_audio:
+                        interrupted = self._play_audio_chunk(audio, start_index + offset)
+                        if interrupted:
+                            logger.info("TTS播放被打断，停止合成（播放后）")
+                            break
+
+                    logger.debug(f"第 {start_index + offset} 段完成")
+            except GeneratorExit:
+                logger.debug("生成器已关闭")
+
+            return audio_chunks, interrupted
+
+        if self.provider == "easy_tts_server":
+            if self._interrupted.is_set():
+                return [], True
+
+            language = self.language or "zh"
+            audio = self.easy_tts_engine.tts(text, language=language, voice=self.voice)
+            audio_array = np.asarray(audio)
+            audio_chunks = [audio_array]
+            interrupted = False
+
+            if play_audio:
+                interrupted = self._play_audio_chunk(audio_array, start_index)
+            return audio_chunks, interrupted
+
+        raise ValueError(f"不支持的TTS后端: {self.provider}")
 
     def _synthesize_from_iterable(self, text_stream: Iterable[str], play_audio: bool) -> List[np.ndarray]:
         """从字符串迭代器持续合成；按逗号聚句并并行合成。"""
@@ -104,7 +195,7 @@ class TTSModule:
         def _sentence_iter(stream: Iterable[str]) -> Iterable[str]:
             """从增量文本中按逗号聚合完整句子并依次产出。"""
             buffer = ""
-            delimiters = ( "。", "：", "？", "?", "！", "!", "；", ";", "\n","～")
+            delimiters = ("。", "：", "？", "?", "！", "!", "；", ";", "，", ",", ".", ":", "\n", "～")
 
             for part in stream:
                 if self._interrupted.is_set():
@@ -240,7 +331,7 @@ class TTSModule:
             import soundfile as sf
             # 合并所有音频片段
             full_audio = np.concatenate(audio_chunks)
-            sf.write(filepath, full_audio, 24000)
+            sf.write(filepath, full_audio, self.sample_rate)
             logger.info(f"音频已保存至: {filepath}")
             return True
         except Exception as e:

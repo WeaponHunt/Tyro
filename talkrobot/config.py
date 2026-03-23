@@ -32,6 +32,8 @@ class Config:
     ASR_DEVICE = "cuda"  # 或 "cpu"
     
     # TTS 配置
+    TTS_PROVIDER = "easy_tts_server"  # 可选: kokoro / easy_tts_server
+    LANGUAGE = "zh"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
     TTS_LANG_CODE = 'z'  # 中文
     TTS_VOICE = 'zf_xiaoyi'
     TTS_SPEED = 1.0
@@ -50,6 +52,7 @@ class Config:
     # 人脸识别配置
     FACE_ENABLED = False
     FACE_CAMERA_INDEX = 0
+    FACE_POLL_INTERVAL = 0.03
     FACE_USE_GPU = True
     FACE_MODEL_NAME = "buffalo_s"
     FACE_UNKNOWN_USER = "guest"
@@ -75,6 +78,12 @@ class Config:
         音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
         生成的文本要便于tts朗读，比如”10-15“应该生成为“10到15”避免tts把”-“读成”减“。"""
 
+    GLOBAL_SYSTEM_PROMPT_EN = """Please follow these principles:
+        Semantic-first: if an utterance is awkward or unclear, infer the most likely user intent from context (for example, treat minor ASR mistakes as likely homophone errors).
+        Homophone correction: for ambiguous words, prefer phonetically similar and contextually correct terms.
+        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "10 to 15" instead of "10-15" to avoid reading '-' as "minus".
+        Language policy: answer the user in English no matter what."""
+
     # 是否启用后台人格自动更新（LangGraph Agent）
     ENABLE_PERSONA_AUTO_UPDATE = True
 
@@ -88,6 +97,13 @@ class Config:
         语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
         音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
         保持自然：直接回答用户的潜在意图，除非完全无法理解，否则不要反复询问用户是否说错了。"""
+
+    SYSTEM_PROMPT_EN = """Your name is Tyro, a friendly, helpful, and efficient AI assistant. Answer user questions in concise, natural English.
+    Note: your input comes from an ASR (speech recognition) system, so it may contain homophone errors, missing words, extra words, or incorrect sentence boundaries.
+    When handling user input, follow these principles:
+        Semantic-first: if a sentence is not fluent literally, infer the user's most likely intent from context.
+        Homophone correction: for ambiguous terms, prioritize phonetically similar and contextually correct words.
+        Keep it natural: directly answer the user's likely intent; unless it is completely unintelligible, avoid repeatedly asking whether the user spoke incorrectly."""
     
 
     @classmethod

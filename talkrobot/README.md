@@ -38,7 +38,7 @@ talkrobot/
 ## 安装依赖
 
 ```bash
-pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
+pip install funasr kokoro easy_tts_server openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
 ```
 
 ## 使用方法
@@ -59,6 +59,18 @@ python -m talkrobot.main chat --user ljc
 # 关闭TTS语音播放（仅显示文字回复）
 python -m talkrobot.main --user ljc --no-tts
 python -m talkrobot.main chat --user ljc --no-tts
+
+# 使用 easy_tts_server 作为 TTS 后端（中文）
+python -m talkrobot.main chat --tts-provider easy_tts_server --language zh
+
+# 使用 Kokoro 作为 TTS 后端（英文）
+python -m talkrobot.main chat --tts-provider kokoro --language en
+
+# 控制大模型用英文回复
+python -m talkrobot.main chat --language en
+
+# 控制大模型用中文回复
+python -m talkrobot.main chat --language zh
 
 # 使用持续监听模式（无需按键，直接说话即可）
 python -m talkrobot.main --user ljc --listen-mode continuous
@@ -117,6 +129,8 @@ python -m talkrobot.tests.test_memory
 
 - `ASR_DEVICE`: ASR运行设备 (cuda/cpu)
 - `TTS_VOICE`: TTS音色选择
+- `TTS_PROVIDER`: TTS后端选择 (`kokoro` / `easy_tts_server`)
+- `LANGUAGE`: 统一语言开关 (`zh` / `en`，同时作用于TTS和LLM)
 - `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
 - `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
@@ -218,7 +232,8 @@ python -m talkrobot.main chat --disable-persona-auto-update
 - 支持GPU加速
 
 ### TTSModule (语音合成)
-- 使用 Kokoro TTS
+- 支持 Kokoro / easy_tts_server 双后端
+- 支持中文与英文
 - 支持多种音色
 - 实时流式播放
 - 支持字符串与生成器输入

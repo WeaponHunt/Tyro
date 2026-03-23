@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import argparse
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +14,20 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 from loguru import logger
+
+try:
+	import rclpy
+	from rclpy.node import Node
+	from geometry_msgs.msg import PolygonStamped, Point32
+	from sensor_msgs.msg import Image
+	ROS2_AVAILABLE = True
+except Exception:
+	rclpy = None
+	Node = None
+	PolygonStamped = None
+	Point32 = None
+	Image = None
+	ROS2_AVAILABLE = False
 
 
 @dataclass
@@ -24,6 +40,94 @@ class FaceTrack:
 	best_quality: float = 0.0
 	missed_frames: int = 0
 	similarity: float = 0.0
+
+
+class _Ros2TopicPublisher:
+	"""负责发布图像与人脸框 topic 的轻量 ROS2 发布器。"""
+
+	def __init__(
+		self,
+		node_name: str,
+		image_topic: str,
+		bbox_topic: str,
+		qos_depth: int = 10,
+	):
+		self.enabled = False
+		self._node = None
+		self._image_pub = None
+		self._bbox_pub = None
+		self._self_inited_rclpy = False
+
+		if not ROS2_AVAILABLE:
+			logger.warning("ROS2 依赖不可用，跳过人脸 topic 发布")
+			return
+
+		if not rclpy.ok():
+			rclpy.init()
+			self._self_inited_rclpy = True
+
+		self._node = Node(node_name)
+		self._image_pub = self._node.create_publisher(Image, image_topic, qos_depth)
+		self._bbox_pub = self._node.create_publisher(PolygonStamped, bbox_topic, qos_depth)
+		self.enabled = True
+
+		logger.info(
+			f"ROS2 topic 发布已启用: image={image_topic}, bbox={bbox_topic}, node={node_name}"
+		)
+
+	def publish(self, frame: np.ndarray, result: Dict[str, object]) -> None:
+		if not self.enabled or self._node is None:
+			return
+		stamp = self._node.get_clock().now().to_msg()
+
+		image_msg = Image()
+		image_msg.header.stamp = stamp
+		image_msg.header.frame_id = "camera"
+		image_msg.height = int(frame.shape[0])
+		image_msg.width = int(frame.shape[1])
+		image_msg.encoding = "bgr8"
+		image_msg.is_bigendian = 0
+		image_msg.step = int(frame.shape[1] * frame.shape[2])
+		image_msg.data = frame.tobytes()
+		self._image_pub.publish(image_msg)
+
+		bbox = result.get("bbox")
+		quality = float(result.get("quality", 0.0))
+		similarity = float(result.get("similarity", 0.0))
+		tracked = bool(result.get("tracked", False)) and bbox is not None
+
+		bbox_msg = PolygonStamped()
+		bbox_msg.header.stamp = stamp
+		bbox_msg.header.frame_id = "camera"
+		if tracked:
+			x1, y1, x2, y2 = [float(v) for v in bbox]
+			bbox_msg.polygon.points = [
+				Point32(x=x1, y=y1, z=0.0),
+				Point32(x=x2, y=y1, z=0.0),
+				Point32(x=x2, y=y2, z=0.0),
+				Point32(x=x1, y=y2, z=0.0),
+			]
+			bbox_msg.polygon.points[0].z = float(quality)
+			bbox_msg.polygon.points[1].z = float(similarity)
+			bbox_msg.polygon.points[2].z = 1.0
+			bbox_msg.polygon.points[3].z = 0.0
+		self._bbox_pub.publish(bbox_msg)
+
+	def shutdown(self) -> None:
+		if self._node is not None:
+			try:
+				self._node.destroy_node()
+			except Exception as e:
+				logger.warning(f"ROS2 节点释放异常: {e}")
+			self._node = None
+
+		if self._self_inited_rclpy and ROS2_AVAILABLE and rclpy.ok():
+			try:
+				rclpy.shutdown()
+			except Exception as e:
+				logger.warning(f"ROS2 关闭异常: {e}")
+
+		self.enabled = False
 
 
 class FaceRecognitionModule:
@@ -41,6 +145,11 @@ class FaceRecognitionModule:
 		iou_threshold: float = 0.25,
 		max_missed_frames: int = 15,
 		use_gpu: bool = True,
+		enable_ros2_publish: bool = True,
+		ros2_node_name: str = "talkrobot_face_module",
+		ros2_image_topic: str = "/face/camera/image_raw",
+		ros2_bbox_topic: str = "/face/tracking/bbox",
+		ros2_qos_depth: int = 10,
 	):
 		"""
 		初始化人脸识别模块
@@ -54,12 +163,18 @@ class FaceRecognitionModule:
 			iou_threshold: 追踪时判定同一目标的 IoU 阈值
 			max_missed_frames: 最多允许丢帧数量
 			use_gpu: 是否优先使用 GPU
+			enable_ros2_publish: 是否发布 ROS2 topic
+			ros2_node_name: ROS2 节点名
+			ros2_image_topic: 图像 topic
+			ros2_bbox_topic: 人脸框 topic
+			ros2_qos_depth: ROS2 发布队列深度
 		"""
 		self.known_faces_dir = Path(known_faces_dir)
 		self.recognition_threshold = recognition_threshold
 		self.quality_threshold = quality_threshold
 		self.iou_threshold = iou_threshold
 		self.max_missed_frames = max_missed_frames
+		self._ros2_publisher: Optional[_Ros2TopicPublisher] = None
 
 		self.current_track: Optional[FaceTrack] = None
 		self.known_embeddings: Dict[str, List[np.ndarray]] = {}
@@ -76,6 +191,28 @@ class FaceRecognitionModule:
 				raise
 
 		self._build_known_faces_index()
+
+		if enable_ros2_publish and ROS2_AVAILABLE:
+			try:
+				self._ros2_publisher = _Ros2TopicPublisher(
+					node_name=ros2_node_name,
+					image_topic=ros2_image_topic,
+					bbox_topic=ros2_bbox_topic,
+					qos_depth=ros2_qos_depth,
+				)
+			except Exception as e:
+				logger.warning(f"ROS2 发布器初始化失败，继续仅本地识别: {e}")
+				self._ros2_publisher = None
+		elif enable_ros2_publish and not ROS2_AVAILABLE:
+			logger.warning("ROS2 不可用，已自动禁用 topic 发布，仅保留人脸识别与追踪")
+
+	def _publish_ros2_topics(self, frame: np.ndarray, result: Dict[str, object]) -> None:
+		if self._ros2_publisher is None:
+			return
+		try:
+			self._ros2_publisher.publish(frame, result)
+		except Exception as e:
+			logger.debug(f"发布 ROS2 topic 失败: {e}")
 
 	def _build_known_faces_index(self) -> None:
 		"""从 known_faces 目录构建已知人脸 embedding 索引"""
@@ -262,7 +399,7 @@ class FaceRecognitionModule:
 				self.current_track.missed_frames += 1
 				if self.current_track.missed_frames > self.max_missed_frames:
 					self.current_track = None
-			return {
+			result = {
 				"label": "无人脸",
 				"bbox": None,
 				"quality": 0.0,
@@ -270,10 +407,12 @@ class FaceRecognitionModule:
 				"tracked": False,
 				"frame": frame,
 			}
+			self._publish_ros2_topics(frame, result)
+			return result
 
 		center_face = self._pick_center_face(frame, faces)
 		if center_face is None:
-			return {
+			result = {
 				"label": "无人脸",
 				"bbox": None,
 				"quality": 0.0,
@@ -281,12 +420,14 @@ class FaceRecognitionModule:
 				"tracked": False,
 				"frame": frame,
 			}
+			self._publish_ros2_topics(frame, result)
+			return result
 
 		self._update_track(frame, center_face)
 		self._maybe_lock_identity(frame, center_face)
 
 		if self.current_track is None:
-			return {
+			result = {
 				"label": "无人脸",
 				"bbox": None,
 				"quality": 0.0,
@@ -294,6 +435,8 @@ class FaceRecognitionModule:
 				"tracked": False,
 				"frame": frame,
 			}
+			self._publish_ros2_topics(frame, result)
+			return result
 
 		quality = self._face_quality_score(frame, center_face)
 		label = self.current_track.label if self.current_track.is_identity_locked else "识别中"
@@ -306,7 +449,36 @@ class FaceRecognitionModule:
 			"tracked": True,
 			"frame": frame,
 		}
+		self._publish_ros2_topics(frame, result)
 		return result
+
+	def shutdown(self) -> None:
+		if self._ros2_publisher is not None:
+			self._ros2_publisher.shutdown()
+			self._ros2_publisher = None
+
+	def run_as_ros2_node(self, camera_index: int = 0) -> None:
+		"""作为独立 ROS2 节点运行（按 Ctrl+C 退出）。"""
+		cap = cv2.VideoCapture(camera_index)
+		if not cap.isOpened():
+			raise RuntimeError(f"无法打开摄像头: index={camera_index}")
+
+		logger.info("ROS2 人脸节点启动，按 Ctrl+C 退出")
+		try:
+			while True:
+				ok, frame = cap.read()
+				if not ok:
+					logger.warning("摄像头读取失败")
+					time.sleep(0.05)
+					continue
+
+				self.process_frame(frame)
+		except KeyboardInterrupt:
+			pass
+		finally:
+			cap.release()
+			self.shutdown()
+			logger.info("ROS2 人脸节点已停止")
 
 	def annotate_frame(self, frame: np.ndarray, result: Dict[str, object]) -> np.ndarray:
 		"""在图像上绘制识别结果"""
@@ -349,16 +521,42 @@ class FaceRecognitionModule:
 		finally:
 			cap.release()
 			cv2.destroyAllWindows()
+			self.shutdown()
 			logger.info("人脸监测已停止")
+
+	def __del__(self):
+		try:
+			self.shutdown()
+		except Exception:
+			pass
 
 
 if __name__ == "__main__":
+	if not ROS2_AVAILABLE:
+		logger.warning("未检测到 ROS2 Python 依赖，将继续运行但不发布 ROS2 topic")
+
 	current_dir = Path(__file__).resolve().parent
-	known_dir = current_dir / "known_faces"
+	default_known_dir = current_dir / "known_faces"
+
+	parser = argparse.ArgumentParser(description="FaceRecognitionModule 独立 ROS2 节点")
+	parser.add_argument("--camera-index", type=int, default=0)
+	parser.add_argument("--known-faces-dir", type=str, default=str(default_known_dir))
+	parser.add_argument("--model-name", type=str, default="buffalo_s")
+	parser.add_argument("--image-topic", type=str, default="/face/camera/image_raw")
+	parser.add_argument("--bbox-topic", type=str, default="/face/tracking/bbox")
+	gpu_group = parser.add_mutually_exclusive_group()
+	gpu_group.add_argument("--use-gpu", dest="use_gpu", action="store_true")
+	gpu_group.add_argument("--no-gpu", dest="use_gpu", action="store_false")
+	parser.set_defaults(use_gpu=True)
+	args = parser.parse_args()
 
 	module = FaceRecognitionModule(
-		known_faces_dir=str(known_dir),
-		model_name="buffalo_s",
-		use_gpu=True,
+		known_faces_dir=args.known_faces_dir,
+		model_name=args.model_name,
+		use_gpu=args.use_gpu,
+		enable_ros2_publish=True,
+		ros2_node_name="talkrobot_face_node",
+		ros2_image_topic=args.image_topic,
+		ros2_bbox_topic=args.bbox_topic,
 	)
-	module.monitor_camera(camera_index=0)
+	module.run_as_ros2_node(camera_index=args.camera_index)

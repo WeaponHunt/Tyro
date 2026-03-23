@@ -18,7 +18,10 @@ def test_tts():
     tts = TTSModule(
         lang_code=Config.TTS_LANG_CODE,
         voice=Config.TTS_VOICE,
-        speed=Config.TTS_SPEED
+        speed=Config.TTS_SPEED,
+        provider=Config.TTS_PROVIDER,
+        language=Config.LANGUAGE,
+        sample_rate=Config.TTS_SAMPLE_RATE,
     )
     init_elapsed = time.perf_counter() - init_start
     print(f"初始化耗时: {init_elapsed:.3f}s")

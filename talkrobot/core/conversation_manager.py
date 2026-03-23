@@ -27,6 +27,7 @@ class ConversationManager:
                  memory_provider: Optional[Callable[[str], Tuple[Optional[object], bool]]] = None,
                  persona_provider: Optional[Callable[[str], str]] = None,
                  persona_update_handler: Optional[Callable[[str, str, str], None]] = None,
+                 language: str = "zh",
                  say_hallo: bool = False,
                  greeting_cooldown_seconds: float = 600.0):
         """
@@ -85,8 +86,11 @@ class ConversationManager:
         self._pending_user_switch_notice = ""
         self._is_continuous_mode = bool(audio_recorder and audio_recorder.listen_mode == "continuous")
         self._response_enabled = not self._is_continuous_mode
-        self._wake_word = "你好"
-        self._sleep_word = "再见"
+        self.language = (language or "zh").strip().lower()
+        if self.language not in {"zh", "en"}:
+            self.language = "zh"
+        self._wake_words = ["hello", "hi", "hey"] if self._is_english else ["你好"]
+        self._sleep_words = ["goodbye", "bye", "seeyou"] if self._is_english else ["再见"]
         self._say_hallo = bool(say_hallo)
         self._greeting_response_window_seconds = 10.0
         self._pending_greeting_deadline: Optional[float] = None
@@ -103,7 +107,17 @@ class ConversationManager:
             f"流式: {'开启' if streaming else '关闭'}, 表情: {expr_status}, 滑动窗口轮数: {self.history_rounds})"
         )
         if self._is_continuous_mode:
-            logger.info("continuous 模式已启用响应开关：说“你好”进入响应，说“再见”退出响应")
+            if self._is_english:
+                logger.info("continuous mode wake/sleep commands enabled: say 'hello' to wake, 'goodbye' to sleep")
+            else:
+                logger.info("continuous 模式已启用响应开关：说“你好”进入响应，说“再见”退出响应")
+
+    @property
+    def _is_english(self) -> bool:
+        return self.language == "en"
+
+    def _msg(self, zh: str, en: str) -> str:
+        return en if self._is_english else zh
 
     def _resolve_active_user(self) -> str:
         """解析当前交互用户。"""
@@ -238,7 +252,11 @@ class ConversationManager:
                 return
 
             try:
-                memory_context = self.memory.search_memory("这个用户叫什么名字？我应该如何称呼TA？")
+                memory_context = self.memory.search_memory(
+                    "What is this user's name and how should I address them?"
+                    if self._is_english
+                    else "这个用户叫什么名字？我应该如何称呼TA？"
+                )
             except Exception as e:
                 logger.warning(f"say_hallo 记忆检索失败: {e}")
                 memory_context = ""
@@ -248,6 +266,11 @@ class ConversationManager:
                 return
 
             greeting_instruction = (
+                "You just met a familiar person. Use only the provided memory to decide how to address them. "
+                "Say one short and natural greeting in English. "
+                "If the name cannot be confirmed from memory, say exactly: 'Hello, welcome back.' "
+                "Do not make up extra details and do not mention memory retrieval."
+                if self._is_english else
                 "你刚见到一位熟人。请仅基于提供的记忆判断对方称呼，"
                 "用一句简短自然的中文主动问好。"
                 "如果记忆里无法确认名字，直接说“你好，欢迎回来”。"
@@ -284,12 +307,16 @@ class ConversationManager:
             if expression_name and self.expression and self.expression.is_available:
                 self.expression.set_expression(expression_name)
 
-            print(f"🤖 主动问好: {response}")
+            print(f"🤖 {self._msg('主动问好', 'Greeting')}: {response}")
 
             self._last_greet_ts_by_user[self._active_user] = time.time()
 
             # 将主动问好写入短期滑动窗口，便于后续上下文连续
-            self._append_dialogue_round(self._active_user, "（机器人主动问好）", response)
+            self._append_dialogue_round(
+                self._active_user,
+                self._msg("（机器人主动问好）", "(Assistant proactive greeting)"),
+                response,
+            )
 
             # 开启“问好后应答窗口”：5秒内用户应答可直接进入响应模式
             self._pending_greeting_deadline = time.time() + self._greeting_response_window_seconds
@@ -366,6 +393,7 @@ class ConversationManager:
         if not text:
             return ""
         cleaned = re.sub(r"<\|[^>]*\|>", "", text)
+        cleaned = cleaned.casefold()
         cleaned = re.sub(r"\s+", "", cleaned)
         cleaned = re.sub(r"[，。！？、；：,.!?;:\"'‘’“”\[\]()（）]", "", cleaned)
         return cleaned
@@ -390,27 +418,27 @@ class ConversationManager:
             if time.time() <= self._pending_greeting_deadline:
                 self._response_enabled = True
                 self._pending_greeting_deadline = None
-                logger.info("检测到问好后5秒内应答，自动进入响应模式")
-                print("✅ 已进入响应模式（已识别为对问好的应答）")
+                logger.info(self._msg("检测到问好后5秒内应答，自动进入响应模式", "Detected a response within the greeting window, entering response mode"))
+                print(self._msg("✅ 已进入响应模式（已识别为对问好的应答）", "✅ Response mode enabled (detected as greeting reply)"))
             else:
                 self._pending_greeting_deadline = None
 
         if not self._response_enabled:
-            if self._wake_word in normalized_text:
+            if any(word in normalized_text for word in self._wake_words):
                 self._response_enabled = True
                 self._pending_greeting_deadline = None
-                logger.info("检测到唤醒词“你好”，进入响应模式")
-                print("✅ 已进入响应模式")
+                logger.info(self._msg("检测到唤醒词“你好”，进入响应模式", "Wake word detected, entering response mode"))
+                print(self._msg("✅ 已进入响应模式", "✅ Response mode enabled"))
             else:
                 logger.debug("当前为非响应模式，忽略本次语音")
-                print("🤫 当前非响应模式（说“你好”可唤醒）")
+                print(self._msg("🤫 当前非响应模式（说“你好”可唤醒）", "🤫 Non-response mode (say 'hello' to wake)"))
                 return False
 
-        if self._sleep_word in normalized_text:
+        if any(word in normalized_text for word in self._sleep_words):
             # 新增：先主动告别
-            farewell = "再见，下次再聊！"
-            print(f"🤖 机器人: {farewell}")
-            logger.info("检测到“再见”，机器人主动告别")
+            farewell = self._msg("再见，下次再聊！", "Goodbye, talk to you next time!")
+            print(f"🤖 {self._msg('机器人', 'Assistant')}: {farewell}")
+            logger.info(self._msg("检测到“再见”，机器人主动告别", "Sleep word detected, assistant says goodbye"))
             if self.tts_enabled and self.tts is not None:
                 if self.audio_recorder:
                     self.audio_recorder.is_tts_playing = True
@@ -423,8 +451,8 @@ class ConversationManager:
             self._clear_sliding_window(self._active_user)
             self._response_enabled = False
             self._pending_greeting_deadline = None
-            logger.info("检测到“再见”，退出响应模式")
-            print("🛑 已退出响应模式（后续语音将忽略，说“你好”可重新唤醒）")
+            logger.info(self._msg("检测到“再见”，退出响应模式", "Sleep word detected, exit response mode"))
+            print(self._msg("🛑 已退出响应模式（后续语音将忽略，说“你好”可重新唤醒）", "🛑 Response mode disabled (later speech will be ignored, say 'hello' to wake again)"))
             return False
 
         return True
@@ -449,10 +477,10 @@ class ConversationManager:
         memory_start = time.perf_counter()
         memory_context = ""
         if self._active_user_has_long_term_memory and self.memory is not None:
-            print("🔍 正在检索相关记忆...")
+            print(self._msg("🔍 正在检索相关记忆...", "🔍 Retrieving relevant memory..."))
             memory_context = self.memory.search_memory(user_text)
         else:
-            print("🧠 当前仅使用短期记忆（滑动窗口）...")
+            print(self._msg("🧠 当前仅使用短期记忆（滑动窗口）...", "🧠 Using short-term memory only (sliding window)..."))
 
         sliding_window_context = self._build_sliding_window_context(self._active_user)
         context = self._merge_context(memory_context, sliding_window_context)
@@ -468,7 +496,7 @@ class ConversationManager:
         persona_async_schedule_ts = self._start_persona_update_async(self._active_user, user_text, context)
 
         # 4. LLM: 生成回复
-        print("🤖 正在思考回复...")
+        print(self._msg("🤖 正在思考回复...", "🤖 Thinking..."))
         logger.debug("开始LLM生成回复")
         llm_start = time.perf_counter()
         if self.debug_timing and persona_async_schedule_ts > 0:
@@ -554,10 +582,10 @@ class ConversationManager:
                     print(buffered_prefix, end="", flush=True)
                     yield buffered_prefix
 
-            print("🤖 机器人: ", end="", flush=True)
+            print(self._msg("🤖 机器人: ", "🤖 Assistant: "), end="", flush=True)
 
             if self.tts_enabled:
-                print("\n🔊 正在播放语音... (按 'S' 键可打断)")
+                print(self._msg("\n🔊 正在播放语音... (按 'S' 键可打断)", "\n🔊 Playing audio... (press 'S' to interrupt)"))
                 logger.debug("开始流式TTS播放")
 
                 def _on_press_interrupt_streaming(key):
@@ -614,7 +642,7 @@ class ConversationManager:
             response = raw_response
 
         if not self.streaming:
-            print(f"🤖 机器人: {response}")
+            print(f"🤖 {self._msg('机器人', 'Assistant')}: {response}")
         if expression_name:
             logger.info(f"检测到表情: {expression_name}")
 
@@ -635,7 +663,7 @@ class ConversationManager:
 
         # 6. TTS: 文字转语音并播放
         if self.tts_enabled and not tts_played_in_streaming:
-            print("🔊 正在播放语音... (按 'S' 键可打断)")
+            print(self._msg("🔊 正在播放语音... (按 'S' 键可打断)", "🔊 Playing audio... (press 'S' to interrupt)"))
             logger.debug("开始TTS播放")
 
             # 启动临时键盘监听器，按 S 键打断 TTS
@@ -672,7 +700,7 @@ class ConversationManager:
                 logger.debug("TTS播放流程已结束")
 
             if self.tts._interrupted.is_set():
-                print("⏹️ 语音播放已打断")
+                print(self._msg("⏹️ 语音播放已打断", "⏹️ Audio playback interrupted"))
                 logger.debug("TTS播放被打断")
             else:
                 logger.debug("TTS播放正常完成")
@@ -686,11 +714,11 @@ class ConversationManager:
 
         print("\n" + "-"*50)
         if self.audio_recorder and self.audio_recorder.listen_mode == "continuous":
-            print("✅ 对话完成，请继续说话")
+            print(self._msg("✅ 对话完成，请继续说话", "✅ Done. Please continue speaking"))
         elif self.audio_recorder:
-            print("✅ 对话完成，请继续按 'Q' 说话")
+            print(self._msg("✅ 对话完成，请继续按 'Q' 说话", "✅ Done. Hold 'Q' to speak again"))
         else:
-            print("✅ 对话完成，请继续输入")
+            print(self._msg("✅ 对话完成，请继续输入", "✅ Done. Please continue typing"))
         print("-"*50 + "\n")
         logger.debug("对话流程完成")
     
@@ -711,18 +739,18 @@ class ConversationManager:
             
             if duration < self.audio_min_duration:
                 logger.info(f"音频过短 ({duration:.2f}s < {self.audio_min_duration}s)，已忽略")
-                print(f"\n⚠️ 音频过短 ({duration:.2f}秒)，已忽略")
+                print(self._msg(f"\n⚠️ 音频过短 ({duration:.2f}秒)，已忽略", f"\n⚠️ Audio too short ({duration:.2f}s), ignored"))
                 return
             
             if rms < self.audio_min_rms:
                 logger.info(f"音量过低 (RMS={rms:.4f} < {self.audio_min_rms})，已忽略")
-                print(f"\n⚠️ 音量过低，已忽略")
+                print(self._msg("\n⚠️ 音量过低，已忽略", "\n⚠️ Volume too low, ignored"))
                 return
             
             logger.debug(f"音频检查通过: 时长={duration:.2f}s, RMS={rms:.4f}")
             
             # 1. ASR: 语音转文字
-            print("\n🎯 正在识别...")
+            print(self._msg("\n🎯 正在识别...", "\n🎯 Recognizing..."))
             logger.debug("开始ASR识别")
             asr_start = time.perf_counter()
             user_text = self.asr.transcribe(audio_data)
@@ -731,11 +759,11 @@ class ConversationManager:
             logger.debug(f"ASR识别完成: {user_text}")
             
             if not user_text or user_text.strip() == "":
-                print("⚠️ 未识别到有效内容,请重试")
+                print(self._msg("⚠️ 未识别到有效内容,请重试", "⚠️ No valid speech recognized, please try again"))
                 logger.debug("ASR识别为空")
                 return
             
-            print(f"👤 您说: {user_text}")
+            print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
             if not self._handle_continuous_mode_command(user_text):
                 return
 
@@ -755,11 +783,11 @@ class ConversationManager:
         """处理终端输入文本,完成完整对话流程。"""
         try:
             if not user_text or user_text.strip() == "":
-                print("⚠️ 输入为空，请重试")
+                print(self._msg("⚠️ 输入为空，请重试", "⚠️ Empty input, please try again"))
                 return
 
             user_text = user_text.strip()
-            print(f"👤 您输入: {user_text}")
+            print(f"👤 {self._msg('您输入', 'You typed')}: {user_text}")
 
             if not self._handle_continuous_mode_command(user_text):
                 return

@@ -28,12 +28,18 @@ class FaceIdentityResolver:
 
     _NON_TARGET_LABELS = {"", "无人脸", "识别中"}
 
-    def __init__(self, enabled: bool, default_user: str, camera_index: int):
+    def __init__(
+        self,
+        enabled: bool,
+        default_user: str,
+        camera_index: int,
+        poll_interval: float = Config.FACE_POLL_INTERVAL,
+    ):
         self.enabled = False
         self.default_user = default_user
         self.camera_index = camera_index
         self.unknown_user = Config.FACE_UNKNOWN_USER
-        self.poll_interval = 0.2
+        self.poll_interval = max(0.0, float(poll_interval))
         self._cap = None
         self._module = None
         self._on_user_change = None
@@ -259,6 +265,18 @@ def run_chat(args):
     try:
         _setup_logger()
 
+        language = (getattr(args, "language", None) or Config.LANGUAGE or "zh").strip().lower()
+        if language not in {"zh", "en"}:
+            logger.warning(f"无效的语言配置: {language}，回退为 zh")
+            language = "zh"
+
+        if language == "en":
+            selected_system_prompt = Config.SYSTEM_PROMPT_EN
+            selected_global_system_prompt = Config.GLOBAL_SYSTEM_PROMPT_EN
+        else:
+            selected_system_prompt = Config.SYSTEM_PROMPT
+            selected_global_system_prompt = Config.GLOBAL_SYSTEM_PROMPT
+
         logger.info("="*50)
         logger.info(f"正在初始化对话机器人系统... (用户: {user})")
         logger.info("="*50)
@@ -273,10 +291,15 @@ def run_chat(args):
                 device=Config.ASR_DEVICE
             )
 
+        tts_provider = getattr(args, "tts_provider", None) or Config.TTS_PROVIDER
+
         tts_module = TTSModule(
             lang_code=Config.TTS_LANG_CODE,
             voice=Config.TTS_VOICE,
-            speed=Config.TTS_SPEED
+            speed=Config.TTS_SPEED,
+            provider=tts_provider,
+            language=language,
+            sample_rate=Config.TTS_SAMPLE_RATE,
         )
 
         # 初始化表情模块（可选）
@@ -297,8 +320,9 @@ def run_chat(args):
             api_key=Config.LLM_API_KEY,
             base_url=Config.LLM_BASE_URL,
             model=Config.LLM_MODEL,
-            system_prompt=Config.SYSTEM_PROMPT,
-            expression_prompt=expression_prompt
+            system_prompt=selected_system_prompt,
+            expression_prompt=expression_prompt,
+            language=language,
         )
 
         disable_persona_auto_update = bool(getattr(args, "disable_persona_auto_update", False))
@@ -310,7 +334,7 @@ def run_chat(args):
 
         persona_manager = PersonaManager(
             profile_path=Config.PERSONA_PROFILE_PATH,
-            fallback_prompt=Config.SYSTEM_PROMPT,
+            fallback_prompt=selected_system_prompt,
         )
 
         if enable_persona_auto_update:
@@ -321,7 +345,7 @@ def run_chat(args):
 
         def _persona_provider(current_user: str) -> str:
             persona_prompt = persona_manager.get_prompt_for_user(current_user)
-            global_prompt = (Config.GLOBAL_SYSTEM_PROMPT or "").strip()
+            global_prompt = (selected_global_system_prompt or "").strip()
             sections = []
             if persona_prompt and str(persona_prompt).strip():
                 sections.append(str(persona_prompt).strip())
@@ -397,6 +421,7 @@ def run_chat(args):
                 enabled=True,
                 default_user=user,
                 camera_index=getattr(args, "face_camera_index", Config.FACE_CAMERA_INDEX),
+                poll_interval=getattr(args, "face_poll_interval", Config.FACE_POLL_INTERVAL),
             )
             if face_resolver.enabled:
                 memory_router = UserMemoryRouter()
@@ -459,6 +484,7 @@ def run_chat(args):
             memory_provider=memory_provider,
             persona_provider=_persona_provider,
             persona_update_handler=persona_update_handler,
+            language=language,
             say_hallo=getattr(args, 'say_hallo', False),
             greeting_cooldown_seconds=getattr(args, 'hallo_cooldown_seconds', 600.0),
         )
@@ -475,11 +501,15 @@ def run_chat(args):
 
         # 4. 开始对话：语音模式 or 终端文本模式
         if no_asr_mode:
-            print("\n⌨️ 已启用 no-asr 模式：请直接在终端输入文本对话")
-            print("   输入 q / quit / exit 退出\n")
+            if language == "en":
+                print("\n⌨️ no-asr mode enabled: type text directly in terminal")
+                print("   Enter q / quit / exit to quit\n")
+            else:
+                print("\n⌨️ 已启用 no-asr 模式：请直接在终端输入文本对话")
+                print("   输入 q / quit / exit 退出\n")
             while True:
                 try:
-                    user_text = input("你: ").strip()
+                    user_text = input("You: " if language == "en" else "你: ").strip()
                 except EOFError:
                     break
 
@@ -495,7 +525,10 @@ def run_chat(args):
             )
 
     except KeyboardInterrupt:
-        print("\n\n👋 程序已退出,再见!")
+        if 'language' in locals() and language == "en":
+            print("\n\n👋 Program exited. Goodbye!")
+        else:
+            print("\n\n👋 程序已退出,再见!")
         logger.info("用户主动退出程序")
         
         # Debug模式：打印所有线程堆栈
@@ -612,6 +645,16 @@ def main():
         help="禁用TTS语音播放，仅显示文字回复"
     )
     chat_parser.add_argument(
+        "--tts-provider", type=str, choices=["kokoro", "easy_tts_server"],
+        default=Config.TTS_PROVIDER,
+        help=f"TTS后端选择 (默认: {Config.TTS_PROVIDER})"
+    )
+    chat_parser.add_argument(
+        "--language", type=str, choices=["zh", "en"],
+        default=Config.LANGUAGE,
+        help=f"统一语言开关：TTS与LLM同时生效 (默认: {Config.LANGUAGE})"
+    )
+    chat_parser.add_argument(
         "--listen-mode", type=str, choices=["push", "continuous"],
         default=Config.DEFAULT_LISTEN_MODE,
         help="监听模式: push=按住Q键说话, continuous=持续监听 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
@@ -639,6 +682,10 @@ def main():
     chat_parser.add_argument(
         "--face-camera-index", type=int, default=Config.FACE_CAMERA_INDEX,
         help=f"人脸识别摄像头索引 (默认: {Config.FACE_CAMERA_INDEX})"
+    )
+    chat_parser.add_argument(
+        "--face-poll-interval", type=float, default=Config.FACE_POLL_INTERVAL,
+        help=f"人脸识别轮询间隔（秒，越小越高频，默认: {Config.FACE_POLL_INTERVAL}）"
     )
     chat_parser.add_argument(
         "--say-hallo", action="store_true", default=False,
@@ -674,6 +721,16 @@ def main():
         help="(兼容旧版) 禁用TTS语音播放"
     )
     parser.add_argument(
+        "--tts-provider", type=str, choices=["kokoro", "easy_tts_server"],
+        default=None,
+        help="(兼容旧版) TTS后端选择"
+    )
+    parser.add_argument(
+        "--language", type=str, choices=["zh", "en"],
+        default=None,
+        help="(兼容旧版) 统一语言开关：TTS与LLM同时生效"
+    )
+    parser.add_argument(
         "--listen-mode", type=str, choices=["push", "continuous"],
         default=None,
         help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听"
@@ -703,6 +760,10 @@ def main():
         help="(兼容旧版) 人脸识别摄像头索引"
     )
     parser.add_argument(
+        "--face-poll-interval", type=float, default=None,
+        help="(兼容旧版) 人脸识别轮询间隔（秒）"
+    )
+    parser.add_argument(
         "--say-hallo", action="store_true", default=False,
         help="(兼容旧版) 在 continuous 的非响应阶段，检测到熟人时主动问好"
     )
@@ -728,6 +789,8 @@ def main():
             args.listen_mode = Config.DEFAULT_LISTEN_MODE
         if not hasattr(args, 'face_camera_index') or args.face_camera_index is None:
             args.face_camera_index = Config.FACE_CAMERA_INDEX
+        if not hasattr(args, 'face_poll_interval') or args.face_poll_interval is None:
+            args.face_poll_interval = Config.FACE_POLL_INTERVAL
         run_chat(args)
 
 

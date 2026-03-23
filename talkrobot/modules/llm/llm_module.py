@@ -10,7 +10,15 @@ from loguru import logger
 class LLMModule:
     """大语言模型模块"""
     
-    def __init__(self, api_key: str, base_url: str, model: str, system_prompt: str, expression_prompt: str = ""):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        system_prompt: str,
+        expression_prompt: str = "",
+        language: str = "zh",
+    ):
         """
         初始化LLM模块
         
@@ -20,12 +28,20 @@ class LLMModule:
             model: 模型名称
             system_prompt: 系统提示词
             expression_prompt: 表情指令提示词（追加到 system_prompt 后）
+            language: 输出语言（zh/en）
         """
         logger.info(f"正在初始化LLM模块: model={model}")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.system_prompt = system_prompt + expression_prompt
+        self.language = (language or "zh").strip().lower()
+        if self.language not in {"zh", "en"}:
+            self.language = "zh"
         logger.info("LLM模块初始化完成")
+
+    @property
+    def _is_english(self) -> bool:
+        return self.language == "en"
 
     def _build_messages(self, user_input: str, context: str = "", system_prompt_override: str = "") -> List[Dict[str, str]]:
         """构建发送给大模型的消息列表。"""
@@ -37,7 +53,11 @@ class LLMModule:
         if context:
             messages.append({
                 "role": "system",
-                "content": f"关于用户的相关背景信息:\n{context}"
+                "content": (
+                    f"Relevant background information about the user:\n{context}"
+                    if self._is_english
+                    else f"关于用户的相关背景信息:\n{context}"
+                )
             })
 
         messages.append({"role": "user", "content": user_input})
@@ -70,6 +90,8 @@ class LLMModule:
             
         except Exception as e:
             logger.error(f"LLM生成回复出错: {e}")
+            if self._is_english:
+                return "Sorry, I can't answer your question right now."
             return "抱歉,我现在无法回答您的问题。"
 
     def generate_response_stream(self, user_input: str, context: str = "", system_prompt_override: str = "") -> Iterator[str]:
@@ -106,4 +128,7 @@ class LLMModule:
 
         except Exception as e:
             logger.error(f"LLM流式生成回复出错: {e}")
-            yield "抱歉,我现在无法回答您的问题。"
+            if self._is_english:
+                yield "Sorry, I can't answer your question right now."
+            else:
+                yield "抱歉,我现在无法回答您的问题。"
