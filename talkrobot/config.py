@@ -40,7 +40,7 @@ class Config:
     TTS_SAMPLE_RATE = 24000
     
     # LLM 配置
-    LLM_API_KEY = "api-key = sk-9d42be35fbba4ef8ab8d217c2a613869"
+    LLM_API_KEY = "api-key = "
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_MODEL = "qwen-flash"#"qwen-plus"
     
