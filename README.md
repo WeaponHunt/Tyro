@@ -12,6 +12,9 @@
 - 🪟 **滑动窗口记忆**: 可配置最近 n 轮对话上下文，与检索记忆一起提供给大模型
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
 - 👥 **多用户隔离**: 不同用户的记忆数据独立存储
+- 🧑‍🤝‍🧑 **人脸驱动交互对象**: 可按当前识别人脸自动切换交互用户
+- 🎬 **脚本模式**: 按 C 键播放预设脚本（可指定表情、图片与间隔）
+- 😴 **睡眠模式**: 按 W 键进入/退出睡眠（睡眠中忽略外部输入）
 
 ## 项目结构
 
@@ -37,7 +40,7 @@ talkrobot/
 ## 安装依赖
 
 ```bash
-pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
+pip install funasr kokoro easy_tts_server openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
 ```
 
 ## 使用方法
@@ -59,6 +62,18 @@ python -m talkrobot.main chat --user ljc
 python -m talkrobot.main --user ljc --no-tts
 python -m talkrobot.main chat --user ljc --no-tts
 
+# 使用 easy_tts_server 作为 TTS 后端（中文）
+python -m talkrobot.main chat --tts-provider easy_tts_server --language zh
+
+# 使用 Kokoro 作为 TTS 后端（英文）
+python -m talkrobot.main chat --tts-provider kokoro --language en
+
+# 控制大模型用英文回复
+python -m talkrobot.main chat --language en
+
+# 控制大模型用中文回复
+python -m talkrobot.main chat --language zh
+
 # 使用持续监听模式（无需按键，直接说话即可）
 python -m talkrobot.main --user ljc --listen-mode continuous
 
@@ -73,6 +88,15 @@ python -m talkrobot.main --user ljc --streaming
 
 # 设置滑动窗口轮数（让模型额外看到最近 5 轮对话）
 python -m talkrobot.main --user ljc --history-rounds 5
+
+# 启用人脸识别，按当前识别人脸自动热切换交互对象
+python -m talkrobot.main chat --enable-face
+
+# 指定人脸识别摄像头
+python -m talkrobot.main chat --enable-face --face-camera-index 0
+
+# 在 continuous 非响应阶段，见到熟人主动问好
+python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous
 ```
 
 ### 2. 手动添加记忆
@@ -107,8 +131,13 @@ python -m talkrobot.tests.test_memory
 
 - `ASR_DEVICE`: ASR运行设备 (cuda/cpu)
 - `TTS_VOICE`: TTS音色选择
+- `TTS_PROVIDER`: TTS后端选择 (`kokoro` / `easy_tts_server`)
+- `LANGUAGE`: 统一语言开关 (`zh` / `en`，同时作用于TTS和LLM)
 - `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
+- `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
+- `GLOBAL_SYSTEM_PROMPT`: 全局提示词（会拼接在用户人格 prompt 后）
+- `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
@@ -116,6 +145,57 @@ python -m talkrobot.tests.test_memory
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
 
 > 启动参数 `--streaming` 可启用流式回复生成。
+
+### 按用户配置人格 Prompt
+
+系统支持按用户名配置不同的人格 prompt。默认配置文件为 `talkrobot/persona_profiles.json`，示例：
+
+```json
+{
+    "default": {
+        "system_prompt": "你是一个友好、简洁的中文助手。"
+    },
+    "ljc": {
+        "system_prompt": "语气更轻松口语化，回答简短直接。"
+    }
+}
+```
+
+生效优先级：
+
+1. 当前用户专属配置（如 `"ljc"`）
+2. `default.system_prompt`
+3. `Config.SYSTEM_PROMPT`（最终兜底）
+
+最终发送给大模型的 system prompt 按以下顺序拼接：
+
+1. 用户人格 prompt（含 default/Config 回退）
+2. `Config.GLOBAL_SYSTEM_PROMPT`
+3. 表情指令 prompt（若启用表情模块）
+
+> 对于新增用户或未手动配置的用户，系统会自动使用默认人格 prompt。
+
+### 后台自动更新人格（LangGraph）
+
+系统支持在单轮对话中后台触发人格更新 Agent（不阻塞当前回复生成）：
+
+- 分支1：判断是否需要更新人格 prompt
+- 分支2：生成候选新版人格 prompt
+
+上述两个分支由 LangGraph 并行执行；若判定通过，会将更新结果写回 `talkrobot/persona_profiles.json`，并在后续轮次生效。
+
+若环境未安装 LangGraph，则自动跳过该能力，不影响原有对话功能。
+
+可通过启动参数临时关闭：
+
+```bash
+python -m talkrobot.main chat --disable-persona-auto-update
+```
+
+> 启动参数 `--enable-face` 启用人脸识别后，会根据当前识别对象自动切换用户；
+> 若该对象不存在长期记忆数据，则自动回退为“仅滑动窗口短期记忆”模式。
+> 若当前帧未检测到有效人脸，也会按“陌生人用户”处理。
+> 启动参数 `--say-hallo` 开启后，仅在 continuous 的非响应阶段检测到熟人时主动问好（称呼基于该用户记忆检索）。
 
 ## 操作说明
 
@@ -126,6 +206,11 @@ python -m talkrobot.tests.test_memory
 3. 松开 `Q` 键结束录音
 4. 系统自动识别、生成回复并播放语音
 5. 按 `Ctrl+C` 退出程序
+
+### 快捷键
+
+- `W`: 进入/退出睡眠模式（睡眠中忽略外部输入）
+- `C`: 进入/退出脚本模式（按顺序播放脚本）
 
 ### 持续监听模式 (`--listen-mode continuous`)
 
@@ -146,6 +231,32 @@ python -m talkrobot.tests.test_memory
 3. 系统基于输入文本生成回复（可选TTS播放）
 4. 输入 `q` / `quit` / `exit` 退出程序
 
+### 脚本模式
+
+1. 将脚本文件放入 [script](script) 目录（JSON 格式，示例见 `example_script.json`）
+2. 运行程序后按 `C` 进入脚本模式（再次按 `C` 退出）
+3. 脚本播放结束后会自动回到交互模式
+
+脚本格式（JSON）：
+
+```json
+{
+    "name": "demo",
+    "steps": [
+        {"text": "欢迎来到演示。", "expression": "happy", "image": "assets/sample.ppm", "delay": 1.5},
+        {"text": "这里可以展示图片。", "expression": "neutral", "delay": 1.0},
+        {"text": "脚本结束，谢谢。", "expression": "happy", "delay": 1.0}
+    ]
+}
+```
+
+字段说明：
+
+- `text`: 机器人要说的话
+- `expression`: 要切换的表情名称
+- `image`: 要展示的图片路径（相对 `script/` 目录）
+- `delay`: 当前句结束后等待的秒数
+
 ## 模块说明
 
 ### ASRModule (语音识别)
@@ -154,7 +265,8 @@ python -m talkrobot.tests.test_memory
 - 支持GPU加速
 
 ### TTSModule (语音合成)
-- 使用 Kokoro TTS
+- 支持 Kokoro / easy_tts_server 双后端
+- 支持中文与英文
 - 支持多种音色
 - 实时流式播放
 - 支持字符串与生成器输入

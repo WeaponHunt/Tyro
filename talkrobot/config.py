@@ -51,7 +51,7 @@ class Config:
 
     # 人脸识别配置
     FACE_ENABLED = False
-    FACE_CAMERA_INDEX = 0
+    FACE_CAMERA_INDEX = 4
     FACE_POLL_INTERVAL = 0.03
     FACE_USE_GPU = True
     FACE_MODEL_NAME = "buffalo_s"
@@ -96,13 +96,15 @@ class Config:
     在处理用户输入时，请遵循以下原则：
         语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
         音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
+        文字回应：至少作出一些简单的文字回应，不要只做表情或者动作回应。
         保持自然：直接回答用户的潜在意图，除非完全无法理解，否则不要反复询问用户是否说错了。"""
 
-    SYSTEM_PROMPT_EN = """Your name is Tyro, a friendly, helpful, and efficient AI assistant. Answer user questions in concise, natural English.
+    SYSTEM_PROMPT_EN = """Your name is Xiao Suan Suan, a friendly, helpful, and efficient AI assistant. Answer user questions in concise, natural English.
     Note: your input comes from an ASR (speech recognition) system, so it may contain homophone errors, missing words, extra words, or incorrect sentence boundaries.
     When handling user input, follow these principles:
         Semantic-first: if a sentence is not fluent literally, infer the user's most likely intent from context.
         Homophone correction: for ambiguous terms, prioritize phonetically similar and contextually correct words.
+        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "10 to 15" instead of "10-15" to avoid reading '-' as "minus".
         Keep it natural: directly answer the user's likely intent; unless it is completely unintelligible, avoid repeatedly asking whether the user spoke incorrectly."""
     
 

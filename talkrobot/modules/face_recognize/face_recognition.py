@@ -95,10 +95,13 @@ class _Ros2TopicPublisher:
 		quality = float(result.get("quality", 0.0))
 		similarity = float(result.get("similarity", 0.0))
 		tracked = bool(result.get("tracked", False)) and bbox is not None
+		label = str(result.get("label", "camera"))
 
 		bbox_msg = PolygonStamped()
 		bbox_msg.header.stamp = stamp
-		bbox_msg.header.frame_id = "camera"
+		# 把识别到的 label 放到 header.frame_id 中，消费者可从中解析当前人脸身份。
+		# 如果没有 label，则回退为 "camera"（保持向后兼容）。
+		bbox_msg.header.frame_id = label or "camera"
 		if tracked:
 			x1, y1, x2, y2 = [float(v) for v in bbox]
 			bbox_msg.polygon.points = [

@@ -8,8 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterable
 from typing import List, Optional, Union
 
-import sounddevice as sd
+# sounddevice is imported lazily inside methods that actually play audio to avoid
+# hard dependency at module import time in environments without audio devices.
 import numpy as np
+import unicodedata
 from loguru import logger
 
 class TTSModule:
@@ -105,11 +107,49 @@ class TTSModule:
                 logger.info(f"easy_tts_server 采样率: {value}")
                 return value
         return default
+
+    @staticmethod
+    def _filter_text(text: str) -> str:
+        """
+        过滤输入文本，删除非文本且非标点的符号（例如表情符号、其他 Unicode 符号类别）。
+
+        保留的 Unicode 类别首字母：
+          - L: Letter (字母)
+          - N: Number (数字)
+          - P: Punctuation (标点)
+          - Z: Separator (空白)
+          - M: Mark (组合符号)
+
+        删除的类别示例：S (Symbol，包含 emoji)、C (Other 控制字符等)
+        """
+        if not text:
+            return text
+
+        filtered_chars = []
+        removed_chars = []
+        for ch in text:
+            try:
+                cat = unicodedata.category(ch)
+            except Exception:
+                cat = "C"
+
+            if cat and cat[0] in ("L", "N", "P", "Z", "M"):
+                filtered_chars.append(ch)
+            else:
+                removed_chars.append(ch)
+
+        if removed_chars:
+            # 只打印部分以避免日志过长
+            sample = removed_chars[:10]
+            logger.debug(f"过滤掉非文本/标点字符: {sample}{'...' if len(removed_chars)>10 else ''}")
+
+        return "".join(filtered_chars)
     
     def stop(self):
         """打断当前TTS播放"""
         self._interrupted.set()
         try:
+            import sounddevice as sd
             sd.stop()
         except Exception as e:
             logger.debug(f"TTS stop 调用 sd.stop 异常(可忽略): {e}")
@@ -117,6 +157,12 @@ class TTSModule:
     def _play_audio_chunk(self, audio: np.ndarray, index: int) -> bool:
         """播放单段音频，返回是否被中断。"""
         logger.debug(f"播放第{index}段音频，长度{len(audio)}")
+        try:
+            import sounddevice as sd
+        except Exception as e:
+            logger.debug(f"无法导入 sounddevice，跳过播放: {e}")
+            return False
+
         sd.play(audio, self.sample_rate, blocking=False)
 
         total_samples = len(audio)
@@ -202,7 +248,12 @@ class TTSModule:
                     break
                 if part is None:
                     continue
-                buffer += str(part)
+                # 先过滤掉非文本/非标点的字符（例如表情符号）
+                filtered_part = self._filter_text(str(part))
+                if not filtered_part:
+                    logger.debug(f"迭代器部分被过滤（非文本/标点），跳过: {part}")
+                    continue
+                buffer += filtered_part
 
                 while True:
                     positions = [buffer.find(d) for d in delimiters if d in buffer]
@@ -301,8 +352,14 @@ class TTSModule:
             self._interrupted.clear()
 
             if isinstance(text, str):
-                logger.info(f"正在合成语音: {text}")
-                audio_chunks, _ = self._synthesize_single_text(text, play_audio=play_audio)
+                # 过滤掉非文本/标点的字符（例如仅包含表情符号的字符串）
+                filtered = self._filter_text(text)
+                if not filtered:
+                    logger.info("输入文本被过滤为空（可能只包含 emoji/符号），跳过合成")
+                    return []
+
+                logger.info(f"正在合成语音: {filtered}")
+                audio_chunks, _ = self._synthesize_single_text(filtered, play_audio=play_audio)
             else:
                 audio_chunks = self._synthesize_from_iterable(text, play_audio=play_audio)
             

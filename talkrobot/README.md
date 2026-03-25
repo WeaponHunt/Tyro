@@ -214,7 +214,8 @@ python -m talkrobot.main chat --disable-persona-auto-update
 5. 说“再见”可退出响应模式，退出后将忽略后续语音
 6. **机器人说话时会自动屏蔽麦克风**，避免机器人听到自己的回复
 7. 按 `Ctrl+C` 退出程序
-
+8. s键打断说话
+9. w键唤醒/睡眠
 > **提示**: 持续监听模式使用 [Silero VAD](https://github.com/snakers4/silero-vad) 进行语音检测，相关参数可在 `config.py` 中调整。
 
 ### 终端输入模式 (`--no-asr`)

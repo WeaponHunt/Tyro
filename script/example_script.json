@@ -1,0 +1,22 @@
+{
+  "name": "demo",
+  "steps": [
+    {
+      "text": "大家好，欢迎来到脚本演示。",
+      "expression": "happy",
+      "image": "assets/example.png",
+      "delay": 1
+    },
+    {
+      "text": "这一句展示的是指定图片与表情。",
+      "expression": "neutral",
+      "image": "assets/sample.ppm",
+      "delay": 5.0
+    },
+    {
+      "text": "脚本演示结束，谢谢观看。",
+      "expression": "happy",
+      "delay": 1.0
+    }
+  ]
+}

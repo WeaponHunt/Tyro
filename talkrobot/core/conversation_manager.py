@@ -5,6 +5,9 @@
 import numpy as np
 import time
 import re
+import os
+import json
+import copy
 from loguru import logger
 from typing import Optional, Callable, Tuple
 import threading
@@ -79,6 +82,9 @@ class ConversationManager:
         self._user_state_lock = threading.Lock()
         self._proactive_lock = threading.Lock()
         self._history_lock = threading.Lock()
+        self._sleep_lock = threading.Lock()
+        self._script_lock = threading.Lock()
+        self._script_image_lock = threading.Lock()
         self._recent_dialogue_rounds_by_user = {}  # dict[user, list[(user_text, assistant_text)]]
         self._active_user = self.default_user
         self._active_user_has_long_term_memory = True
@@ -86,6 +92,21 @@ class ConversationManager:
         self._pending_user_switch_notice = ""
         self._is_continuous_mode = bool(audio_recorder and audio_recorder.listen_mode == "continuous")
         self._response_enabled = not self._is_continuous_mode
+        self._sleep_mode = False
+        self._sleep_listener = None
+        self._script_mode = False
+        self._script_thread = None
+        self._script_stop_event = threading.Event()
+        self._script_context_snapshot = None
+        self._script_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "script")
+        )
+        self._script_image_window = "ScriptImage"
+        self._script_image_open = False
+        self._script_image_thread = None
+        self._script_image_stop_event = threading.Event()
+        self._script_image_update_event = threading.Event()
+        self._script_image_current_path = None
         self.language = (language or "zh").strip().lower()
         if self.language not in {"zh", "en"}:
             self.language = "zh"
@@ -96,10 +117,12 @@ class ConversationManager:
         self._pending_greeting_deadline: Optional[float] = None
         self._greeting_cooldown_seconds = float(greeting_cooldown_seconds)
         self._last_greet_ts_by_user = {}
+        self._script_triggers = ["介绍一下实验室"] if not self._is_english else ["introduce the lab"]
 
         if self._memory_provider is None:
             self._memory_provider = lambda _: (memory_module, True)
         self._switch_user_if_needed(self.default_user, silent=True)
+        self._start_sleep_listener()
         
         expr_status = '开启' if (expression_module and expression_module.is_available) else '关闭'
         logger.info(
@@ -130,6 +153,303 @@ class ConversationManager:
         if not user or not str(user).strip():
             return self.default_user
         return str(user).strip()
+
+    def _start_sleep_listener(self) -> None:
+        """启动睡眠/脚本模式切换的键盘监听器（W/C）。"""
+        if self._sleep_listener is not None:
+            return
+
+        def _on_press_sleep(key):
+            try:
+                k = key.char if hasattr(key, 'char') else None
+                if not k:
+                    return
+                k = k.lower()
+                if k == 'w':
+                    self._toggle_sleep_mode()
+                elif k == 'c':
+                    self._toggle_script_mode()
+            except Exception as e:
+                logger.debug(f"睡眠模式按键监听异常: {e}")
+
+        self._sleep_listener = keyboard.Listener(on_press=_on_press_sleep, daemon=True)
+        self._sleep_listener.start()
+        logger.info("睡眠模式切换监听已启动 (按 W 切换)")
+
+    def _toggle_sleep_mode(self) -> None:
+        """切换睡眠模式。"""
+        with self._sleep_lock:
+            self._sleep_mode = not self._sleep_mode
+            is_sleeping = self._sleep_mode
+
+        if is_sleeping:
+            if self._script_mode:
+                self._exit_script_mode()
+            if self.expression and self.expression.is_available:
+                self.expression.set_expression("sleep")
+            logger.info("进入睡眠模式，暂停外部输入响应")
+            print(self._msg("😴 已进入睡眠模式（按 W 退出）", "😴 Sleep mode enabled (press W to wake)"))
+            self._play_tts_notice(self._msg("我先去睡会。", "I'm going to sleep for a bit."))
+        else:
+            self._reset_context_on_wake()
+            logger.info("退出睡眠模式，已重置上下文")
+            print(self._msg("✅ 已退出睡眠模式（上下文已重置）", "✅ Sleep mode disabled (context reset)"))
+            self._play_tts_notice(self._msg("我醒了。", "I'm awake."))
+            if self.expression and self.expression.is_available:
+                self.expression.reset_expression()
+
+    def _toggle_script_mode(self) -> None:
+        """切换脚本模式。"""
+        if self._sleep_mode:
+            print(self._msg("😴 当前为睡眠模式，无法进入脚本模式", "😴 Sleep mode active, script mode disabled"))
+            return
+
+        if self._script_mode and self._script_thread and not self._script_thread.is_alive():
+            logger.warning("检测到脚本线程异常退出，自动恢复脚本状态")
+            self._exit_script_mode()
+
+        if not self._script_mode:
+            self._enter_script_mode()
+        else:
+            self._exit_script_mode()
+
+    def _enter_script_mode(self) -> None:
+        with self._script_lock:
+            if self._script_mode:
+                return
+
+            self._script_context_snapshot = {
+                "recent_dialogue_rounds_by_user": copy.deepcopy(self._recent_dialogue_rounds_by_user),
+                "pending_user_switch_notice": self._pending_user_switch_notice,
+                "pending_greeting_deadline": self._pending_greeting_deadline,
+                "last_greet_ts_by_user": copy.deepcopy(self._last_greet_ts_by_user),
+                "response_enabled": self._response_enabled,
+                "active_user": self._active_user,
+                "active_user_has_long_term_memory": self._active_user_has_long_term_memory,
+                "active_user_initialized": self._active_user_initialized,
+            }
+
+            self._script_mode = True
+            self._script_stop_event.clear()
+            self._script_thread = threading.Thread(target=self._run_script_mode, daemon=True)
+            self._script_thread.start()
+
+        logger.info("进入脚本模式")
+        print(self._msg("🎬 已进入脚本模式（按 C 退出）", "🎬 Script mode enabled (press C to exit)"))
+
+    def _exit_script_mode(self) -> None:
+        with self._script_lock:
+            if not self._script_mode:
+                return
+            self._script_mode = False
+            self._script_stop_event.set()
+            snapshot = self._script_context_snapshot
+            self._script_context_snapshot = None
+
+        if snapshot:
+            with self._history_lock:
+                self._recent_dialogue_rounds_by_user = snapshot.get("recent_dialogue_rounds_by_user", {})
+            self._pending_user_switch_notice = snapshot.get("pending_user_switch_notice", "")
+            self._pending_greeting_deadline = snapshot.get("pending_greeting_deadline")
+            self._last_greet_ts_by_user = snapshot.get("last_greet_ts_by_user", {})
+            self._response_enabled = snapshot.get("response_enabled", self._response_enabled)
+            self._active_user = snapshot.get("active_user", self._active_user)
+            self._active_user_has_long_term_memory = snapshot.get(
+                "active_user_has_long_term_memory", self._active_user_has_long_term_memory
+            )
+            self._active_user_initialized = snapshot.get(
+                "active_user_initialized", self._active_user_initialized
+            )
+
+        self._close_script_image_window()
+        logger.info("退出脚本模式，恢复交互上下文")
+        print(self._msg("✅ 已退出脚本模式", "✅ Script mode disabled"))
+
+    def _resolve_script_path(self) -> Optional[str]:
+        if not os.path.isdir(self._script_dir):
+            return None
+
+        script_candidates = []
+        for name in os.listdir(self._script_dir):
+            if name.lower().endswith(".json"):
+                script_candidates.append(os.path.join(self._script_dir, name))
+
+        script_candidates.sort()
+        return script_candidates[0] if script_candidates else None
+
+    def _load_script_steps(self) -> list:
+        script_path = self._resolve_script_path()
+        if not script_path:
+            logger.warning("脚本模式未找到脚本文件 (.json)")
+            return []
+
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            logger.warning(f"脚本文件读取失败: {e}")
+            return []
+
+        steps = payload.get("steps", []) if isinstance(payload, dict) else payload
+        if not isinstance(steps, list):
+            logger.warning("脚本格式无效：steps 必须是列表")
+            return []
+        return steps
+
+    def _run_script_mode(self) -> None:
+        try:
+            steps = self._load_script_steps()
+            if not steps:
+                self._exit_script_mode()
+                return
+
+            for step in steps:
+                if self._script_stop_event.is_set() or not self._script_mode:
+                    break
+
+                if not isinstance(step, dict):
+                    continue
+
+                text = str(step.get("text", "") or "").strip()
+                expression = str(step.get("expression", "") or "").strip()
+                image = str(step.get("image", "") or "").strip()
+                delay = step.get("delay", 0.0)
+
+                if expression and self.expression and self.expression.is_available:
+                    self.expression.set_expression(expression)
+
+                if image:
+                    self._show_script_image_async(image)
+
+                if text:
+                    print(f"🤖 {self._msg('脚本', 'Script')}: {text}")
+                    self._play_tts_notice(text)
+
+                try:
+                    delay_seconds = float(delay)
+                except Exception:
+                    delay_seconds = 0.0
+
+                if delay_seconds > 0:
+                    end_ts = time.time() + delay_seconds
+                    while time.time() < end_ts:
+                        if self._script_stop_event.is_set() or not self._script_mode:
+                            break
+                        time.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"脚本模式运行异常: {e}")
+        finally:
+            if self.expression and self.expression.is_available:
+                self.expression.reset_expression()
+            self._close_script_image_window()
+
+            if self._script_mode:
+                self._exit_script_mode()
+
+    def _resolve_script_image_path(self, image_path: str) -> Optional[str]:
+        if not image_path:
+            return None
+
+        resolved_path = image_path
+        if not os.path.isabs(resolved_path):
+            resolved_path = os.path.join(self._script_dir, image_path)
+
+        if not os.path.isfile(resolved_path):
+            logger.warning(f"脚本图片不存在: {resolved_path}")
+            return None
+        return resolved_path
+
+    def _script_image_loop(self) -> None:
+        try:
+            import cv2
+        except Exception as e:
+            logger.warning(f"脚本图片显示失败，缺少 OpenCV: {e}")
+            return
+
+        cv2.startWindowThread()
+
+        while not self._script_image_stop_event.is_set():
+            self._script_image_update_event.wait(0.1)
+            self._script_image_update_event.clear()
+
+            with self._script_image_lock:
+                resolved_path = self._script_image_current_path
+
+            if not resolved_path:
+                if self._script_image_open:
+                    try:
+                        cv2.destroyWindow(self._script_image_window)
+                    except Exception as e:
+                        logger.debug(f"关闭脚本图片窗口失败: {e}")
+                    finally:
+                        self._script_image_open = False
+                time.sleep(0.05)
+                continue
+
+            try:
+                image = cv2.imread(resolved_path)
+                if image is None:
+                    logger.warning(f"脚本图片读取失败: {resolved_path}")
+                    continue
+                cv2.namedWindow(self._script_image_window, cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(
+                    self._script_image_window,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
+                cv2.imshow(self._script_image_window, image)
+                self._script_image_open = True
+                cv2.waitKey(1)
+            except Exception as e:
+                logger.warning(f"脚本图片显示异常: {e}")
+
+        if self._script_image_open:
+            try:
+                cv2.destroyWindow(self._script_image_window)
+            except Exception as e:
+                logger.debug(f"关闭脚本图片窗口失败: {e}")
+            finally:
+                self._script_image_open = False
+
+    def _show_script_image_async(self, image_path: str) -> None:
+        resolved_path = self._resolve_script_image_path(image_path)
+        if not resolved_path:
+            return
+
+        with self._script_image_lock:
+            self._script_image_current_path = resolved_path
+        self._script_image_update_event.set()
+
+        if self._script_image_thread is None or not self._script_image_thread.is_alive():
+            self._script_image_stop_event.clear()
+            self._script_image_thread = threading.Thread(target=self._script_image_loop, daemon=True)
+            self._script_image_thread.start()
+
+    def _close_script_image_window(self) -> None:
+        with self._script_image_lock:
+            self._script_image_current_path = None
+        self._script_image_update_event.set()
+
+    def _play_tts_notice(self, text: str) -> None:
+        if not text or not self.tts_enabled or self.tts is None:
+            return
+        if self.audio_recorder:
+            self.audio_recorder.is_tts_playing = True
+        try:
+            self.tts.synthesize(text, play_audio=True)
+        finally:
+            if self.audio_recorder:
+                self.audio_recorder.is_tts_playing = False
+
+    def _reset_context_on_wake(self) -> None:
+        """从睡眠模式唤醒时重置对话上下文。"""
+        with self._history_lock:
+            self._recent_dialogue_rounds_by_user.clear()
+        self._pending_user_switch_notice = ""
+        self._pending_greeting_deadline = None
+        self._last_greet_ts_by_user = {}
+        self._response_enabled = not self._is_continuous_mode
+        logger.info("已重置滑动窗口、问好窗口与响应模式")
 
     def _switch_user_if_needed(self, user: str, silent: bool = False) -> None:
         """当用户变化时切换记忆模块与会话上下文。"""
@@ -217,6 +537,9 @@ class ConversationManager:
 
     def on_face_user_change(self, user: str, is_familiar: bool = False) -> None:
         """人脸追踪回调入口：切换对象，并在条件满足时主动问好。"""
+        if self._sleep_mode or self._script_mode:
+            logger.debug("睡眠模式中，忽略人脸用户变更")
+            return
         self._switch_user_if_needed(user)
 
         if not self._say_hallo:
@@ -397,6 +720,19 @@ class ConversationManager:
         cleaned = re.sub(r"\s+", "", cleaned)
         cleaned = re.sub(r"[，。！？、；：,.!?;:\"'‘’“”\[\]()（）]", "", cleaned)
         return cleaned
+
+    def _maybe_trigger_script_mode(self, user_text: str) -> bool:
+        """监听特定ASR内容触发脚本模式。返回是否已触发。"""
+        if self._sleep_mode or self._script_mode:
+            return False
+
+        normalized_text = self._normalize_text(user_text)
+        for trigger in self._script_triggers:
+            if trigger and trigger in normalized_text:
+                logger.info(f"命中脚本触发词: {trigger}")
+                self._enter_script_mode()
+                return True
+        return False
 
     def _print_stage_timing(self, stage: str, elapsed: float) -> None:
         """在 debug 模式下输出阶段耗时。"""
@@ -730,6 +1066,9 @@ class ConversationManager:
             audio_data: 音频数据
         """
         try:
+            if self._sleep_mode or self._script_mode:
+                logger.debug("睡眠模式中，忽略音频输入")
+                return
             logger.debug("开始处理音频数据")
             # 0. 音频前置过滤：时长和音量检查
             duration = len(audio_data) / self.sample_rate
@@ -764,6 +1103,8 @@ class ConversationManager:
                 return
             
             print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
+            if self._maybe_trigger_script_mode(user_text):
+                return
             if not self._handle_continuous_mode_command(user_text):
                 return
 
@@ -782,12 +1123,18 @@ class ConversationManager:
     def process_text(self, user_text: str) -> None:
         """处理终端输入文本,完成完整对话流程。"""
         try:
+            if self._sleep_mode or self._script_mode:
+                logger.debug("睡眠模式中，忽略文本输入")
+                return
             if not user_text or user_text.strip() == "":
                 print(self._msg("⚠️ 输入为空，请重试", "⚠️ Empty input, please try again"))
                 return
 
             user_text = user_text.strip()
             print(f"👤 {self._msg('您输入', 'You typed')}: {user_text}")
+
+            if self._maybe_trigger_script_mode(user_text):
+                return
 
             if not self._handle_continuous_mode_command(user_text):
                 return
@@ -828,4 +1175,19 @@ class ConversationManager:
         for thread in persona_threads:
             if thread.is_alive() and thread != threading.current_thread():
                 thread.join(timeout=min(timeout, 1.0))
+        if self._script_thread and self._script_thread.is_alive():
+            self._script_stop_event.set()
+            self._script_thread.join(timeout=min(timeout, 1.0))
+        if self._script_image_thread and self._script_image_thread.is_alive():
+            self._script_image_stop_event.set()
+            self._script_image_update_event.set()
+            self._script_image_thread.join(timeout=min(timeout, 1.0))
+            self._script_image_thread = None
+        self._close_script_image_window()
+        if self._sleep_listener is not None:
+            try:
+                self._sleep_listener.stop()
+            except Exception as e:
+                logger.warning(f"停止睡眠模式监听异常: {e}")
+            self._sleep_listener = None
         logger.info("对话管理器已关闭")
