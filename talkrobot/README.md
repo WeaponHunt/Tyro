@@ -78,6 +78,9 @@ python -m talkrobot.main --user ljc --listen-mode continuous
 # 使用按键模式（按住Q键说话，默认行为）
 python -m talkrobot.main --user ljc --listen-mode push
 
+# 使用对讲机模式（检测PTT触发，按下开始/松开结束）
+python -m talkrobot.main --user ljc --listen-mode intercom
+
 # 使用 no-asr 模式（禁用语音识别，改为终端输入）
 python -m talkrobot.main --user ljc --no-asr
 
@@ -94,7 +97,10 @@ python -m talkrobot.main chat --enable-face
 python -m talkrobot.main chat --enable-face --face-camera-index 0
 
 # 在 continuous 非响应阶段，见到熟人主动问好
-python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous
+python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous 
+
+# 对讲机模式
+python -m talkrobot.main chat --enable-face --say-hallo --listen-mode intercom --language en
 ```
 
 ### 2. 手动添加记忆
@@ -136,11 +142,13 @@ python -m talkrobot.tests.test_memory
 - `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
 - `GLOBAL_SYSTEM_PROMPT`: 全局提示词（会拼接在用户人格 prompt 后）
 - `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
-- `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
+- `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous" / "intercom")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
 - `VAD_SILENCE_DURATION`: 静默多久判定说话结束（秒）
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
+- `INTERCOM_PTT_TRIGGER_THRESHOLD`: 对讲机模式触发阈值（int16 幅值）
+- `INTERCOM_PTT_DEBOUNCE_TIME`: 对讲机模式防抖时间（秒）
 
 > 启动参数 `--streaming` 可启用流式回复生成。
 
@@ -217,6 +225,16 @@ python -m talkrobot.main chat --disable-persona-auto-update
 8. s键打断说话
 9. w键唤醒/睡眠
 > **提示**: 持续监听模式使用 [Silero VAD](https://github.com/snakers4/silero-vad) 进行语音检测，相关参数可在 `config.py` 中调整。
+
+### 对讲机模式 (`--listen-mode intercom`)
+
+1. 启动程序后,等待所有模块初始化完成
+2. 程序会持续监听麦克风中的 PTT 触发信号（阈值 + 防抖）
+3. 检测到一次触发后开始收音
+4. 检测到下一次触发后结束收音并送入 ASR
+5. 按 `Ctrl+C` 退出程序
+6. s键打断说话
+> **提示**: 若触发不稳定，可在 `config.py` 中调整 `INTERCOM_PTT_TRIGGER_THRESHOLD` 与 `INTERCOM_PTT_DEBOUNCE_TIME`。
 
 ### 终端输入模式 (`--no-asr`)
 

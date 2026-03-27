@@ -40,6 +40,8 @@ class FaceTrack:
 	best_quality: float = 0.0
 	missed_frames: int = 0
 	similarity: float = 0.0
+	track_start_time: float = 0.0
+	last_recognition_time: float = 0.0
 
 
 class _Ros2TopicPublisher:
@@ -323,10 +325,10 @@ class FaceRecognitionModule:
 	def _match_known_identity(self, embedding: np.ndarray) -> Tuple[str, float]:
 		"""将 embedding 与已知人脸库匹配，返回 (标签, 相似度)"""
 		if not self.known_embeddings:
-			return "陌生人", 0.0
+			return "guest", 0.0
 
 		emb = self._normalize_embedding(embedding)
-		best_label = "陌生人"
+		best_label = "guest"
 		best_similarity = -1.0
 
 		for label, vectors in self.known_embeddings.items():
@@ -338,7 +340,7 @@ class FaceRecognitionModule:
 
 		if best_similarity >= self.recognition_threshold:
 			return best_label, best_similarity
-		return "陌生人", best_similarity
+		return "guest", best_similarity
 
 	def _pick_center_face(self, frame: np.ndarray, faces: list) -> Optional[object]:
 		if not faces:
@@ -353,12 +355,22 @@ class FaceRecognitionModule:
 		bbox = center_face.bbox.astype(float)
 
 		if self.current_track is None:
-			self.current_track = FaceTrack(bbox=bbox)
+			now = time.time()
+			self.current_track = FaceTrack(
+				bbox=bbox,
+				track_start_time=now,
+				last_recognition_time=0.0,
+			)
 			return
 
 		iou = self._iou(self.current_track.bbox, bbox)
 		if iou < self.iou_threshold:
-			self.current_track = FaceTrack(bbox=bbox)
+			now = time.time()
+			self.current_track = FaceTrack(
+				bbox=bbox,
+				track_start_time=now,
+				last_recognition_time=0.0,
+			)
 			return
 
 		self.current_track.bbox = bbox
@@ -366,20 +378,36 @@ class FaceRecognitionModule:
 
 	def _maybe_lock_identity(self, frame: np.ndarray, face) -> None:
 		"""当追踪目标尚未锁定身份时，等待高质量首图触发识别"""
-		if self.current_track is None or self.current_track.is_identity_locked:
+		if self.current_track is None or (self.current_track.is_identity_locked and self.current_track.label != "guest"):
 			return
 
+		now = time.time()
 		quality = self._face_quality_score(frame, face)
 		if quality > self.current_track.best_quality:
 			self.current_track.best_quality = quality
 
 		if quality < self.quality_threshold:
 			return
+		
+		if not self.current_track.is_identity_locked:
+			label, similarity = self._match_known_identity(face.embedding)
+			self.current_track.label = label
+			self.current_track.similarity = similarity
+			self.current_track.is_identity_locked = True
+			
+		# # 前 10 秒内每秒尝试一次识别，避免低质量导致漏识别
+		# if now - self.current_track.track_start_time <= 10.0:
+		if now - self.current_track.last_recognition_time >= 1.0:
+			label, similarity = self._match_known_identity(face.embedding)
+			self.current_track.last_recognition_time = now
+			if similarity >= self.recognition_threshold:
+				self.current_track.label = label
+				self.current_track.similarity = similarity
+				self.current_track.is_identity_locked = True
+				return
 
-		label, similarity = self._match_known_identity(face.embedding)
-		self.current_track.label = label
-		self.current_track.similarity = similarity
-		self.current_track.is_identity_locked = True
+
+	
 
 	def process_frame(self, frame: np.ndarray) -> Dict[str, object]:
 		"""
@@ -495,7 +523,7 @@ class FaceRecognitionModule:
 		quality = float(result.get("quality", 0.0))
 		sim = float(result.get("similarity", 0.0))
 
-		color = (0, 200, 0) if label not in ("陌生人", "识别中") else (0, 165, 255)
+		color = (0, 200, 0) if label not in ("guest", "识别中") else (0, 165, 255)
 		cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
 		text = f"{label} | q={quality:.2f} | sim={sim:.2f}"
 		cv2.putText(output, text, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)

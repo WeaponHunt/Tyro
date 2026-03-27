@@ -9,7 +9,7 @@ import os
 import json
 import copy
 from loguru import logger
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable, Tuple, List
 import threading
 from pynput import keyboard
 
@@ -32,7 +32,16 @@ class ConversationManager:
                  persona_update_handler: Optional[Callable[[str, str, str], None]] = None,
                  language: str = "zh",
                  say_hallo: bool = False,
-                 greeting_cooldown_seconds: float = 600.0):
+                 greeting_cooldown_seconds: float = 600.0,
+                 sleep_toggle_key: str = "w",
+                 script_toggle_key: str = "c",
+                 script_pause_resume_key: str = "p",
+                 tts_interrupt_key: str = "s",
+                 sleep_toggle_voice_words: Optional[List[str]] = None,
+                 script_toggle_voice_words: Optional[List[str]] = None,
+                 visualizer_enable_topic: str = "/face/visualizer/enabled",
+                 visualizer_enable_voice_words: Optional[List[str]] = None,
+                 visualizer_disable_voice_words: Optional[List[str]] = None):
         """
         初始化对话管理器
         
@@ -56,6 +65,15 @@ class ConversationManager:
             persona_provider: 根据用户名返回人格 system prompt
             persona_update_handler: 后台人格更新处理器，参数为 (user, user_text, context)
             say_hallo: 是否在非响应阶段见到熟人后主动问好
+            sleep_toggle_key: 睡眠模式切换按键
+            script_toggle_key: 脚本模式切换按键
+            script_pause_resume_key: 脚本模式下TTS暂停/恢复按键
+            tts_interrupt_key: TTS 打断按键
+            sleep_toggle_voice_words: 睡眠模式语音切换词列表（任一命中即切换）
+            script_toggle_voice_words: 脚本模式语音切换词列表（任一命中即切换）
+            visualizer_enable_topic: 可视化开关 topic
+            visualizer_enable_voice_words: 可视化开启语音词（任一命中即发布 True）
+            visualizer_disable_voice_words: 可视化关闭语音词（任一命中即发布 False）
         """
         self.asr = asr_module
         self.tts = tts_module
@@ -79,11 +97,13 @@ class ConversationManager:
         self._persona_update_threads = []
         self._worker_lock = threading.Lock()
         self._persona_update_lock = threading.Lock()
+        self._proactive_thread = None
         self._user_state_lock = threading.Lock()
         self._proactive_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._sleep_lock = threading.Lock()
         self._script_lock = threading.Lock()
+        self._script_pause_lock = threading.Lock()
         self._script_image_lock = threading.Lock()
         self._recent_dialogue_rounds_by_user = {}  # dict[user, list[(user_text, assistant_text)]]
         self._active_user = self.default_user
@@ -95,6 +115,7 @@ class ConversationManager:
         self._sleep_mode = False
         self._sleep_listener = None
         self._script_mode = False
+        self._script_paused = False
         self._script_thread = None
         self._script_stop_event = threading.Event()
         self._script_context_snapshot = None
@@ -107,9 +128,40 @@ class ConversationManager:
         self._script_image_stop_event = threading.Event()
         self._script_image_update_event = threading.Event()
         self._script_image_current_path = None
+        self._script_face_tracking_disabled = False
         self.language = (language or "zh").strip().lower()
         if self.language not in {"zh", "en"}:
             self.language = "zh"
+        self._sleep_toggle_key = self._normalize_key_char(sleep_toggle_key, "w")
+        self._script_toggle_key = self._normalize_key_char(script_toggle_key, "c")
+        self._script_pause_resume_key = self._normalize_key_char(script_pause_resume_key, "p")
+        self._tts_interrupt_key = self._normalize_key_char(tts_interrupt_key, "s")
+        self._sleep_toggle_key_label = self._format_key_label(self._sleep_toggle_key)
+        self._script_toggle_key_label = self._format_key_label(self._script_toggle_key)
+        self._script_pause_resume_key_label = self._format_key_label(self._script_pause_resume_key)
+        self._tts_interrupt_key_label = self._format_key_label(self._tts_interrupt_key)
+
+        default_sleep_toggle_words = ["toggle sleep mode", "switch sleep mode"] if self._is_english else ["切换睡眠模式", "睡眠模式切换"]
+        default_script_toggle_words = ["toggle script mode", "switch script mode"] if self._is_english else ["切换脚本模式", "脚本模式切换"]
+        self._sleep_toggle_voice_words = self._normalize_voice_toggle_words(
+            sleep_toggle_voice_words,
+            default_sleep_toggle_words,
+        )
+        self._script_toggle_voice_words = self._normalize_voice_toggle_words(
+            script_toggle_voice_words,
+            default_script_toggle_words,
+        )
+        default_visualizer_enable_words = ["enable visualizer", "turn on visualizer", "show visualizer"] if self._is_english else ["开启可视化", "打开可视化", "显示可视化"]
+        default_visualizer_disable_words = ["disable visualizer", "turn off visualizer", "hide visualizer"] if self._is_english else ["关闭可视化", "关掉可视化", "隐藏可视化"]
+        self._visualizer_enable_topic = str(visualizer_enable_topic or "/face/visualizer/enabled").strip() or "/face/visualizer/enabled"
+        self._visualizer_enable_voice_words = self._normalize_voice_toggle_words(
+            visualizer_enable_voice_words,
+            default_visualizer_enable_words,
+        )
+        self._visualizer_disable_voice_words = self._normalize_voice_toggle_words(
+            visualizer_disable_voice_words,
+            default_visualizer_disable_words,
+        )
         self._wake_words = ["hello", "hi", "hey"] if self._is_english else ["你好"]
         self._sleep_words = ["goodbye", "bye", "seeyou"] if self._is_english else ["再见"]
         self._say_hallo = bool(say_hallo)
@@ -142,6 +194,133 @@ class ConversationManager:
     def _msg(self, zh: str, en: str) -> str:
         return en if self._is_english else zh
 
+    @staticmethod
+    def _normalize_key_char(key: Optional[str], fallback: str) -> str:
+        """标准化键位配置：支持单字符与特殊键名（如 enter/space）。"""
+        value = str(key or "").strip().lower()
+        if not value:
+            return fallback
+
+        aliases = {
+            "return": "enter",
+            "newline": "enter",
+            "esc": "escape",
+            "spacebar": "space",
+        }
+        value = aliases.get(value, value)
+
+        special_keys = {"enter", "space", "tab", "escape"}
+        if value in special_keys:
+            return value
+        return value[0]
+
+    @staticmethod
+    def _format_key_label(key_value: str) -> str:
+        labels = {
+            "enter": "ENTER",
+            "space": "SPACE",
+            "tab": "TAB",
+            "escape": "ESC",
+        }
+        return labels.get(key_value, key_value.upper())
+
+    @staticmethod
+    def _is_key_pressed(key, expected_key: str) -> bool:
+        if not expected_key:
+            return False
+
+        key_name = {
+            "enter": "enter",
+            "space": "space",
+            "tab": "tab",
+            "escape": "esc",
+        }.get(expected_key)
+
+        if key_name:
+            try:
+                if key == getattr(keyboard.Key, key_name):
+                    return True
+            except Exception:
+                pass
+
+        if expected_key == "space":
+            return bool(hasattr(key, "char") and key.char == " ")
+
+        return bool(hasattr(key, "char") and key.char and key.char.lower() == expected_key)
+
+    def _normalize_voice_toggle_words(self, words: Optional[List[str]], defaults: List[str]) -> List[str]:
+        candidates = words if words is not None else defaults
+        normalized_words = []
+        for raw in candidates:
+            normalized = self._normalize_text(str(raw or ""))
+            if normalized:
+                normalized_words.append(normalized)
+        return normalized_words
+
+    def _contains_any_trigger(self, normalized_text: str, triggers: List[str]) -> bool:
+        if not normalized_text or not triggers:
+            return False
+        return any(trigger in normalized_text for trigger in triggers)
+
+    def _handle_mode_toggle_voice_command(self, user_text: str) -> bool:
+        """处理通过语音关键词触发的模式切换。"""
+        normalized_text = self._normalize_text(user_text)
+        if not normalized_text:
+            return False
+
+        if self._contains_any_trigger(normalized_text, self._sleep_toggle_voice_words):
+            logger.info("命中语音指令：切换睡眠模式")
+            self._toggle_sleep_mode()
+            return True
+
+        if self._contains_any_trigger(normalized_text, self._script_toggle_voice_words):
+            logger.info("命中语音指令：切换脚本模式")
+            self._toggle_script_mode()
+            return True
+
+        return False
+
+    def _set_visualizer_enabled(self, enabled: bool) -> bool:
+        """通过 topic 控制可视化界面开关。"""
+        if not self.llm or not hasattr(self.llm, "publish_visualizer_enable"):
+            logger.warning("可视化开关未发布（LLM模块不支持 publish_visualizer_enable）")
+            return False
+
+        try:
+            published = self.llm.publish_visualizer_enable(bool(enabled))
+            if published:
+                logger.info(
+                    f"已设置可视化开关: {'开启' if enabled else '关闭'} ({self._visualizer_enable_topic})"
+                )
+            else:
+                logger.warning(
+                    f"设置可视化开关失败（返回 False）: {'开启' if enabled else '关闭'} ({self._visualizer_enable_topic})"
+                )
+            return bool(published)
+        except Exception as e:
+            logger.warning(f"设置可视化开关异常: enabled={enabled}, err={e}")
+            return False
+
+    def _handle_visualizer_toggle_voice_command(self, user_text: str) -> bool:
+        """处理通过语音关键词触发的可视化界面开关。"""
+        normalized_text = self._normalize_text(user_text)
+        if not normalized_text:
+            return False
+
+        if self._contains_any_trigger(normalized_text, self._visualizer_enable_voice_words):
+            logger.info("命中语音指令：开启可视化界面")
+            self._set_visualizer_enabled(True)
+            print(self._msg("🟢 已触发可视化开启", "🟢 Visualizer enable triggered"))
+            return True
+
+        if self._contains_any_trigger(normalized_text, self._visualizer_disable_voice_words):
+            logger.info("命中语音指令：关闭可视化界面")
+            self._set_visualizer_enabled(False)
+            print(self._msg("⚫ 已触发可视化关闭", "⚫ Visualizer disable triggered"))
+            return True
+
+        return False
+
     def _resolve_active_user(self) -> str:
         """解析当前交互用户。"""
         try:
@@ -155,26 +334,28 @@ class ConversationManager:
         return str(user).strip()
 
     def _start_sleep_listener(self) -> None:
-        """启动睡眠/脚本模式切换的键盘监听器（W/C）。"""
+        """启动睡眠/脚本模式切换与脚本暂停恢复键盘监听器。"""
         if self._sleep_listener is not None:
             return
 
         def _on_press_sleep(key):
             try:
-                k = key.char if hasattr(key, 'char') else None
-                if not k:
-                    return
-                k = k.lower()
-                if k == 'w':
+                if self._is_key_pressed(key, self._sleep_toggle_key):
                     self._toggle_sleep_mode()
-                elif k == 'c':
+                elif self._is_key_pressed(key, self._script_toggle_key):
                     self._toggle_script_mode()
+                elif self._is_key_pressed(key, self._script_pause_resume_key):
+                    self._toggle_script_pause_mode()
             except Exception as e:
                 logger.debug(f"睡眠模式按键监听异常: {e}")
 
         self._sleep_listener = keyboard.Listener(on_press=_on_press_sleep, daemon=True)
         self._sleep_listener.start()
-        logger.info("睡眠模式切换监听已启动 (按 W 切换)")
+        logger.info(
+            f"模式切换按键监听已启动 (按 {self._sleep_toggle_key_label} 切换睡眠，"
+            f"按 {self._script_toggle_key_label} 切换脚本，"
+            f"按 {self._script_pause_resume_key_label} 暂停/恢复脚本播报)"
+        )
 
     def _toggle_sleep_mode(self) -> None:
         """切换睡眠模式。"""
@@ -188,13 +369,16 @@ class ConversationManager:
             if self.expression and self.expression.is_available:
                 self.expression.set_expression("sleep")
             logger.info("进入睡眠模式，暂停外部输入响应")
-            print(self._msg("😴 已进入睡眠模式（按 W 退出）", "😴 Sleep mode enabled (press W to wake)"))
-            self._play_tts_notice(self._msg("我先去睡会。", "I'm going to sleep for a bit."))
+            print(self._msg(
+                f"😴 已进入睡眠模式（按 {self._sleep_toggle_key_label} 退出）",
+                f"😴 Sleep mode enabled (press {self._sleep_toggle_key_label} to wake)",
+            ))
+            self._play_tts_notice(self._msg("那我闭嘴了。", "I will be quiet now."))
         else:
             self._reset_context_on_wake()
             logger.info("退出睡眠模式，已重置上下文")
             print(self._msg("✅ 已退出睡眠模式（上下文已重置）", "✅ Sleep mode disabled (context reset)"))
-            self._play_tts_notice(self._msg("我醒了。", "I'm awake."))
+            self._play_tts_notice(self._msg("我可以说话了。", "I can talk now."))
             if self.expression and self.expression.is_available:
                 self.expression.reset_expression()
 
@@ -213,6 +397,59 @@ class ConversationManager:
         else:
             self._exit_script_mode()
 
+    @staticmethod
+    def _split_text_for_script_step(text: str) -> List[str]:
+        """按中英文逗号和句号切分脚本文本，保留标点。"""
+        if not text:
+            return []
+
+        delimiters = {"，", ",", "。", "."}
+        segments: List[str] = []
+        buffer = ""
+
+        for ch in str(text):
+            buffer += ch
+            if ch in delimiters:
+                segment = buffer.strip()
+                if segment:
+                    segments.append(segment)
+                buffer = ""
+
+        tail = buffer.strip()
+        if tail:
+            segments.append(tail)
+        return segments
+
+    def _wait_script_resume_or_stop(self) -> bool:
+        """若脚本处于暂停态则阻塞等待恢复；若脚本退出则返回 False。"""
+        while True:
+            if self._script_stop_event.is_set() or not self._script_mode:
+                return False
+            with self._script_pause_lock:
+                if not self._script_paused:
+                    return True
+            time.sleep(0.05)
+
+    def _toggle_script_pause_mode(self) -> None:
+        """脚本模式下切换暂停/恢复。"""
+        if not self._script_mode:
+            return
+
+        with self._script_pause_lock:
+            self._script_paused = not self._script_paused
+            paused = self._script_paused
+
+        if paused:
+            self._interrupt_tts_playback()
+            logger.info("脚本播报已暂停")
+            print(self._msg(
+                f"⏸️ 脚本播报已暂停（按 {self._script_pause_resume_key_label} 恢复）",
+                f"⏸️ Script playback paused (press {self._script_pause_resume_key_label} to resume)",
+            ))
+        else:
+            logger.info("脚本播报已恢复")
+            print(self._msg("▶️ 脚本播报已恢复", "▶️ Script playback resumed"))
+
     def _enter_script_mode(self) -> None:
         with self._script_lock:
             if self._script_mode:
@@ -230,12 +467,21 @@ class ConversationManager:
             }
 
             self._script_mode = True
+            self._script_paused = False
             self._script_stop_event.clear()
             self._script_thread = threading.Thread(target=self._run_script_mode, daemon=True)
             self._script_thread.start()
 
+        disabled = self._set_face_tracking_enabled(False)
+        self._script_face_tracking_disabled = bool(disabled)
+        if not disabled:
+            logger.warning("进入脚本模式时未能关闭人脸追踪")
+
         logger.info("进入脚本模式")
-        print(self._msg("🎬 已进入脚本模式（按 C 退出）", "🎬 Script mode enabled (press C to exit)"))
+        print(self._msg(
+            f"🎬 已进入脚本模式（按 {self._script_toggle_key_label} 退出）",
+            f"🎬 Script mode enabled (press {self._script_toggle_key_label} to exit)",
+        ))
 
     def _exit_script_mode(self) -> None:
         with self._script_lock:
@@ -245,6 +491,10 @@ class ConversationManager:
             self._script_stop_event.set()
             snapshot = self._script_context_snapshot
             self._script_context_snapshot = None
+        with self._script_pause_lock:
+            self._script_paused = False
+
+        self._interrupt_tts_playback()
 
         if snapshot:
             with self._history_lock:
@@ -262,6 +512,9 @@ class ConversationManager:
             )
 
         self._close_script_image_window()
+        if self._script_face_tracking_disabled:
+            self._set_face_tracking_enabled(True)
+        self._script_face_tracking_disabled = False
         logger.info("退出脚本模式，恢复交互上下文")
         print(self._msg("✅ 已退出脚本模式", "✅ Script mode disabled"))
 
@@ -296,6 +549,126 @@ class ConversationManager:
             return []
         return steps
 
+    def _normalize_script_gesture(self, gesture: str) -> str:
+        """标准化脚本动作字符串，统一为函数调用样式。"""
+        value = str(gesture or "").strip()
+        if not value:
+            return ""
+
+        # 兼容只写函数名（如 greet）
+        if re.match(r"^[A-Za-z_]\w*$", value):
+            return f"{value}()"
+
+        # 只允许简单函数调用形式，避免注入奇怪内容
+        if re.match(r"^[A-Za-z_]\w*\s*\([^()]*\)$", value):
+            return value
+        return ""
+
+    def _publish_script_gesture(self, gesture: str) -> None:
+        """在脚本模式下发布动作到 /gesture topic。"""
+        normalized_gesture = self._normalize_script_gesture(gesture)
+        if not normalized_gesture:
+            if gesture:
+                logger.warning(f"脚本动作格式非法，已跳过: {gesture}")
+            return
+
+        if not self.llm or not hasattr(self.llm, "publish_gesture"):
+            logger.warning(f"脚本动作未发布（LLM模块不支持 publish_gesture）: {normalized_gesture}")
+            return
+
+        try:
+            published = self.llm.publish_gesture(normalized_gesture)
+            if published:
+                logger.info(f"脚本动作已发布: {normalized_gesture}")
+            else:
+                logger.warning(f"脚本动作未发布（返回 False）: {normalized_gesture}")
+        except Exception as e:
+            logger.warning(f"脚本动作发布失败: {normalized_gesture}, err={e}")
+
+    def _set_face_tracking_enabled(self, enabled: bool) -> bool:
+        """通过 topic 控制人脸追踪开关。"""
+        if not self.llm or not hasattr(self.llm, "publish_face_tracking_enable"):
+            logger.warning("人脸追踪开关未发布（LLM模块不支持 publish_face_tracking_enable）")
+            return False
+
+        try:
+            published = self.llm.publish_face_tracking_enable(bool(enabled))
+            if published:
+                logger.info(f"已设置人脸追踪开关: {'开启' if enabled else '关闭'}")
+            else:
+                logger.warning(f"设置人脸追踪开关失败（返回 False）: {'开启' if enabled else '关闭'}")
+            return bool(published)
+        except Exception as e:
+            logger.warning(f"设置人脸追踪开关异常: enabled={enabled}, err={e}")
+            return False
+
+    def _normalize_head_control_deg(self, value) -> Optional[Tuple[float, float]]:
+        """将脚本中的 head_control_deg 规范化为 (x, y) 两轴角度。"""
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value), 0.0
+
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return None
+            try:
+                x = float(value[0])
+                y = float(value[1]) if len(value) > 1 else 0.0
+                return x, y
+            except Exception:
+                return None
+
+        if isinstance(value, dict):
+            # 兼容 x/y 或 yaw/pitch 两种写法（如果传了 z/roll 会被忽略）
+            x_raw = value.get("x", value.get("yaw", 0.0))
+            y_raw = value.get("y", value.get("pitch", 0.0))
+            try:
+                return float(x_raw), float(y_raw)
+            except Exception:
+                return None
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return float(text), 0.0
+            except Exception:
+                parts = [p.strip() for p in text.split(",") if p.strip()]
+                if not parts:
+                    return None
+                try:
+                    x = float(parts[0])
+                    y = float(parts[1]) if len(parts) > 1 else 0.0
+                    return x, y
+                except Exception:
+                    return None
+
+        return None
+
+    def _publish_script_head_control(self, head_control_deg) -> None:
+        """在脚本模式下发布手动头控角度到 /head/manual_control_deg。"""
+        normalized = self._normalize_head_control_deg(head_control_deg)
+        if normalized is None:
+            logger.warning(f"脚本头控格式非法，已跳过: {head_control_deg}")
+            return
+
+        if not self.llm or not hasattr(self.llm, "publish_head_manual_control_deg"):
+            logger.warning("脚本头控未发布（LLM模块不支持 publish_head_manual_control_deg）")
+            return
+
+        x_deg, y_deg = normalized
+        try:
+            published = self.llm.publish_head_manual_control_deg(x_deg, y_deg)
+            if published:
+                logger.info(f"脚本头控已发布: x={x_deg:.2f}, y={y_deg:.2f}")
+            else:
+                logger.warning(f"脚本头控未发布（返回 False）: x={x_deg:.2f}, y={y_deg:.2f}")
+        except Exception as e:
+            logger.warning(f"脚本头控发布失败: x={x_deg:.2f}, y={y_deg:.2f}, err={e}")
+
     def _run_script_mode(self) -> None:
         try:
             steps = self._load_script_steps()
@@ -306,6 +679,8 @@ class ConversationManager:
             for step in steps:
                 if self._script_stop_event.is_set() or not self._script_mode:
                     break
+                if not self._wait_script_resume_or_stop():
+                    break
 
                 if not isinstance(step, dict):
                     continue
@@ -313,17 +688,49 @@ class ConversationManager:
                 text = str(step.get("text", "") or "").strip()
                 expression = str(step.get("expression", "") or "").strip()
                 image = str(step.get("image", "") or "").strip()
+                gesture = str(step.get("gesture", step.get("action", "")) or "").strip()
+                head_control_deg = step.get("head_control_deg", step.get("head_deg", step.get("head", None)))
                 delay = step.get("delay", 0.0)
+                text_segments = self._split_text_for_script_step(text)
+                if not text_segments:
+                    text_segments = [""]
 
-                if expression and self.expression and self.expression.is_available:
-                    self.expression.set_expression(expression)
+                # 动作和头控在大 step 开始时触发一次
+                if gesture:
+                    self._publish_script_gesture(gesture)
+                if head_control_deg is not None:
+                    self._publish_script_head_control(head_control_deg)
 
-                if image:
-                    self._show_script_image_async(image)
+                substep_idx = 0
+                while substep_idx < len(text_segments):
+                    if self._script_stop_event.is_set() or not self._script_mode:
+                        break
+                    if not self._wait_script_resume_or_stop():
+                        break
 
-                if text:
-                    print(f"🤖 {self._msg('脚本', 'Script')}: {text}")
-                    self._play_tts_notice(text)
+                    # 每个小 step 使用与大 step 相同的表情和图片
+                    if expression and self.expression and self.expression.is_available:
+                        self.expression.set_expression(expression)
+                    if image:
+                        self._show_script_image_async(image)
+
+                    segment_text = text_segments[substep_idx]
+                    if segment_text:
+                        print(f"🤖 {self._msg('脚本', 'Script')}: {segment_text}")
+                        self._play_tts_notice(segment_text)
+
+                    if self._script_stop_event.is_set() or not self._script_mode:
+                        break
+
+                    with self._script_pause_lock:
+                        paused = self._script_paused
+                    if paused:
+                        continue
+
+                    substep_idx += 1
+
+                if self._script_stop_event.is_set() or not self._script_mode:
+                    break
 
                 try:
                     delay_seconds = float(delay)
@@ -331,11 +738,16 @@ class ConversationManager:
                     delay_seconds = 0.0
 
                 if delay_seconds > 0:
-                    end_ts = time.time() + delay_seconds
-                    while time.time() < end_ts:
+                    remaining = max(0.0, delay_seconds)
+                    while remaining > 0:
                         if self._script_stop_event.is_set() or not self._script_mode:
                             break
-                        time.sleep(0.05)
+                        if not self._wait_script_resume_or_stop():
+                            break
+                        tick = min(0.05, remaining)
+                        start_ts = time.time()
+                        time.sleep(tick)
+                        remaining -= max(0.0, time.time() - start_ts)
         except Exception as e:
             logger.warning(f"脚本模式运行异常: {e}")
         finally:
@@ -429,6 +841,21 @@ class ConversationManager:
         with self._script_image_lock:
             self._script_image_current_path = None
         self._script_image_update_event.set()
+
+    def _interrupt_tts_playback(self) -> None:
+        """使用与常态对话一致的方式软打断 TTS（仅置中断标记）。"""
+        if self.tts is None:
+            return
+
+        interrupted_flag = getattr(self.tts, "_interrupted", None)
+        if interrupted_flag is None or not hasattr(interrupted_flag, "set"):
+            logger.warning("TTS模块不支持 _interrupted 软打断")
+            return
+
+        try:
+            interrupted_flag.set()
+        except Exception as e:
+            logger.warning(f"设置 TTS 软打断标记失败: {e}")
 
     def _play_tts_notice(self, text: str) -> None:
         if not text or not self.tts_enabled or self.tts is None:
@@ -551,7 +978,20 @@ class ConversationManager:
         if self._response_enabled:
             return
 
-        self._say_hello_to_familiar_user()
+        self._schedule_hello_to_familiar_user()
+
+    def _schedule_hello_to_familiar_user(self) -> None:
+        """异步触发主动问好，避免阻塞人脸追踪线程。"""
+        with self._proactive_lock:
+            if self._proactive_thread is not None and self._proactive_thread.is_alive():
+                logger.debug("say_hallo 已在执行中，跳过重复调度")
+                return
+
+            self._proactive_thread = threading.Thread(
+                target=self._say_hello_to_familiar_user,
+                daemon=True,
+            )
+            self._proactive_thread.start()
 
     def _say_hello_to_familiar_user(self) -> None:
         """在非响应阶段，对熟人执行一次主动问好。"""
@@ -921,20 +1361,23 @@ class ConversationManager:
             print(self._msg("🤖 机器人: ", "🤖 Assistant: "), end="", flush=True)
 
             if self.tts_enabled:
-                print(self._msg("\n🔊 正在播放语音... (按 'S' 键可打断)", "\n🔊 Playing audio... (press 'S' to interrupt)"))
+                print(self._msg(
+                    f"\n🔊 正在播放语音... (按 '{self._tts_interrupt_key_label}' 键可打断)",
+                    f"\n🔊 Playing audio... (press '{self._tts_interrupt_key_label}' to interrupt)",
+                ))
                 logger.debug("开始流式TTS播放")
 
                 def _on_press_interrupt_streaming(key):
                     try:
-                        if hasattr(key, 'char') and key.char == 's':
-                            logger.info("检测到S键，触发TTS打断")
+                        if self._is_key_pressed(key, self._tts_interrupt_key):
+                            logger.info(f"检测到{self._tts_interrupt_key_label}键，触发TTS打断")
                             self.tts._interrupted.set()
                     except Exception as e:
                         logger.debug(f"回调异常: {e}")
 
                 interrupt_listener = keyboard.Listener(on_press=_on_press_interrupt_streaming, daemon=True)
                 interrupt_listener.start()
-                logger.debug("流式TTS打断监听器已启动（daemon模式）")
+                logger.debug(f"流式TTS打断监听器已启动（daemon模式，按 {self._tts_interrupt_key_label} 键）")
 
                 if self.audio_recorder:
                     logger.debug("设置 is_tts_playing = True")
@@ -999,15 +1442,18 @@ class ConversationManager:
 
         # 6. TTS: 文字转语音并播放
         if self.tts_enabled and not tts_played_in_streaming:
-            print(self._msg("🔊 正在播放语音... (按 'S' 键可打断)", "🔊 Playing audio... (press 'S' to interrupt)"))
+            print(self._msg(
+                f"🔊 正在播放语音... (按 '{self._tts_interrupt_key_label}' 键可打断)",
+                f"🔊 Playing audio... (press '{self._tts_interrupt_key_label}' to interrupt)",
+            ))
             logger.debug("开始TTS播放")
 
             # 启动临时键盘监听器，按 S 键打断 TTS
             # 重要：不在回调里返回 False，避免监听器自阻塞；用 daemon=True 让主线程不等待
             def _on_press_interrupt(key):
                 try:
-                    if hasattr(key, 'char') and key.char == 's':
-                        logger.info("检测到S键，触发TTS打断")
+                    if self._is_key_pressed(key, self._tts_interrupt_key):
+                        logger.info(f"检测到{self._tts_interrupt_key_label}键，触发TTS打断")
                         self.tts._interrupted.set()
                         # 不调用 sd.stop()，让 TTS 模块自己在轮询里检查到中断后调用
                 except Exception as e:
@@ -1015,7 +1461,7 @@ class ConversationManager:
 
             interrupt_listener = keyboard.Listener(on_press=_on_press_interrupt, daemon=True)
             interrupt_listener.start()
-            logger.debug("TTS打断监听器已启动（daemon模式）")
+            logger.debug(f"TTS打断监听器已启动（daemon模式，按 {self._tts_interrupt_key_label} 键）")
 
             # 通知录音器 TTS 正在播放（continuous 模式下屏蔽麦克风）
             if self.audio_recorder:
@@ -1066,9 +1512,6 @@ class ConversationManager:
             audio_data: 音频数据
         """
         try:
-            if self._sleep_mode or self._script_mode:
-                logger.debug("睡眠模式中，忽略音频输入")
-                return
             logger.debug("开始处理音频数据")
             # 0. 音频前置过滤：时长和音量检查
             duration = len(audio_data) / self.sample_rate
@@ -1103,6 +1546,17 @@ class ConversationManager:
                 return
             
             print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
+
+            if self._handle_visualizer_toggle_voice_command(user_text):
+                return
+
+            if self._handle_mode_toggle_voice_command(user_text):
+                return
+
+            if self._sleep_mode or self._script_mode:
+                logger.debug("当前在睡眠/脚本模式，忽略非模式切换语音输入")
+                return
+
             if self._maybe_trigger_script_mode(user_text):
                 return
             if not self._handle_continuous_mode_command(user_text):
@@ -1123,15 +1577,22 @@ class ConversationManager:
     def process_text(self, user_text: str) -> None:
         """处理终端输入文本,完成完整对话流程。"""
         try:
-            if self._sleep_mode or self._script_mode:
-                logger.debug("睡眠模式中，忽略文本输入")
-                return
             if not user_text or user_text.strip() == "":
                 print(self._msg("⚠️ 输入为空，请重试", "⚠️ Empty input, please try again"))
                 return
 
             user_text = user_text.strip()
             print(f"👤 {self._msg('您输入', 'You typed')}: {user_text}")
+
+            if self._handle_visualizer_toggle_voice_command(user_text):
+                return
+
+            if self._handle_mode_toggle_voice_command(user_text):
+                return
+
+            if self._sleep_mode or self._script_mode:
+                logger.debug("当前在睡眠/脚本模式，忽略非模式切换文本输入")
+                return
 
             if self._maybe_trigger_script_mode(user_text):
                 return

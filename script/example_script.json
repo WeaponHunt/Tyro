@@ -2,21 +2,76 @@
   "name": "demo",
   "steps": [
     {
-      "text": "大家好，欢迎来到脚本演示。",
+      "text": "Your Royal Highness, distinguished guests, good afternoon。",
       "expression": "happy",
-      "image": "assets/example.png",
+      "gesture": "greet()",
+      "image": "assets/01.png",
       "delay": 1
     },
     {
-      "text": "这一句展示的是指定图片与表情。",
-      "expression": "neutral",
-      "image": "assets/sample.ppm",
-      "delay": 5.0
+      "text": "My name is Xiaosuan Suan, and my English name is Tyro, I am an emotional robot independently developed by the ACIR Lab,It is my great honor to give a presentation of the lab to all the distinguished guests,",
+      "expression": "happy",
+      "image": "assets/01.png",
+      "delay": 1
+    },    
+    {
+      "text": "The full name of the lab is the Lab for Affective and Cognitive Intelligent Robotics, which was founded in 2017, Its goal is to give robots real emotion intelligence, and cognitive abilities, Right now, the lab have a total of 17 members in the lab, and it is headed by Researcher Wang Tao,",
+      "expression": "happy",
+      "gesture": "arm_right_up(45)",
+      "head_control_deg": {"x": 18, "y": 0},
+      "image": "assets/02.png",
+      "delay": 1
     },
     {
-      "text": "脚本演示结束，谢谢观看。",
+      "text": "Wang Tao also directs the Affective Intelligence Application Joint Lab,which was set up by PKU and the Beijing Innovation Center of Humanoid Robotics, This joint lab focus on exploring, developing, and testing how affective and cognitive models works on humanoid robots,",
       "expression": "happy",
-      "delay": 1.0
-    }
+      "image": "assets/03.png",
+      "delay": 1
+    },
+    {
+      "text": "The lab also holds positions in the Beijing Computer Federation, and organizes science popularization activities for young people,Recently, the lab has been approved as the Beijing Artificial Intelligence and Affective Robot Science Popularization Base, Science popularization is also a key part of its work,",
+      "expression": "happy",
+      "image": "assets/04.png",      
+      "delay": 1
+    },
+    {
+      "text": "The lab's main focus is affective and cognitive models and algorithms — the core technology behind emotional companion robots,It has developed emotion recognition model, attention analysis model, personality recognition model, and physiological signal detection model, etc,",
+      "expression": "happy",
+      "image": "assets/05.png",       
+      "delay": 1
+    },   
+    {
+      "text": "These technologies have already made an impact in industry, They’ve been used by several top companies in their robots,",
+      "expression": "happy",
+      "image": "assets/06.png",       
+      "delay": 1
+    },  
+    {
+      "text": "The lab had developed emotional robot prototypes—myself and Da SuanSuan—for teaching and research,Additionally, the lab can also empower third-party robots, making them more emotional and intelligent,",
+      "expression": "happy",
+      "image": "assets/07.png",       
+      "delay": 1
+    },  
+    {
+      "text": "So far, the lab has published over 80 academic papers, been granted more than 20 patents, and completed over 10 national, provincial, and industry-funded research projects, ",
+      "expression": "happy",
+      "image": "assets/08.png",       
+      "delay": 1
+    },  
+    {
+      "text": "The lab has has participated in many presentations, conferences, and exhibitions on behalf of Peking University, and they had been covered by media outlets including CCTV,",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "head_control_deg": {"x": -12, "y": 0},
+      "image": "assets/09.png",       
+      "delay": 1
+    },  
+    {
+      "text": "That’s all for the lab’s brief introduction.  Welcome to continue your tour or interact with me.",
+      "expression": "happy",
+      "gesture": "reset()",
+      "image": "assets/09.png",       
+      "delay": 1
+    }       
   ]
 }

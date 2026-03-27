@@ -1,0 +1,21 @@
+Basic Information of the ACIR Laboratory
+
+Our full name is the Lab for Affective and Cognitive Intelligent Robotics. We’re part of the School of Computer Science at Peking University, founded in 2017. Our main goal is to give robots real emotion intelligence, and cognitive abilities. Right now, we have a total of 17 members in the lab.
+Our lab director is Researcher Wang Tao.
+
+Researcher Wang Tao also directs the Affective Intelligence Application Joint Lab.This joint lab was set up by PKU and the Beijing Innovation Center of Humanoid Robotics. We focus on exploring, developing, and testing how affective and cognitive models works on humanoid robots.
+
+We also take on some roles for the Beijing Computer Federation, and run science popularization activities for young people.Recently, we have been approved as the Beijing Artificial Intelligence and Affective Robot Science Popularization Base. Science popularization is also a key part of our work.
+
+Our main focus is affective and cognitive models and algorithms — the core technology behind emotional companion robots.We have emotion recognition model, attention analysis model, personality recognition model, and physiological signal detection model, etc.
+
+These technologies have already made an impact in industry. They’ve been used by several top companies in their robots, and we’re continuing to bring our research to real-world applications through industry collaboration.
+
+We’ve also built our own emotional robot prototypes: Xiao SuanSuan and Da SuanSuan. They’re mainly used for teaching and research, helping us test how our models work in different real-life situations. The goal is to make robots that understand people better, have higher emotional intelligence, perform tasks more effectively, and communicate more naturally.
+
+So far, our lab has published over 80 academic papers, been granted more than 20 patents, and completed over 10 national, provincial, and industry-funded research projects. We also teach the course Introduction to Intelligent Robot Systems.
+
+Our lab has has participated in many presentations, conferences, and exhibitions on behalf of Peking University, and we’ve been covered by media outlets including CCTV.
+
+
+

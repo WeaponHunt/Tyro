@@ -3,15 +3,12 @@
 负责将文本转换为语音
 """
 import threading
-import queue
-from concurrent.futures import ThreadPoolExecutor
+import time
 from collections.abc import Iterable
 from typing import List, Optional, Union
 
-# sounddevice is imported lazily inside methods that actually play audio to avoid
-# hard dependency at module import time in environments without audio devices.
+import sounddevice as sd
 import numpy as np
-import unicodedata
 from loguru import logger
 
 class TTSModule:
@@ -44,6 +41,11 @@ class TTSModule:
         self.speed = speed
         self.pipeline = None
         self.easy_tts_engine = None
+        self._state_lock = threading.Lock()
+        self._paused = threading.Event()
+        self._resume_segments: List[str] = []
+        self._resume_segment_index = 0
+        self._resume_play_audio = True
 
         logger.info(
             f"正在初始化TTS模块: provider={self.provider}, language={self.language}, "
@@ -107,67 +109,77 @@ class TTSModule:
                 logger.info(f"easy_tts_server 采样率: {value}")
                 return value
         return default
-
-    @staticmethod
-    def _filter_text(text: str) -> str:
-        """
-        过滤输入文本，删除非文本且非标点的符号（例如表情符号、其他 Unicode 符号类别）。
-
-        保留的 Unicode 类别首字母：
-          - L: Letter (字母)
-          - N: Number (数字)
-          - P: Punctuation (标点)
-          - Z: Separator (空白)
-          - M: Mark (组合符号)
-
-        删除的类别示例：S (Symbol，包含 emoji)、C (Other 控制字符等)
-        """
-        if not text:
-            return text
-
-        filtered_chars = []
-        removed_chars = []
-        for ch in text:
-            try:
-                cat = unicodedata.category(ch)
-            except Exception:
-                cat = "C"
-
-            if cat and cat[0] in ("L", "N", "P", "Z", "M"):
-                filtered_chars.append(ch)
-            else:
-                removed_chars.append(ch)
-
-        if removed_chars:
-            # 只打印部分以避免日志过长
-            sample = removed_chars[:10]
-            logger.debug(f"过滤掉非文本/标点字符: {sample}{'...' if len(removed_chars)>10 else ''}")
-
-        return "".join(filtered_chars)
     
     def stop(self):
         """打断当前TTS播放"""
         self._interrupted.set()
+        self._paused.clear()
+        with self._state_lock:
+            self._resume_segments = []
+            self._resume_segment_index = 0
         try:
-            import sounddevice as sd
             sd.stop()
         except Exception as e:
             logger.debug(f"TTS stop 调用 sd.stop 异常(可忽略): {e}")
 
+    def pause(self):
+        """暂停当前TTS播放，记录到当前段。"""
+        self._paused.set()
+        try:
+            sd.stop()
+        except Exception as e:
+            logger.debug(f"TTS pause 调用 sd.stop 异常(可忽略): {e}")
+
+    def resume(self, play_audio: Optional[bool] = None) -> list:
+        """恢复暂停的TTS播放，从暂停段重新开始。"""
+        if not self._paused.is_set():
+            logger.info("当前未处于暂停状态，无需恢复")
+            return []
+
+        with self._state_lock:
+            segments = list(self._resume_segments)
+            start_idx = self._resume_segment_index
+            resolved_play_audio = self._resume_play_audio if play_audio is None else bool(play_audio)
+
+        if not segments or start_idx >= len(segments):
+            logger.info("没有可恢复的TTS段")
+            self._paused.clear()
+            return []
+
+        logger.info(f"恢复TTS播放，从第{start_idx}段开始")
+        self._paused.clear()
+        self._interrupted.clear()
+        audio_chunks, next_segment_idx = self._synthesize_segments(
+            segments=segments,
+            start_segment_idx=start_idx,
+            play_audio=resolved_play_audio,
+        )
+
+        with self._state_lock:
+            self._resume_segment_index = next_segment_idx
+            self._resume_play_audio = resolved_play_audio
+            if next_segment_idx >= len(segments) or self._interrupted.is_set():
+                self._resume_segments = []
+                self._resume_segment_index = 0
+
+        return audio_chunks
+
     def _play_audio_chunk(self, audio: np.ndarray, index: int) -> bool:
         """播放单段音频，返回是否被中断。"""
         logger.debug(f"播放第{index}段音频，长度{len(audio)}")
-        try:
-            import sounddevice as sd
-        except Exception as e:
-            logger.debug(f"无法导入 sounddevice，跳过播放: {e}")
-            return False
-
         sd.play(audio, self.sample_rate, blocking=False)
 
-        total_samples = len(audio)
-        played_samples = 0
-        while played_samples < total_samples:
+        # 某些设备/驱动下 get_stream().latency 并不表示已播放采样数，
+        # 使用预计时长 + 安全余量避免等待循环卡死。
+        expected_seconds = max(0.0, float(len(audio)) / float(self.sample_rate))
+        deadline = time.monotonic() + expected_seconds + 1.0
+
+        while True:
+            if self._paused.is_set():
+                logger.info("TTS播放已暂停，停止当前播放")
+                sd.stop()
+                return True
+
             if self._interrupted.is_set():
                 logger.info("TTS播放被打断，停止播放（播放中）")
                 sd.stop()
@@ -178,14 +190,83 @@ class TTSModule:
                 logger.debug(f"第{index}段播放完成")
                 break
 
-            try:
-                played_samples = int(stream.latency[1] * self.sample_rate)
-            except Exception:
-                pass
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"第{index}段播放等待超时，已强制停止（预计{expected_seconds:.2f}s）"
+                )
+                sd.stop()
+                break
 
             sd.sleep(10)
 
-        return self._interrupted.is_set()
+        return self._interrupted.is_set() or self._paused.is_set()
+
+    @staticmethod
+    def _split_text_by_punctuation(text: str) -> List[str]:
+        """按中英文逗号和句号切分文本，保留标点。"""
+        if not text:
+            return []
+
+        delimiters = {"，", ",", "。", "."}
+        segments: List[str] = []
+        buffer = ""
+
+        for ch in str(text):
+            buffer += ch
+            if ch in delimiters:
+                segment = buffer.strip()
+                if segment:
+                    segments.append(segment)
+                buffer = ""
+
+        tail = buffer.strip()
+        if tail:
+            segments.append(tail)
+
+        return segments
+
+    def _synthesize_segments(
+        self,
+        segments: List[str],
+        start_segment_idx: int,
+        play_audio: bool,
+    ) -> tuple[List[np.ndarray], int]:
+        """从指定段号开始合成，返回(音频块, 下一个待播段号)。"""
+        audio_chunks: List[np.ndarray] = []
+        next_segment_idx = start_segment_idx
+        audio_index = 0
+
+        for segment_idx in range(start_segment_idx, len(segments)):
+            if self._paused.is_set() or self._interrupted.is_set():
+                next_segment_idx = segment_idx
+                break
+
+            segment = segments[segment_idx].strip()
+            if not segment:
+                next_segment_idx = segment_idx + 1
+                continue
+
+            logger.debug(f"开始合成第{segment_idx}段: {segment}")
+            segment_audio_chunks, interrupted = self._synthesize_single_text(
+                segment,
+                play_audio=play_audio,
+                start_index=audio_index,
+            )
+            audio_chunks.extend(segment_audio_chunks)
+            audio_index += len(segment_audio_chunks)
+
+            if self._paused.is_set():
+                next_segment_idx = segment_idx
+                logger.info(f"TTS暂停在第{segment_idx}段，恢复时将从该段重新开始")
+                break
+
+            if interrupted or self._interrupted.is_set():
+                next_segment_idx = segment_idx + 1
+                break
+
+            next_segment_idx = segment_idx + 1
+
+        return audio_chunks, next_segment_idx
 
     def _synthesize_single_text(self, text: str, play_audio: bool, start_index: int = 0) -> tuple[List[np.ndarray], bool]:
         """合成单条文本，返回(音频列表, 是否被中断)。"""
@@ -196,6 +277,11 @@ class TTSModule:
 
             try:
                 for offset, (_gs, _ps, audio) in enumerate(generator):
+                    if self._paused.is_set():
+                        logger.info("TTS已暂停，停止合成（生成前）")
+                        interrupted = True
+                        break
+
                     if self._interrupted.is_set():
                         logger.info("TTS播放被打断，停止合成（生成前）")
                         interrupted = True
@@ -206,7 +292,10 @@ class TTSModule:
                     if play_audio:
                         interrupted = self._play_audio_chunk(audio, start_index + offset)
                         if interrupted:
-                            logger.info("TTS播放被打断，停止合成（播放后）")
+                            if self._paused.is_set():
+                                logger.info("TTS已暂停，停止合成（播放后）")
+                            else:
+                                logger.info("TTS播放被打断，停止合成（播放后）")
                             break
 
                     logger.debug(f"第 {start_index + offset} 段完成")
@@ -216,7 +305,7 @@ class TTSModule:
             return audio_chunks, interrupted
 
         if self.provider == "easy_tts_server":
-            if self._interrupted.is_set():
+            if self._paused.is_set() or self._interrupted.is_set():
                 return [], True
 
             language = self.language or "zh"
@@ -232,108 +321,35 @@ class TTSModule:
         raise ValueError(f"不支持的TTS后端: {self.provider}")
 
     def _synthesize_from_iterable(self, text_stream: Iterable[str], play_audio: bool) -> List[np.ndarray]:
-        """从字符串迭代器持续合成；按逗号聚句并并行合成。"""
-        audio_chunks: List[np.ndarray] = []
-        chunk_index = 0
-        future_queue: queue.Queue = queue.Queue()
-        sentinel = object()
-
-        def _sentence_iter(stream: Iterable[str]) -> Iterable[str]:
-            """从增量文本中按逗号聚合完整句子并依次产出。"""
-            buffer = ""
-            delimiters = ("。", "：", "？", "?", "！", "!", "；", ";", "，", ",", ".", ":", "\n", "～")
-
-            for part in stream:
-                if self._interrupted.is_set():
-                    break
-                if part is None:
-                    continue
-                # 先过滤掉非文本/非标点的字符（例如表情符号）
-                filtered_part = self._filter_text(str(part))
-                if not filtered_part:
-                    logger.debug(f"迭代器部分被过滤（非文本/标点），跳过: {part}")
-                    continue
-                buffer += filtered_part
-
-                while True:
-                    positions = [buffer.find(d) for d in delimiters if d in buffer]
-                    if not positions:
-                        break
-
-                    split_pos = min(pos for pos in positions if pos >= 0) + 1
-                    sentence = buffer[:split_pos].strip()
-                    buffer = buffer[split_pos:]
-                    if sentence:
-                        yield sentence
-
-            tail = buffer.strip()
-            if tail and not self._interrupted.is_set():
-                yield tail
-
-        def _synthesize_sentence(sentence: str) -> List[np.ndarray]:
-            chunks, _ = self._synthesize_single_text(sentence, play_audio=False)
-            return chunks
-
-        def producer() -> None:
-            try:
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    sentence_idx = 0
-                    for sentence in _sentence_iter(text_stream):
-                        if self._interrupted.is_set():
-                            break
-                        logger.debug(f"生成器模式收到完整句子[{sentence_idx}]: {sentence}")
-                        future = executor.submit(_synthesize_sentence, sentence)
-                        future_queue.put((sentence_idx, future))
-                        sentence_idx += 1
-            except Exception as e:
-                logger.error(f"生成器模式生产线程出错: {e}")
-            finally:
-                future_queue.put(sentinel)
-
-        producer_thread = threading.Thread(target=producer, daemon=True)
-        producer_thread.start()
-
-        pending_futures = {}
-        next_sentence_idx = 0
-        producer_done = False
-
-        while not self._interrupted.is_set():
-            if not producer_done:
-                item = future_queue.get()
-                if item is sentinel:
-                    producer_done = True
-                else:
-                    sentence_idx, future = item
-                    pending_futures[sentence_idx] = future
-
-            while next_sentence_idx in pending_futures:
-                future = pending_futures[next_sentence_idx]
-                if not future.done():
-                    break
-
-                try:
-                    sentence_chunks = future.result()
-                except Exception as e:
-                    logger.error(f"句子[{next_sentence_idx}] 合成失败: {e}")
-                    sentence_chunks = []
-
-                for audio in sentence_chunks:
-                    if self._interrupted.is_set():
-                        break
-                    audio_chunks.append(audio)
-                    if play_audio:
-                        interrupted = self._play_audio_chunk(audio, chunk_index)
-                        chunk_index += 1
-                        if interrupted:
-                            break
-
-                del pending_futures[next_sentence_idx]
-                next_sentence_idx += 1
-
-            if producer_done and not pending_futures:
+        """从字符串迭代器合并文本后按逗号/句号切段合成。"""
+        merged_text_parts: List[str] = []
+        for part in text_stream:
+            if self._paused.is_set() or self._interrupted.is_set():
                 break
+            if part is None:
+                continue
+            merged_text_parts.append(str(part))
 
-        producer_thread.join(timeout=0.5)
+        merged_text = "".join(merged_text_parts)
+        segments = self._split_text_by_punctuation(merged_text)
+
+        with self._state_lock:
+            self._resume_segments = segments
+            self._resume_segment_index = 0
+            self._resume_play_audio = play_audio
+
+        audio_chunks, next_segment_idx = self._synthesize_segments(
+            segments=segments,
+            start_segment_idx=0,
+            play_audio=play_audio,
+        )
+
+        with self._state_lock:
+            self._resume_segment_index = next_segment_idx
+            if next_segment_idx >= len(segments) or self._interrupted.is_set():
+                self._resume_segments = []
+                self._resume_segment_index = 0
+
         return audio_chunks
     
     def synthesize(self, text: Union[str, Iterable[str]], play_audio: bool = True) -> list:
@@ -350,20 +366,33 @@ class TTSModule:
         try:
             logger.info(f"正在合成语音，输入类型: {type(text).__name__}")
             self._interrupted.clear()
+            self._paused.clear()
 
             if isinstance(text, str):
-                # 过滤掉非文本/标点的字符（例如仅包含表情符号的字符串）
-                filtered = self._filter_text(text)
-                if not filtered:
-                    logger.info("输入文本被过滤为空（可能只包含 emoji/符号），跳过合成")
-                    return []
+                logger.info(f"正在合成语音: {text}")
+                segments = self._split_text_by_punctuation(text)
+                with self._state_lock:
+                    self._resume_segments = segments
+                    self._resume_segment_index = 0
+                    self._resume_play_audio = play_audio
 
-                logger.info(f"正在合成语音: {filtered}")
-                audio_chunks, _ = self._synthesize_single_text(filtered, play_audio=play_audio)
+                audio_chunks, next_segment_idx = self._synthesize_segments(
+                    segments=segments,
+                    start_segment_idx=0,
+                    play_audio=play_audio,
+                )
+
+                with self._state_lock:
+                    self._resume_segment_index = next_segment_idx
+                    if next_segment_idx >= len(segments) or self._interrupted.is_set():
+                        self._resume_segments = []
+                        self._resume_segment_index = 0
             else:
                 audio_chunks = self._synthesize_from_iterable(text, play_audio=play_audio)
             
-            if self._interrupted.is_set():
+            if self._paused.is_set():
+                logger.info("语音合成已暂停")
+            elif self._interrupted.is_set():
                 logger.info("语音合成被用户打断")
             else:
                 logger.info("语音合成完成")

@@ -69,8 +69,34 @@ def test_initialization_continuous():
         return None
 
 
+def test_initialization_intercom():
+    """测试3: Intercom 模式初始化"""
+    print("\n" + "="*60)
+    print("测试3: Intercom 模式初始化")
+    print("="*60)
+
+    try:
+        recorder = AudioRecorder(
+            sample_rate=16000,
+            channels=1,
+            listen_mode="intercom",
+            ptt_trigger_threshold=10000,
+            ptt_debounce_time=0.2,
+        )
+        print("✅ Intercom 模式初始化成功")
+        print(f"   采样率: {recorder.sample_rate} Hz")
+        print(f"   声道数: {recorder.channels}")
+        print(f"   监听模式: {recorder.listen_mode}")
+        print(f"   PTT 阈值: {recorder.ptt_trigger_threshold}")
+        print(f"   防抖时间: {recorder.ptt_debounce_time}s")
+        return recorder
+    except Exception as e:
+        print(f"❌ 初始化失败: {e}")
+        return None
+
+
 def test_parameters_validation():
-    """测试3: 参数验证"""
+    """测试4: 参数验证"""
     print("\n" + "="*60)
     print("测试3: 不同参数配置")
     print("="*60)
@@ -119,7 +145,7 @@ def test_parameters_validation():
 
 
 def test_audio_callback_simulation():
-    """测试4: 音频回调模拟"""
+    """测试5: 音频回调模拟"""
     print("\n" + "="*60)
     print("测试4: 音频回调模拟（Push 模式）")
     print("="*60)
@@ -153,8 +179,45 @@ def test_audio_callback_simulation():
         print(f"   ⚠️  预期 10 个块，实际 {total_frames} 个")
 
 
+def test_intercom_ptt_simulation():
+    """测试6: 对讲机 PTT 触发模拟"""
+    print("\n" + "="*60)
+    print("测试6: 对讲机 PTT 触发模拟")
+    print("="*60)
+
+    recorder = AudioRecorder(
+        listen_mode="intercom",
+        ptt_trigger_threshold=10000,
+        ptt_debounce_time=0.0,
+    )
+
+    captured = []
+
+    def _on_audio(audio_data):
+        captured.append(audio_data)
+
+    recorder.on_audio_complete = _on_audio
+
+    # 触发“按下”
+    pulse = np.full((160, 1), 0.6, dtype=np.float32)
+    recorder.audio_callback(pulse, 160, None, None)
+
+    # 模拟收音过程
+    voice = np.full((160, 1), 0.01, dtype=np.float32)
+    recorder.audio_callback(voice, 160, None, None)
+    recorder.audio_callback(voice, 160, None, None)
+
+    # 触发“松开”
+    recorder.audio_callback(pulse, 160, None, None)
+
+    if len(captured) == 1 and captured[0].shape[0] > 0:
+        print(f"   ✅ 对讲机模式回调正常，音频长度: {captured[0].shape[0]}")
+    else:
+        print(f"   ❌ 对讲机模式异常，回调次数: {len(captured)}")
+
+
 def test_tts_playing_flag():
-    """测试5: TTS 播放标志"""
+    """测试7: TTS 播放标志"""
     print("\n" + "="*60)
     print("测试5: TTS 播放标志（Continuous 模式）")
     print("="*60)
@@ -192,7 +255,7 @@ def test_tts_playing_flag():
 
 
 def test_processing_flag():
-    """测试6: 处理标志"""
+    """测试8: 处理标志"""
     print("\n" + "="*60)
     print("测试6: 音频处理标志")
     print("="*60)
@@ -220,7 +283,7 @@ def test_processing_flag():
 
 
 def test_vad_status_display():
-    """测试7: VAD 状态栏显示"""
+    """测试9: VAD 状态栏显示"""
     print("\n" + "="*60)
     print("测试7: VAD 状态栏显示")
     print("="*60)
@@ -265,7 +328,7 @@ def test_vad_status_display():
 
 
 def test_real_microphone_push():
-    """测试8: 真实麦克风测试（Push 模式）"""
+    """测试10: 真实麦克风测试（Push 模式）"""
     print("\n" + "="*60)
     print("测试8: 真实麦克风测试（Push 模式）")
     print("="*60)
@@ -329,7 +392,7 @@ def test_real_microphone_push():
 
 
 def test_real_microphone_continuous():
-    """测试9: 真实麦克风测试（Continuous 模式）"""
+    """测试11: 真实麦克风测试（Continuous 模式）"""
     print("\n" + "="*60)
     print("测试9: 真实麦克风测试（Continuous 模式）")
     print("="*60)
@@ -394,7 +457,7 @@ def test_real_microphone_continuous():
 
 
 def test_concurrent_callbacks():
-    """测试10: 并发回调测试"""
+    """测试12: 并发回调测试"""
     print("\n" + "="*60)
     print("测试10: 并发音频回调测试")
     print("="*60)
@@ -442,7 +505,7 @@ def test_concurrent_callbacks():
 
 
 def test_memory_leak():
-    """测试11: 内存泄漏测试"""
+    """测试13: 内存泄漏测试"""
     print("\n" + "="*60)
     print("测试11: 内存管理测试")
     print("="*60)
@@ -503,10 +566,12 @@ def run_all_tests():
     # 非交互式测试
     test_initialization_push()
     recorder = test_initialization_continuous()
+    test_initialization_intercom()
     
     if recorder:
         test_parameters_validation()
         test_audio_callback_simulation()
+        test_intercom_ptt_simulation()
         test_tts_playing_flag()
         test_processing_flag()
         test_vad_status_display()
@@ -544,6 +609,12 @@ def test_quick():
     # 测试 Push 模式
     if test_initialization_push():
         print("✅ Push 模式工作正常")
+
+    # 测试 Intercom 模式
+    intercom_recorder = test_initialization_intercom()
+    if intercom_recorder:
+        print("✅ Intercom 模式工作正常")
+        test_intercom_ptt_simulation()
     
     # 测试 Continuous 模式
     recorder = test_initialization_continuous()

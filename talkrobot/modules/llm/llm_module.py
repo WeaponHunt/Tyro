@@ -43,15 +43,23 @@ GESTURE_INSTRUCTION_EN = (
 # 尝试可选导入 ROS2，如果不可用则保持为 None
 _rclpy = None
 _ros_String = None
+_ros_Bool = None
+_ros_Point = None
 try:
     import rclpy as _tmp_rclpy  # type: ignore
     from std_msgs.msg import String as _tmp_String  # type: ignore
+    from std_msgs.msg import Bool as _tmp_Bool  # type: ignore
+    from geometry_msgs.msg import Point as _tmp_Point  # type: ignore
     _rclpy = _tmp_rclpy
     _ros_String = _tmp_String
+    _ros_Bool = _tmp_Bool
+    _ros_Point = _tmp_Point
 except Exception:
     # ROS2 环境不可用，后续发布将被跳过
     _rclpy = None
     _ros_String = None
+    _ros_Bool = None
+    _ros_Point = None
 
 class LLMModule:
     """大语言模型模块"""
@@ -64,6 +72,7 @@ class LLMModule:
         system_prompt: str,
         expression_prompt: str = "",
         language: str = "zh",
+        visualizer_enable_topic: str = "/face/visualizer/enabled",
     ):
         """
         初始化LLM模块
@@ -75,6 +84,7 @@ class LLMModule:
             system_prompt: 系统提示词
             expression_prompt: 表情指令提示词（追加到 system_prompt 后）
             language: 输出语言（zh/en）
+            visualizer_enable_topic: 可视化开关 topic（std_msgs/Bool）
         """
         logger.info(f"正在初始化LLM模块: model={model}")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
@@ -93,9 +103,13 @@ class LLMModule:
         # 可选的 ROS2 发布器（如果环境中有 rclpy）
         self.ros2_enabled: bool = False
         self.gesture_publisher = None
+        self.face_tracking_enable_publisher = None
+        self.head_manual_control_deg_publisher = None
+        self.visualizer_enable_publisher = None
+        self.visualizer_enable_topic = str(visualizer_enable_topic or "/face/visualizer/enabled").strip() or "/face/visualizer/enabled"
         self._ros_node = None
 
-        if _rclpy is not None and _ros_String is not None:
+        if _rclpy is not None and _ros_String is not None and _ros_Bool is not None and _ros_Point is not None:
             try:
                 # 尝试初始化 rclpy（如果尚未初始化）并创建一个临时节点用于发布
                 try:
@@ -121,8 +135,14 @@ class LLMModule:
 
                 if self._ros_node is not None:
                     self.gesture_publisher = self._ros_node.create_publisher(_ros_String, '/gesture', 10)
+                    self.face_tracking_enable_publisher = self._ros_node.create_publisher(_ros_Bool, '/face_tracking/enable', 10)
+                    self.head_manual_control_deg_publisher = self._ros_node.create_publisher(_ros_Point, '/head/manual_control_deg', 10)
+                    self.visualizer_enable_publisher = self._ros_node.create_publisher(_ros_Bool, self.visualizer_enable_topic, 10)
                     self.ros2_enabled = True
                     logger.info("ROS2 可用：已创建 /gesture 发布器")
+                    logger.info("人脸追踪开关 topic: /face_tracking/enable (Bool, True=开启, False=关闭)")
+                    logger.info("手动头控 topic: /head/manual_control_deg (geometry_msgs/Point, 单位: 度)")
+                    logger.info(f"可视化开关 topic: {self.visualizer_enable_topic} (Bool, True=开启, False=关闭)")
                 else:
                     logger.info("ROS2 环境检测到但无法创建节点，跳过 /gesture 发布器创建")
             except Exception as e:
@@ -259,6 +279,61 @@ class LLMModule:
             return True
         except Exception as e:
             logger.error(f"发布动作到 /gesture 失败: {e}")
+            return False
+
+    def publish_face_tracking_enable(self, enabled: bool) -> bool:
+        """发布人脸追踪开关到 /face_tracking/enable。"""
+        if self.face_tracking_enable_publisher is None or _ros_Bool is None:
+            logger.debug("/face_tracking/enable 发布器不可用，跳过发布")
+            return False
+
+        try:
+            msg = _ros_Bool()
+            msg.data = bool(enabled)
+            self.face_tracking_enable_publisher.publish(msg)
+            logger.info(f"已发布人脸追踪开关到 /face_tracking/enable: {msg.data}")
+            return True
+        except Exception as e:
+            logger.error(f"发布人脸追踪开关失败: {e}")
+            return False
+
+    def publish_head_manual_control_deg(self, x_deg: float, y_deg: float = 0.0) -> bool:
+        """发布手动头控角度到 /head/manual_control_deg（单位：度，仅使用 x/y）。"""
+        if self.head_manual_control_deg_publisher is None or _ros_Point is None:
+            logger.debug("/head/manual_control_deg 发布器不可用，跳过发布")
+            return False
+
+        try:
+            msg = _ros_Point()
+            msg.x = float(x_deg)
+            msg.y = float(y_deg)
+            # 该 topic 仅约定使用 x/y，z 固定为 0
+            msg.z = 0.0
+            self.head_manual_control_deg_publisher.publish(msg)
+            logger.info(
+                f"已发布手动头控到 /head/manual_control_deg: x={msg.x:.2f}, y={msg.y:.2f}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"发布手动头控失败: {e}")
+            return False
+
+    def publish_visualizer_enable(self, enabled: bool) -> bool:
+        """发布可视化界面开关到配置的 Bool topic。"""
+        if self.visualizer_enable_publisher is None or _ros_Bool is None:
+            logger.debug(f"{self.visualizer_enable_topic} 发布器不可用，跳过发布")
+            return False
+
+        try:
+            msg = _ros_Bool()
+            msg.data = bool(enabled)
+            self.visualizer_enable_publisher.publish(msg)
+            logger.info(
+                f"已发布可视化开关到 {self.visualizer_enable_topic}: {int(msg.data)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"发布可视化开关失败: {e}")
             return False
 
     def generate_response_with_gesture(self, user_input: str, context: str = "", system_prompt_override: str = "") -> Tuple[str, str]:

@@ -4,6 +4,7 @@
 支持两种模式:
   - push:       按住 Q 键录音，松开结束
   - continuous:  持续监听，基于 Silero VAD 自动检测语音段
+    - intercom:   检测对讲机 PTT 触发信号，按下开始收音，松开结束
 """
 import sys
 import time as _time
@@ -116,10 +117,13 @@ class AudioRecorder:
         sample_rate: int = 16000,
         channels: int = 1,
         listen_mode: str = "push",
+        tts_interrupt_key: str = "s",
         vad_check_interval: float = 0.25,
         pre_speech_duration: float = 0.25,
         silence_duration: float = 1.5,
         min_speech_duration: float = 0.3,
+        ptt_trigger_threshold: int = 10000,
+        ptt_debounce_time: float = 0.2,
     ):
         """
         初始化录音器
@@ -127,15 +131,20 @@ class AudioRecorder:
         Args:
             sample_rate: 采样率
             channels: 通道数
-            listen_mode: 监听模式 ("push" | "continuous")
+            listen_mode: 监听模式 ("push" | "continuous" | "intercom")
+            tts_interrupt_key: TTS 打断按键（用于提示文案）
             vad_check_interval: VAD 检测间隔（秒），每隔此时间检测一次语音 (continuous 模式)
             pre_speech_duration: VAD 检测到说话时，向前补偿的音频时长（秒）
             silence_duration: 静默多少秒后视为说话结束 (continuous 模式)
             min_speech_duration: 最短语音时长，过短丢弃 (continuous 模式)
+            ptt_trigger_threshold: 对讲机触发阈值（按 int16 幅值计算）
+            ptt_debounce_time: 对讲机触发防抖时间（秒）
         """
         self.sample_rate = sample_rate
         self.channels = channels
         self.listen_mode = listen_mode
+        self.tts_interrupt_key = str(tts_interrupt_key or "s").strip().lower()[:1] or "s"
+        self.tts_interrupt_key_label = self.tts_interrupt_key.upper()
 
         # 通用状态
         self.is_recording = False
@@ -144,6 +153,12 @@ class AudioRecorder:
 
         # 外部可设置的标志: TTS 正在播放时置 True，用于 continuous 模式屏蔽自身语音
         self.is_tts_playing = False
+
+        # intercom 模式参数
+        self.ptt_trigger_threshold = max(0, int(ptt_trigger_threshold))
+        self.ptt_debounce_time = max(0.0, float(ptt_debounce_time))
+        self._ptt_pressed = False
+        self._ptt_last_trigger_time: float = 0.0
 
         # continuous 模式参数
         self.vad_check_interval = vad_check_interval
@@ -266,7 +281,7 @@ class AudioRecorder:
             raise
 
     # ------------------------------------------------------------------
-    # 音频流回调 (两种模式共用)
+    # 音频流回调（各模式共用）
     # ------------------------------------------------------------------
     def audio_callback(self, indata, frames, time, status):
         """音频流回调函数"""
@@ -277,11 +292,62 @@ class AudioRecorder:
             # push 模式: 只有手动按键时才采集
             if self.is_recording:
                 self.audio_frames.append(indata.copy())
+        elif self.listen_mode == "intercom":
+            # intercom 模式: 通过音频阈值检测 PTT 触发，切换录音状态
+            self._handle_intercom_ptt(indata)
+            if self.is_recording:
+                self.audio_frames.append(indata.copy())
         else:
             # continuous 模式: 所有音频写入缓冲区，由 VAD 监控线程处理
             if not self.is_tts_playing and not self._processing:
                 with self._chunk_lock:
                     self._chunk_buffer.append(indata.copy())
+
+    def _handle_intercom_ptt(self, indata) -> None:
+        """检测并处理对讲机 PTT 触发（按下/松开）。"""
+        if indata is None:
+            return
+
+        try:
+            audio_flat = np.asarray(indata).flatten().astype(np.float32)
+        except Exception:
+            return
+
+        if audio_flat.size == 0:
+            return
+
+        # sounddevice 默认 float32(-1~1)，这里转换为近似 int16 幅值以复用阈值经验。
+        current_vol = int(np.max(np.abs(audio_flat)) * 32768.0)
+        now = _time.time()
+
+        if current_vol <= self.ptt_trigger_threshold:
+            return
+
+        if now - self._ptt_last_trigger_time <= self.ptt_debounce_time:
+            return
+
+        self._ptt_last_trigger_time = now
+        self._ptt_pressed = not self._ptt_pressed
+
+        if self._ptt_pressed:
+            if not self.is_recording:
+                self.is_recording = True
+                self._speech_start_time = now
+                self.audio_frames = []
+                print("\n✅ PTT 【按下】")
+                print("🔴 对讲机收音中...", end='\r', flush=True)
+                logger.debug("intercom: PTT 按下，开始收音")
+            return
+
+        # PTT 松开：结束当前段并触发回调
+        if self.is_recording:
+            self.is_recording = False
+            print("\n❌ PTT 【松开】")
+            print("✅ 录音结束")
+            logger.debug("intercom: PTT 松开，结束收音")
+            if self.audio_frames and self.on_audio_complete:
+                audio_data = np.concatenate(self.audio_frames, axis=0)
+                self.on_audio_complete(audio_data)
 
     # ------------------------------------------------------------------
     # continuous 模式: VAD 监控线程
@@ -456,6 +522,8 @@ class AudioRecorder:
         logger.info("正在停止音频录制...")
         self._stop_event.set()
         self.is_recording = False
+        self._ptt_pressed = False
+        self._ptt_last_trigger_time = 0.0
 
         with self._chunk_lock:
             self._chunk_buffer = []
@@ -541,7 +609,15 @@ class AudioRecorder:
             print("📌 操作说明 [按键模式]:")
             print("   - 按住 'Q' 键说话")
             print("   - 松开 'Q' 键结束")
-            print("   - 按 'S' 键打断语音播放")
+            print(f"   - 按 '{self.tts_interrupt_key_label}' 键打断语音播放")
+            print("   - 按 Ctrl+C 退出程序")
+        elif self.listen_mode == "intercom":
+            print("📌 操作说明 [对讲机模式]:")
+            print("   - 检测到 PTT 触发后开始收音")
+            print("   - 再次检测到 PTT 触发后结束收音")
+            print("   - 检测采用阈值 + 防抖")
+            print(f"   - PTT 阈值: {self.ptt_trigger_threshold}, 防抖: {self.ptt_debounce_time:.2f}s")
+            print(f"   - 按 '{self.tts_interrupt_key_label}' 键打断语音播放")
             print("   - 按 Ctrl+C 退出程序")
         else:
             print("📌 操作说明 [持续监听模式 - Silero VAD]:")
@@ -550,7 +626,7 @@ class AudioRecorder:
             print("   - 说“再见”退出响应模式，后续语音将忽略")
             print("   - 停顿超过 {:.1f} 秒视为说话结束".format(self.silence_duration))
             print("   - 机器人说话时会自动屏蔽麦克风")
-            print("   - 按 'S' 键打断语音播放")
+            print(f"   - 按 '{self.tts_interrupt_key_label}' 键打断语音播放")
             print("   - 按 Ctrl+C 退出程序")
 
         print("=" * 50 + "\n")
@@ -570,6 +646,9 @@ class AudioRecorder:
                     on_release=self.on_release,
                 )
                 self._keyboard_listener.start()
+                while not self._stop_event.wait(0.1):
+                    pass
+            elif self.listen_mode == "intercom":
                 while not self._stop_event.wait(0.1):
                     pass
             else:

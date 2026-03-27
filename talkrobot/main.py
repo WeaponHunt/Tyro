@@ -323,6 +323,7 @@ def run_chat(args):
             system_prompt=selected_system_prompt,
             expression_prompt=expression_prompt,
             language=language,
+            visualizer_enable_topic=Config.VISUALIZER_ENABLE_TOPIC,
         )
 
         disable_persona_auto_update = bool(getattr(args, "disable_persona_auto_update", False))
@@ -457,10 +458,13 @@ def run_chat(args):
                 sample_rate=Config.SAMPLE_RATE,
                 channels=Config.CHANNELS,
                 listen_mode=listen_mode,
+                tts_interrupt_key=Config.TTS_INTERRUPT_KEY,
                 vad_check_interval=Config.VAD_CHECK_INTERVAL,
                 pre_speech_duration=Config.VAD_PRE_SPEECH_DURATION,
                 silence_duration=Config.VAD_SILENCE_DURATION,
                 min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
+                ptt_trigger_threshold=Config.INTERCOM_PTT_TRIGGER_THRESHOLD,
+                ptt_debounce_time=Config.INTERCOM_PTT_DEBOUNCE_TIME,
             )
         else:
             audio_recorder = None
@@ -487,6 +491,27 @@ def run_chat(args):
             language=language,
             say_hallo=getattr(args, 'say_hallo', False),
             greeting_cooldown_seconds=getattr(args, 'hallo_cooldown_seconds', 600.0),
+            sleep_toggle_key=Config.MODE_SWITCH_SLEEP_KEY,
+            script_toggle_key=Config.MODE_SWITCH_SCRIPT_KEY,
+            script_pause_resume_key=Config.SCRIPT_PAUSE_RESUME_KEY,
+            tts_interrupt_key=Config.TTS_INTERRUPT_KEY,
+            sleep_toggle_voice_words=Config.MODE_SWITCH_SLEEP_VOICE_WORDS.get(
+                language,
+                Config.MODE_SWITCH_SLEEP_VOICE_WORDS.get("zh", []),
+            ),
+            script_toggle_voice_words=Config.MODE_SWITCH_SCRIPT_VOICE_WORDS.get(
+                language,
+                Config.MODE_SWITCH_SCRIPT_VOICE_WORDS.get("zh", []),
+            ),
+            visualizer_enable_topic=Config.VISUALIZER_ENABLE_TOPIC,
+            visualizer_enable_voice_words=Config.VISUALIZER_ENABLE_VOICE_WORDS.get(
+                language,
+                Config.VISUALIZER_ENABLE_VOICE_WORDS.get("zh", []),
+            ),
+            visualizer_disable_voice_words=Config.VISUALIZER_DISABLE_VOICE_WORDS.get(
+                language,
+                Config.VISUALIZER_DISABLE_VOICE_WORDS.get("zh", []),
+            ),
         )
 
         if face_resolver is not None and face_resolver.enabled:
@@ -655,9 +680,9 @@ def main():
         help=f"统一语言开关：TTS与LLM同时生效 (默认: {Config.LANGUAGE})"
     )
     chat_parser.add_argument(
-        "--listen-mode", type=str, choices=["push", "continuous"],
+        "--listen-mode", type=str, choices=["push", "continuous", "intercom"],
         default=Config.DEFAULT_LISTEN_MODE,
-        help="监听模式: push=按住Q键说话, continuous=持续监听 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
+        help="监听模式: push=按住Q键说话, continuous=持续监听, intercom=对讲机PTT触发 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
     )
     chat_parser.add_argument(
         "--no-asr", action="store_true", default=False,
@@ -731,9 +756,9 @@ def main():
         help="(兼容旧版) 统一语言开关：TTS与LLM同时生效"
     )
     parser.add_argument(
-        "--listen-mode", type=str, choices=["push", "continuous"],
+        "--listen-mode", type=str, choices=["push", "continuous", "intercom"],
         default=None,
-        help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听"
+        help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听, intercom=对讲机PTT触发"
     )
     parser.add_argument(
         "--no-asr", action="store_true", default=False,

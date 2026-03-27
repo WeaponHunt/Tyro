@@ -14,14 +14,46 @@ class Config:
     SAMPLE_RATE = 16000
     CHANNELS = 1
     
-    # 监听模式: "push"=按住Q键说话, "continuous"=持续监听
+    # 监听模式: "push"=按住Q键说话, "continuous"=持续监听, "intercom"=对讲机PTT触发
     DEFAULT_LISTEN_MODE = "push"
+
+    # 键盘控制配置
+    # 支持单字符（如 "w"/"c"/"p"/"s"）以及特殊键名（"enter"/"space"）
+    MODE_SWITCH_SLEEP_KEY = "w"      # 睡眠模式切换
+    MODE_SWITCH_SCRIPT_KEY = "c"     # 脚本模式切换
+    SCRIPT_PAUSE_RESUME_KEY = "enter"    # 脚本模式下TTS暂停/恢复（可改为 "space"）
+    TTS_INTERRUPT_KEY = "s"          # TTS 播放打断
+
+    # 语音模式切换词（用于替代按键切换，按“包含任一词汇”触发）
+    MODE_SWITCH_SLEEP_VOICE_WORDS = {
+        "zh": ["进入闭嘴模式", "退出闭嘴模式"],
+        "en": ["toggle sleep mode", "switch sleep mode","进入闭嘴模式", "退出闭嘴模式"],
+    }
+    MODE_SWITCH_SCRIPT_VOICE_WORDS = {
+        "zh": ["进入脚本模式", "脚本模式切换","退出脚本模式"],
+        "en": ["toggle script mode", "switch script mode","进入脚本模式", "脚本模式切换","退出脚本模式"],
+    }
+
+    # 可视化界面开关语音词与 topic（命中任一词即触发）
+    VISUALIZER_ENABLE_TOPIC = "/face/visualizer/enabled"
+    VISUALIZER_ENABLE_VOICE_WORDS = {
+        "zh": ["开启可视化", "打开可视化", "显示可视化"],
+        "en": ["enable visualizer", "turn on visualizer", "show visualizer","开启可视化", "打开可视化", "显示可视化"],
+    }
+    VISUALIZER_DISABLE_VOICE_WORDS = {
+        "zh": ["关闭可视化", "关掉可视化", "隐藏可视化"],
+        "en": ["disable visualizer", "turn off visualizer", "hide visualizer","关闭可视化", "关掉可视化", "隐藏可视化"],
+    }
     
     # 持续监听模式 VAD 配置 (Silero VAD)
     VAD_CHECK_INTERVAL = 0.5        # VAD 检测间隔（秒），每隔此时间检测一次语音
     VAD_PRE_SPEECH_DURATION = 0.25   # 检测到说话时，向前补偿的音频时长（秒）
     VAD_SILENCE_DURATION = 1      # 静默多少秒后判定说话结束
     VAD_MIN_SPEECH_DURATION = 0.3    # 最短语音时长（秒），过短的丢弃
+
+    # 对讲机模式配置（阈值按 int16 幅值）
+    INTERCOM_PTT_TRIGGER_THRESHOLD = 10000
+    INTERCOM_PTT_DEBOUNCE_TIME = 0.2
     
     # 音频过滤配置（ASR 前置检查）
     AUDIO_MIN_DURATION = 0.3          # 最短音频时长（秒），低于此值不送 ASR
@@ -74,11 +106,14 @@ class Config:
 
     # 全局提示词：对所有用户生效，拼接在用户人格 prompt 后
     GLOBAL_SYSTEM_PROMPT = """请遵循以下原则：
+        你的名字叫小算算
         语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
         音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
-        生成的文本要便于tts朗读，比如”10-15“应该生成为“10到15”避免tts把”-“读成”减“。"""
+        生成的文本要便于tts朗读，比如”10-15“应该生成为“10到15”避免tts把”-“读成”减“。
+        """
 
     GLOBAL_SYSTEM_PROMPT_EN = """Please follow these principles:
+        Your name is Tyro.
         Semantic-first: if an utterance is awkward or unclear, infer the most likely user intent from context (for example, treat minor ASR mistakes as likely homophone errors).
         Homophone correction: for ambiguous words, prefer phonetically similar and contextually correct terms.
         TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "10 to 15" instead of "10-15" to avoid reading '-' as "minus".
@@ -91,7 +126,7 @@ class Config:
     SLIDING_WINDOW_ROUNDS = 5
     
     # 系统提示词
-    SYSTEM_PROMPT = """你名叫Tyro,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题,请尽量不要生成英文。
+    SYSTEM_PROMPT = """你名叫小算算,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题,请尽量不要生成英文。
     请注意：你的输入来自 ASR（语音识别）系统，可能存在同音字错误、漏词、多词或断句不准的情况。
     在处理用户输入时，请遵循以下原则：
         语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
@@ -99,7 +134,7 @@ class Config:
         文字回应：至少作出一些简单的文字回应，不要只做表情或者动作回应。
         保持自然：直接回答用户的潜在意图，除非完全无法理解，否则不要反复询问用户是否说错了。"""
 
-    SYSTEM_PROMPT_EN = """Your name is Xiao Suan Suan, a friendly, helpful, and efficient AI assistant. Answer user questions in concise, natural English.
+    SYSTEM_PROMPT_EN = """Your name is Tyro, a friendly, helpful, and efficient AI assistant. Answer user questions in concise, natural English.
     Note: your input comes from an ASR (speech recognition) system, so it may contain homophone errors, missing words, extra words, or incorrect sentence boundaries.
     When handling user input, follow these principles:
         Semantic-first: if a sentence is not fluent literally, infer the user's most likely intent from context.
