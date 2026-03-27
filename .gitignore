@@ -7,5 +7,7 @@ agent/
 talkrobot/modules/face_recognize/known_faces/ljc.png
 expression_video/*.mp4
 note.txt
+script/assets/
+script/pictures/
 .DS_Store
 *.pyc
