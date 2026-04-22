@@ -4,8 +4,7 @@ talkrobot/logs/
 talkrobot/__pycache__/
 talkrobot/**/__pycache__/
 agent/
-talkrobot/modules/face_recognize/known_faces/*.jpg
-talkrobot/modules/face_recognize/known_faces/*.jepg
+talkrobot/modules/face_recognize/known_faces/
 expression_video/*.mp4
 note.txt
 script/assets/
