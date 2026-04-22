@@ -43,7 +43,7 @@ def make_fake_modules():
     fake_torch.from_numpy = lambda x: x
 
     # Fake silero_vad with simple get_speech_timestamps: returns a start when any non-zero sample
-    def get_speech_timestamps(tensor, model, sampling_rate=16000, return_seconds=False):
+    def get_speech_timestamps(tensor, model, sampling_rate=16000, threshold=0.5, return_seconds=False):
         # tensor is a numpy array in our fake
         if np.any(tensor != 0):
             # return a dict with 'start' at sample 0

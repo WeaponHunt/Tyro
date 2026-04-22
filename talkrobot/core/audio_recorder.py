@@ -14,7 +14,7 @@ import numpy as np
 import sounddevice as sd
 from pynput import keyboard
 from loguru import logger
-from typing import Callable
+from typing import Callable, Optional
 
 
 class VADIterator:
@@ -27,22 +27,57 @@ class VADIterator:
         # event_list may be [] or like [{'start': 123}] or [{'end': True}]
     """
 
-    def __init__(self, model, sampling_rate: int = 16000, silence_duration: float = 1.5):
+    def __init__(self, model, sampling_rate: int = 16000, silence_duration: float = 1.5, speech_threshold: float = 0.5):
         self.model = model
         self.sr = sampling_rate
+        self.speech_threshold = min(1.0, max(0.0, float(speech_threshold)))
         self.silence_samples_threshold = int(max(0.0, silence_duration) * sampling_rate)
         self.in_speech = False
         self._silent_samples = 0
+        self.last_score: float = 0.0
 
     def reset(self):
         """Reset internal state (useful when flushing or skipping audio)."""
         self.in_speech = False
         self._silent_samples = 0
+        self.last_score = 0.0
         try:
             # model may implement reset_states()
             self.model.reset_states()
         except Exception:
             pass
+
+    def _compute_chunk_score(self, audio_flat: np.ndarray) -> Optional[float]:
+        """Estimate VAD speech probability for a chunk by averaging frame scores."""
+        if audio_flat is None or audio_flat.size == 0:
+            return None
+
+        try:
+            import torch
+        except Exception:
+            return None
+
+        frame_size = 512 if self.sr == 16000 else 256
+        scores = []
+
+        try:
+            with torch.no_grad():
+                for i in range(0, audio_flat.size, frame_size):
+                    frame = audio_flat[i:i + frame_size]
+                    if frame.size == 0:
+                        continue
+                    if frame.size < frame_size:
+                        frame = np.pad(frame, (0, frame_size - frame.size), mode='constant')
+                    frame_tensor = torch.from_numpy(frame.astype(np.float32))
+                    score_tensor = self.model(frame_tensor, self.sr)
+                    score = float(score_tensor.item()) if hasattr(score_tensor, 'item') else float(score_tensor)
+                    scores.append(score)
+        except Exception:
+            return None
+
+        if not scores:
+            return None
+        return float(np.mean(scores))
 
     def __call__(self, chunk_audio: np.ndarray, return_seconds: bool = False):
         """Process a single chunk (1-D float32 array).
@@ -68,9 +103,19 @@ class VADIterator:
         else:
             audio_flat = chunk_audio.astype(np.float32)
 
+        score = self._compute_chunk_score(audio_flat)
+        if score is not None:
+            self.last_score = score
+
         try:
             tensor = torch.from_numpy(audio_flat)
-            timestamps = get_speech_timestamps(tensor, self.model, sampling_rate=self.sr, return_seconds=False)
+            timestamps = get_speech_timestamps(
+                tensor,
+                self.model,
+                sampling_rate=self.sr,
+                threshold=self.speech_threshold,
+                return_seconds=False,
+            )
         except Exception:
             return []
 
@@ -118,12 +163,17 @@ class AudioRecorder:
         channels: int = 1,
         listen_mode: str = "push",
         tts_interrupt_key: str = "s",
+        intercom_toggle_key: str = "p",
         vad_check_interval: float = 0.25,
+        vad_chunk_size: float = 0.5,
         pre_speech_duration: float = 0.25,
+        vad_speech_threshold: float = 0.5,
         silence_duration: float = 1.5,
         min_speech_duration: float = 0.3,
         ptt_trigger_threshold: int = 10000,
-        ptt_debounce_time: float = 0.2,
+        ptt_debounce_time: float = 0.1,
+        vad_debug_scores: bool = False,
+        vad_scores_only_mode: bool = False,
     ):
         """
         初始化录音器
@@ -133,18 +183,25 @@ class AudioRecorder:
             channels: 通道数
             listen_mode: 监听模式 ("push" | "continuous" | "intercom")
             tts_interrupt_key: TTS 打断按键（用于提示文案）
+            intercom_toggle_key: 对讲机模式下手动切换 PTT 按下/松开的按键
             vad_check_interval: VAD 检测间隔（秒），每隔此时间检测一次语音 (continuous 模式)
+            vad_chunk_size: 单次 VAD 检测窗口时长（秒，建议 >= vad_check_interval）
             pre_speech_duration: VAD 检测到说话时，向前补偿的音频时长（秒）
+            vad_speech_threshold: Silero VAD 语音概率阈值（0~1，越大越严格）
             silence_duration: 静默多少秒后视为说话结束 (continuous 模式)
             min_speech_duration: 最短语音时长，过短丢弃 (continuous 模式)
             ptt_trigger_threshold: 对讲机触发阈值（按 int16 幅值计算）
             ptt_debounce_time: 对讲机触发防抖时间（秒）
+            vad_debug_scores: 是否输出每个 VAD chunk 的实时分数
+            vad_scores_only_mode: 仅输出 VAD 分数，不进入语音段处理流程
         """
         self.sample_rate = sample_rate
         self.channels = channels
         self.listen_mode = listen_mode
         self.tts_interrupt_key = str(tts_interrupt_key or "s").strip().lower()[:1] or "s"
         self.tts_interrupt_key_label = self.tts_interrupt_key.upper()
+        self.intercom_toggle_key = self._normalize_key_char(intercom_toggle_key, "p")
+        self.intercom_toggle_key_label = self._format_key_label(self.intercom_toggle_key)
 
         # 通用状态
         self.is_recording = False
@@ -161,15 +218,30 @@ class AudioRecorder:
         self._ptt_last_trigger_time: float = 0.0
 
         # continuous 模式参数
-        self.vad_check_interval = vad_check_interval
+        self.vad_check_interval = max(0.01, float(vad_check_interval))
+        raw_vad_chunk_size = max(0.01, float(vad_chunk_size))
+        if raw_vad_chunk_size < self.vad_check_interval:
+            logger.warning(
+                f"vad_chunk_size({raw_vad_chunk_size:.3f}) < vad_check_interval({self.vad_check_interval:.3f})，"
+                "已自动调整为 vad_check_interval"
+            )
+            raw_vad_chunk_size = self.vad_check_interval
+        self.vad_chunk_size = raw_vad_chunk_size
         self.pre_speech_duration = max(0.0, pre_speech_duration)
+        self.vad_speech_threshold = min(1.0, max(0.0, float(vad_speech_threshold)))
         self.silence_duration = silence_duration
         self.min_speech_duration = min_speech_duration
         self._last_voice_time: float = 0.0
         self._speech_start_time: float = 0.0
         self._processing = False  # 正在处理上一段语音时不再采集新段
         self._pre_speech_samples = int(self.sample_rate * self.pre_speech_duration)
+        self._vad_chunk_samples = max(1, int(self.sample_rate * self.vad_chunk_size))
         self._pre_speech_audio = np.empty(0, dtype=np.float32)
+        self._vad_pending_audio = np.empty(0, dtype=np.float32)
+        self._last_vad_score: Optional[float] = None
+        self.vad_debug_scores = bool(vad_debug_scores)
+        self.vad_scores_only_mode = bool(vad_scores_only_mode)
+        self._vad_chunk_counter = 0
 
         # continuous 模式: Silero VAD + 缓冲区
         self._vad_model = None
@@ -187,13 +259,103 @@ class AudioRecorder:
         self._current_rms: float = 0.0
         self._current_has_speech: bool = False
 
+    @staticmethod
+    def _normalize_key_char(key: str, fallback: str) -> str:
+        value = str(key or "").strip().lower()
+        if not value:
+            return fallback
+
+        aliases = {
+            "return": "enter",
+            "newline": "enter",
+            "esc": "escape",
+            "spacebar": "space",
+        }
+        value = aliases.get(value, value)
+
+        special_keys = {"enter", "space", "tab", "escape"}
+        if value in special_keys:
+            return value
+        return value[0]
+
+    @staticmethod
+    def _format_key_label(key_value: str) -> str:
+        labels = {
+            "enter": "ENTER",
+            "space": "SPACE",
+            "tab": "TAB",
+            "escape": "ESC",
+        }
+        return labels.get(key_value, key_value.upper())
+
+    @staticmethod
+    def _is_key_pressed(key, expected_key: str) -> bool:
+        if not expected_key:
+            return False
+
+        key_name = {
+            "enter": "enter",
+            "space": "space",
+            "tab": "tab",
+            "escape": "esc",
+        }.get(expected_key)
+
+        if key_name:
+            try:
+                if key == getattr(keyboard.Key, key_name):
+                    return True
+            except Exception:
+                pass
+
+        if expected_key == "space":
+            try:
+                if getattr(key, "char", None) == " ":
+                    return True
+            except Exception:
+                pass
+
+        try:
+            return getattr(key, "char", None) == expected_key
+        except Exception:
+            return False
+
+    def _set_intercom_ptt_pressed(self, pressed: bool, source: str = "signal") -> None:
+        """设置 intercom PTT 状态，并在状态变化时驱动录音开始/结束。"""
+        pressed = bool(pressed)
+        if self._ptt_pressed == pressed:
+            return
+
+        self._ptt_pressed = pressed
+
+        if self._ptt_pressed:
+            if not self.is_recording:
+                self.is_recording = True
+                self._speech_start_time = _time.time()
+                self.audio_frames = []
+                print("\n✅ PTT 【按下】")
+                print("🔴 对讲机收音中...", end='\r', flush=True)
+                logger.debug(f"intercom: PTT 按下，开始收音 (source={source})")
+            return
+
+        if self.is_recording:
+            self.is_recording = False
+            print("\n❌ PTT 【松开】")
+            print("✅ 录音结束")
+            logger.debug(f"intercom: PTT 松开，结束收音 (source={source})")
+            if self.audio_frames and self.on_audio_complete:
+                audio_data = np.concatenate(self.audio_frames, axis=0)
+                self.on_audio_complete(audio_data)
+
     # ------------------------------------------------------------------
     # VAD 实时状态栏 (原地刷新，不叠加)
     # ------------------------------------------------------------------
-    def _print_vad_status(self, rms: float = 0.0, has_speech: bool = False):
+    def _print_vad_status(self, rms: float = 0.0, has_speech: bool = False, vad_score: Optional[float] = None):
         """在终端原地刷新 VAD 状态行"""
         if not sys.stdout.isatty():
             return
+
+        color_red = "\033[31m"
+        color_reset = "\033[0m"
 
         if self._processing:
             status = "⏳ 处理中"
@@ -211,9 +373,13 @@ class AudioRecorder:
         filled = int(level * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
 
-        speech_icon = "🗣️ " if has_speech else "   "
+        if has_speech:
+            speech_icon = f"{color_red}🗣️ {color_reset}"
+        else:
+            speech_icon = "   "
 
-        line = f"{status} {speech_icon}|{bar}| RMS:{rms:.4f}"
+        score_text = f" SCORE:{vad_score:.3f}" if vad_score is not None else " SCORE:--"
+        line = f"{status} {speech_icon}|{bar}| RMS:{rms:.4f}{score_text}"
 
         # 控制行宽，避免换行导致刷屏
         term_width = shutil.get_terminal_size((80, 20)).columns
@@ -271,7 +437,12 @@ class AudioRecorder:
             logger.info("正在加载 Silero VAD 模型...")
             self._vad_model = load_silero_vad()
             # wrap into VADIterator for per-chunk processing
-            self._vad_iterator = VADIterator(self._vad_model, sampling_rate=self.sample_rate, silence_duration=self.silence_duration)
+            self._vad_iterator = VADIterator(
+                self._vad_model,
+                sampling_rate=self.sample_rate,
+                silence_duration=self.silence_duration,
+                speech_threshold=self.vad_speech_threshold,
+            )
             logger.info("Silero VAD 模型加载完成")
         except ImportError:
             logger.error("未安装 silero-vad，请运行: pip install silero-vad")
@@ -327,27 +498,15 @@ class AudioRecorder:
             return
 
         self._ptt_last_trigger_time = now
-        self._ptt_pressed = not self._ptt_pressed
+        self._set_intercom_ptt_pressed(not self._ptt_pressed, source="signal")
 
-        if self._ptt_pressed:
-            if not self.is_recording:
-                self.is_recording = True
-                self._speech_start_time = now
-                self.audio_frames = []
-                print("\n✅ PTT 【按下】")
-                print("🔴 对讲机收音中...", end='\r', flush=True)
-                logger.debug("intercom: PTT 按下，开始收音")
-            return
-
-        # PTT 松开：结束当前段并触发回调
-        if self.is_recording:
-            self.is_recording = False
-            print("\n❌ PTT 【松开】")
-            print("✅ 录音结束")
-            logger.debug("intercom: PTT 松开，结束收音")
-            if self.audio_frames and self.on_audio_complete:
-                audio_data = np.concatenate(self.audio_frames, axis=0)
-                self.on_audio_complete(audio_data)
+    def _on_intercom_toggle_key_press(self, key) -> None:
+        """intercom 模式下键盘切换 PTT 状态。"""
+        try:
+            if self._is_key_pressed(key, self.intercom_toggle_key):
+                self._set_intercom_ptt_pressed(not self._ptt_pressed, source="keyboard")
+        except Exception as e:
+            logger.debug(f"intercom 按键监听异常: {e}")
 
     # ------------------------------------------------------------------
     # continuous 模式: VAD 监控线程
@@ -371,6 +530,8 @@ class AudioRecorder:
                 with self._chunk_lock:
                     self._chunk_buffer = []
                 self._pre_speech_audio = np.empty(0, dtype=np.float32)
+                self._vad_pending_audio = np.empty(0, dtype=np.float32)
+                self._last_vad_score = None
                 # 重置 iterator/model 状态
                 try:
                     self._vad_iterator.reset()
@@ -383,111 +544,112 @@ class AudioRecorder:
 
             # 取出缓冲区中的所有音频块
             with self._chunk_lock:
-                if not self._chunk_buffer:
-                    self._print_vad_status(rms=0.0, has_speech=False)
-                    continue
-                current_chunks = self._chunk_buffer.copy()
+                current_chunks = self._chunk_buffer.copy() if self._chunk_buffer else []
                 self._chunk_buffer = []
 
-            logger.debug(f"VAD检测: 处理 {len(current_chunks)} 个音频块")
+            if current_chunks:
+                new_audio = np.concatenate(current_chunks, axis=0).flatten().astype(np.float32)
+                if self._vad_pending_audio.size == 0:
+                    self._vad_pending_audio = new_audio
+                else:
+                    self._vad_pending_audio = np.concatenate([self._vad_pending_audio, new_audio])
 
-            # 合并为一维 float32 数组
-            chunk_audio = np.concatenate(current_chunks, axis=0).flatten().astype(np.float32)
+            if self._vad_pending_audio.size < self._vad_chunk_samples:
+                if self._vad_pending_audio.size > 0:
+                    pending_rms = float(np.sqrt(np.mean(self._vad_pending_audio ** 2)))
+                    pending_has_speech = self._vad_iterator.in_speech
+                    self._print_vad_status(rms=pending_rms, has_speech=pending_has_speech, vad_score=self._last_vad_score)
+                else:
+                    self._print_vad_status(rms=0.0, has_speech=False, vad_score=self._last_vad_score)
+                continue
 
-            # 计算当前音频块的 RMS
-            rms = float(np.sqrt(np.mean(chunk_audio ** 2)))
+            windows_processed = 0
+            last_rms = 0.0
+            last_has_speech = self._vad_iterator.in_speech
+            last_score: Optional[float] = None
 
-            # Use VADIterator to get simple events
-            try:
-                events = self._vad_iterator(chunk_audio, return_seconds=False)
-            except Exception as e:
-                logger.warning(f"VAD 检测异常: {e}")
-                events = []
+            while self._vad_pending_audio.size >= self._vad_chunk_samples:
+                chunk_audio = self._vad_pending_audio[:self._vad_chunk_samples]
+                self._vad_pending_audio = self._vad_pending_audio[self._vad_chunk_samples:]
+                windows_processed += 1
 
-            has_speech = any('start' in ev for ev in events) or self._vad_iterator.in_speech
-            now = _time.time()
+                # 计算当前音频块的 RMS
+                rms = float(np.sqrt(np.mean(chunk_audio ** 2)))
 
-            logger.debug(f"VAD结果: events={events}, rms={rms:.4f}, is_recording={self.is_recording}")
+                # Use VADIterator to get simple events
+                try:
+                    events = self._vad_iterator(chunk_audio, return_seconds=False)
+                except Exception as e:
+                    logger.warning(f"VAD 检测异常: {e}")
+                    events = []
 
-            for ev in events:
-                if 'start' in ev:
+                score = self._vad_iterator.last_score
+                self._last_vad_score = score
+                self._vad_chunk_counter += 1
+                if self.vad_debug_scores:
+                    logger.info(
+                        f"VAD chunk#{self._vad_chunk_counter}: score={score:.3f}, rms={rms:.4f}, "
+                        f"events={events}, in_speech={self._vad_iterator.in_speech}"
+                    )
+
+                has_speech = any('start' in ev for ev in events) or self._vad_iterator.in_speech
+                now = _time.time()
+
+                # Keep extending voice activity timestamp while VAD still considers this chunk as speech.
+                # This prevents long utterances from being cut by the external silence timeout path.
+                if has_speech:
                     self._last_voice_time = now
-                    if not self.is_recording:
-                        # Begin recording, include pre-speech buffer
-                        self.is_recording = True
-                        self._speech_start_time = now
-                        self.audio_frames = []
 
-                        speech_start_sample = int(ev.get('start', 0))
-                        pre_speech_audio = self._consume_pre_speech_audio(chunk_audio, speech_start_sample)
-                        if pre_speech_audio.size > 0:
-                            self.audio_frames.append(pre_speech_audio.reshape(-1, self.channels))
+                if self.vad_scores_only_mode:
+                    last_rms = rms
+                    last_has_speech = has_speech
+                    last_score = score
+                    continue
 
-                        self._clear_vad_status()
-                        print("🔴 检测到语音，正在录音...")
-                        logger.debug("开始录音")
-                    # always append current chunk when speech detected
-                    self.audio_frames.extend(current_chunks)
-                    self._pre_speech_audio = np.empty(0, dtype=np.float32)
+                chunk_frame = chunk_audio.reshape(-1, self.channels)
 
-                if 'end' in ev:
-                    # end event from iterator: finalize
-                    self.is_recording = False
-                    speech_len = now - self._speech_start_time
-                    if speech_len < self.min_speech_duration:
-                        self._clear_vad_status()
-                        print("⚠️ 语音过短，已忽略")
-                        logger.debug(f"语音过短: {speech_len:.2f}s")
-                        self.audio_frames = []
+                logger.debug(f"VAD结果: events={events}, rms={rms:.4f}, is_recording={self.is_recording}")
+
+                for ev in events:
+                    if 'start' in ev:
+                        self._last_voice_time = now
+                        if not self.is_recording:
+                            # Begin recording, include pre-speech buffer
+                            self.is_recording = True
+                            self._speech_start_time = now
+                            self.audio_frames = []
+
+                            speech_start_sample = int(ev.get('start', 0))
+                            pre_speech_audio = self._consume_pre_speech_audio(chunk_audio, speech_start_sample)
+                            if pre_speech_audio.size > 0:
+                                self.audio_frames.append(pre_speech_audio.reshape(-1, self.channels))
+
+                            self._clear_vad_status()
+                            print("🔴 检测到语音，正在录音...")
+                            logger.debug("开始录音")
+                        # always append current chunk when speech detected
+                        self.audio_frames.append(chunk_frame)
                         self._pre_speech_audio = np.empty(0, dtype=np.float32)
-                        try:
-                            self._vad_iterator.reset()
-                        except Exception:
-                            try:
-                                self._vad_model.reset_states()
-                            except Exception:
-                                pass
-                        continue
 
-                    self._clear_vad_status()
-                    print("✅ 录音结束")
-                    logger.debug(f"录音结束，时长: {speech_len:.2f}s")
-                    if self.audio_frames and self.on_audio_complete:
-                        audio_data = np.concatenate(self.audio_frames, axis=0)
-                        self._processing = True
-                        try:
-                            self._vad_iterator.reset()
-                        except Exception:
+                    if 'end' in ev:
+                        # end event from iterator: finalize
+                        self.is_recording = False
+                        speech_len = now - self._speech_start_time
+                        if speech_len < self.min_speech_duration:
+                            self._clear_vad_status()
+                            print("⚠️ 语音过短，已忽略")
+                            logger.debug(f"语音过短: {speech_len:.2f}s")
+                            self.audio_frames = []
+                            self._pre_speech_audio = np.empty(0, dtype=np.float32)
                             try:
-                                self._vad_model.reset_states()
+                                self._vad_iterator.reset()
                             except Exception:
-                                pass
-                        logger.debug("触发音频处理回调")
-                        self.on_audio_complete(audio_data)
+                                try:
+                                    self._vad_model.reset_states()
+                                except Exception:
+                                    pass
+                            continue
 
-            # if no events and we're recording, keep appending and check timeout using last voice time
-            if not events and self.is_recording:
-                self.audio_frames.extend(current_chunks)
-                silence_time = now - self._last_voice_time
-                logger.debug(f"录音中，累计静默: {silence_time:.2f}s")
-                if silence_time >= self.silence_duration:
-                    # treat as end
-                    self.is_recording = False
-                    speech_len = now - self._speech_start_time
-                    if speech_len < self.min_speech_duration:
-                        self._clear_vad_status()
-                        print("⚠️ 语音过短，已忽略")
-                        logger.debug(f"语音过短: {speech_len:.2f}s")
-                        self.audio_frames = []
-                        self._pre_speech_audio = np.empty(0, dtype=np.float32)
-                        try:
-                            self._vad_iterator.reset()
-                        except Exception:
-                            try:
-                                self._vad_model.reset_states()
-                            except Exception:
-                                pass
-                    else:
                         self._clear_vad_status()
                         print("✅ 录音结束")
                         logger.debug(f"录音结束，时长: {speech_len:.2f}s")
@@ -503,12 +665,60 @@ class AudioRecorder:
                                     pass
                             logger.debug("触发音频处理回调")
                             self.on_audio_complete(audio_data)
-            elif not events and not self.is_recording:
-                # update pre-speech rolling buffer
-                self._append_pre_speech_audio(chunk_audio)
 
-            # 刷新状态栏
-            self._print_vad_status(rms=rms, has_speech=has_speech)
+                # if no events and we're recording, keep appending and check timeout using last voice time
+                if not events and self.is_recording:
+                    self.audio_frames.append(chunk_frame)
+                    silence_time = now - self._last_voice_time
+                    logger.debug(f"录音中，累计静默: {silence_time:.2f}s")
+                    if silence_time >= self.silence_duration:
+                        # treat as end
+                        self.is_recording = False
+                        speech_len = now - self._speech_start_time
+                        if speech_len < self.min_speech_duration:
+                            self._clear_vad_status()
+                            print("⚠️ 语音过短，已忽略")
+                            logger.debug(f"语音过短: {speech_len:.2f}s")
+                            self.audio_frames = []
+                            self._pre_speech_audio = np.empty(0, dtype=np.float32)
+                            try:
+                                self._vad_iterator.reset()
+                            except Exception:
+                                try:
+                                    self._vad_model.reset_states()
+                                except Exception:
+                                    pass
+                        else:
+                            self._clear_vad_status()
+                            print("✅ 录音结束")
+                            logger.debug(f"录音结束，时长: {speech_len:.2f}s")
+                            if self.audio_frames and self.on_audio_complete:
+                                audio_data = np.concatenate(self.audio_frames, axis=0)
+                                self._processing = True
+                                try:
+                                    self._vad_iterator.reset()
+                                except Exception:
+                                    try:
+                                        self._vad_model.reset_states()
+                                    except Exception:
+                                        pass
+                                logger.debug("触发音频处理回调")
+                                self.on_audio_complete(audio_data)
+                elif not events and not self.is_recording:
+                    # update pre-speech rolling buffer
+                    self._append_pre_speech_audio(chunk_audio)
+
+                last_rms = rms
+                last_has_speech = has_speech
+                last_score = score
+
+                if self.is_tts_playing or self._processing:
+                    self._vad_pending_audio = np.empty(0, dtype=np.float32)
+                    break
+
+            if windows_processed > 0:
+                logger.debug(f"VAD检测: 本轮处理 {windows_processed} 个窗口，剩余样本={self._vad_pending_audio.size}")
+                self._print_vad_status(rms=last_rms, has_speech=last_has_speech, vad_score=last_score)
 
         logger.debug("VAD 监控线程已退出")
 
@@ -615,6 +825,7 @@ class AudioRecorder:
             print("📌 操作说明 [对讲机模式]:")
             print("   - 检测到 PTT 触发后开始收音")
             print("   - 再次检测到 PTT 触发后结束收音")
+            print(f"   - 按 '{self.intercom_toggle_key_label}' 键可手动切换 PTT 按下/松开")
             print("   - 检测采用阈值 + 防抖")
             print(f"   - PTT 阈值: {self.ptt_trigger_threshold}, 防抖: {self.ptt_debounce_time:.2f}s")
             print(f"   - 按 '{self.tts_interrupt_key_label}' 键打断语音播放")
@@ -625,6 +836,8 @@ class AudioRecorder:
             print("   - 说“你好”进入响应模式，机器人才会回复")
             print("   - 说“再见”退出响应模式，后续语音将忽略")
             print("   - 停顿超过 {:.1f} 秒视为说话结束".format(self.silence_duration))
+            if self.vad_debug_scores:
+                print("   - 已开启 VAD chunk 分数实时日志 (score/rms/events)")
             print("   - 机器人说话时会自动屏蔽麦克风")
             print(f"   - 按 '{self.tts_interrupt_key_label}' 键打断语音播放")
             print("   - 按 Ctrl+C 退出程序")
@@ -649,6 +862,10 @@ class AudioRecorder:
                 while not self._stop_event.wait(0.1):
                     pass
             elif self.listen_mode == "intercom":
+                self._keyboard_listener = keyboard.Listener(
+                    on_press=self._on_intercom_toggle_key_press,
+                )
+                self._keyboard_listener.start()
                 while not self._stop_event.wait(0.1):
                     pass
             else:
@@ -662,3 +879,29 @@ class AudioRecorder:
             raise
         finally:
             self.stop()
+
+
+def main():
+    """单独运行录音模块（对讲机模式）。"""
+
+    def on_audio_complete(audio_data: np.ndarray):
+        # 仅用于验证对讲机模式拾音流程是否正常触发
+        if audio_data is None or audio_data.size == 0:
+            print("⚠️ 未收到有效音频")
+            return
+
+        duration = float(len(audio_data) / 16000.0)
+        rms = float(np.sqrt(np.mean(np.square(audio_data.astype(np.float32)))))
+        print(f"📦 收到一段对讲机音频: 时长={duration:.2f}s, RMS={rms:.4f}")
+
+    recorder = AudioRecorder(
+        sample_rate=16000,
+        channels=1,
+        listen_mode="intercom",
+    )
+
+    recorder.start(on_audio_complete=on_audio_complete)
+
+
+if __name__ == "__main__":
+    main()

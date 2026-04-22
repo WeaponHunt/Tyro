@@ -8,6 +8,7 @@ import re
 import os
 import json
 import copy
+import subprocess
 from loguru import logger
 from typing import Optional, Callable, Tuple, List
 import threading
@@ -37,11 +38,21 @@ class ConversationManager:
                  script_toggle_key: str = "c",
                  script_pause_resume_key: str = "p",
                  tts_interrupt_key: str = "s",
-                 sleep_toggle_voice_words: Optional[List[str]] = None,
-                 script_toggle_voice_words: Optional[List[str]] = None,
+                 sleep_enable_voice_words: Optional[List[str]] = None,
+                 sleep_disable_voice_words: Optional[List[str]] = None,
+                 script_enable_voice_words: Optional[List[str]] = None,
+                 script_disable_voice_words: Optional[List[str]] = None,
                  visualizer_enable_topic: str = "/face/visualizer/enabled",
                  visualizer_enable_voice_words: Optional[List[str]] = None,
-                 visualizer_disable_voice_words: Optional[List[str]] = None):
+                 visualizer_disable_voice_words: Optional[List[str]] = None,
+                 script_image_screen_index: int = 0,
+                 script_image_window_x: Optional[int] = None,
+                 script_image_window_y: Optional[int] = None,
+                 script_image_fullscreen: bool = True,
+                 script_image_target_width: Optional[int] = None,
+                 script_image_target_height: Optional[int] = None,
+                 script_image_force_window_size: bool = True,
+                 script_image_force_resize_image: bool = False):
         """
         初始化对话管理器
         
@@ -69,8 +80,10 @@ class ConversationManager:
             script_toggle_key: 脚本模式切换按键
             script_pause_resume_key: 脚本模式下TTS暂停/恢复按键
             tts_interrupt_key: TTS 打断按键
-            sleep_toggle_voice_words: 睡眠模式语音切换词列表（任一命中即切换）
-            script_toggle_voice_words: 脚本模式语音切换词列表（任一命中即切换）
+            sleep_enable_voice_words: 睡眠模式语音开启词列表（任一命中即开启睡眠）
+            sleep_disable_voice_words: 睡眠模式语音关闭词列表（任一命中即关闭睡眠）
+            script_enable_voice_words: 脚本模式语音开启词列表（任一命中即开启脚本）
+            script_disable_voice_words: 脚本模式语音关闭词列表（任一命中即关闭脚本）
             visualizer_enable_topic: 可视化开关 topic
             visualizer_enable_voice_words: 可视化开启语音词（任一命中即发布 True）
             visualizer_disable_voice_words: 可视化关闭语音词（任一命中即发布 False）
@@ -128,6 +141,19 @@ class ConversationManager:
         self._script_image_stop_event = threading.Event()
         self._script_image_update_event = threading.Event()
         self._script_image_current_path = None
+        self._script_image_screen_index = int(script_image_screen_index)
+        self._script_image_window_x = script_image_window_x
+        self._script_image_window_y = script_image_window_y
+        self._script_image_fullscreen = bool(script_image_fullscreen)
+        self._script_image_target_width = (
+            int(script_image_target_width) if script_image_target_width is not None else None
+        )
+        self._script_image_target_height = (
+            int(script_image_target_height) if script_image_target_height is not None else None
+        )
+        self._script_image_force_window_size = bool(script_image_force_window_size)
+        self._script_image_force_resize_image = bool(script_image_force_resize_image)
+        self._screen_geometries_cache = None
         self._script_face_tracking_disabled = False
         self.language = (language or "zh").strip().lower()
         if self.language not in {"zh", "en"}:
@@ -141,15 +167,25 @@ class ConversationManager:
         self._script_pause_resume_key_label = self._format_key_label(self._script_pause_resume_key)
         self._tts_interrupt_key_label = self._format_key_label(self._tts_interrupt_key)
 
-        default_sleep_toggle_words = ["toggle sleep mode", "switch sleep mode"] if self._is_english else ["切换睡眠模式", "睡眠模式切换"]
-        default_script_toggle_words = ["toggle script mode", "switch script mode"] if self._is_english else ["切换脚本模式", "脚本模式切换"]
-        self._sleep_toggle_voice_words = self._normalize_voice_toggle_words(
-            sleep_toggle_voice_words,
-            default_sleep_toggle_words,
+        default_sleep_enable_words = ["quiet", "silent", "remain silent"] if self._is_english else ["别说话了"]
+        default_sleep_disable_words = ["can speak", "speak now"] if self._is_english else ["可以说话了"]
+        default_script_enable_words = ["introduce the lab", "enable script mode"] if self._is_english else ["介绍实验室", "脚本模式切换"]
+        default_script_disable_words = ["stop the introduction", "disable script mode"] if self._is_english else ["别介绍了"]
+        self._sleep_enable_voice_words = self._normalize_voice_toggle_words(
+            sleep_enable_voice_words,
+            default_sleep_enable_words,
         )
-        self._script_toggle_voice_words = self._normalize_voice_toggle_words(
-            script_toggle_voice_words,
-            default_script_toggle_words,
+        self._sleep_disable_voice_words = self._normalize_voice_toggle_words(
+            sleep_disable_voice_words,
+            default_sleep_disable_words,
+        )
+        self._script_enable_voice_words = self._normalize_voice_toggle_words(
+            script_enable_voice_words,
+            default_script_enable_words,
+        )
+        self._script_disable_voice_words = self._normalize_voice_toggle_words(
+            script_disable_voice_words,
+            default_script_disable_words,
         )
         default_visualizer_enable_words = ["enable visualizer", "turn on visualizer", "show visualizer"] if self._is_english else ["开启可视化", "打开可视化", "显示可视化"]
         default_visualizer_disable_words = ["disable visualizer", "turn off visualizer", "hide visualizer"] if self._is_english else ["关闭可视化", "关掉可视化", "隐藏可视化"]
@@ -263,19 +299,29 @@ class ConversationManager:
         return any(trigger in normalized_text for trigger in triggers)
 
     def _handle_mode_toggle_voice_command(self, user_text: str) -> bool:
-        """处理通过语音关键词触发的模式切换。"""
+        """处理通过语音关键词触发的模式开关。"""
         normalized_text = self._normalize_text(user_text)
         if not normalized_text:
             return False
 
-        if self._contains_any_trigger(normalized_text, self._sleep_toggle_voice_words):
-            logger.info("命中语音指令：切换睡眠模式")
-            self._toggle_sleep_mode()
+        if self._contains_any_trigger(normalized_text, self._sleep_enable_voice_words):
+            logger.info("命中语音指令：开启睡眠模式")
+            self._set_sleep_mode(True)
             return True
 
-        if self._contains_any_trigger(normalized_text, self._script_toggle_voice_words):
-            logger.info("命中语音指令：切换脚本模式")
-            self._toggle_script_mode()
+        if self._contains_any_trigger(normalized_text, self._sleep_disable_voice_words):
+            logger.info("命中语音指令：关闭睡眠模式")
+            self._set_sleep_mode(False)
+            return True
+
+        if self._contains_any_trigger(normalized_text, self._script_enable_voice_words):
+            logger.info("命中语音指令：开启脚本模式")
+            self._set_script_mode(True)
+            return True
+
+        if self._contains_any_trigger(normalized_text, self._script_disable_voice_words):
+            logger.info("命中语音指令：关闭脚本模式")
+            self._set_script_mode(False)
             return True
 
         return False
@@ -359,8 +405,15 @@ class ConversationManager:
 
     def _toggle_sleep_mode(self) -> None:
         """切换睡眠模式。"""
+        self._set_sleep_mode(not self._sleep_mode)
+
+    def _set_sleep_mode(self, enabled: bool) -> bool:
+        """显式设置睡眠模式状态，返回是否发生状态变化。"""
+        enabled = bool(enabled)
         with self._sleep_lock:
-            self._sleep_mode = not self._sleep_mode
+            if self._sleep_mode == enabled:
+                return False
+            self._sleep_mode = enabled
             is_sleeping = self._sleep_mode
 
         if is_sleeping:
@@ -381,21 +434,32 @@ class ConversationManager:
             self._play_tts_notice(self._msg("我可以说话了。", "I can talk now."))
             if self.expression and self.expression.is_available:
                 self.expression.reset_expression()
+        return True
 
     def _toggle_script_mode(self) -> None:
         """切换脚本模式。"""
-        if self._sleep_mode:
+        self._set_script_mode(not self._script_mode)
+
+    def _set_script_mode(self, enabled: bool) -> bool:
+        """显式设置脚本模式状态，返回是否发生状态变化。"""
+        enabled = bool(enabled)
+
+        if enabled and self._sleep_mode:
             print(self._msg("😴 当前为睡眠模式，无法进入脚本模式", "😴 Sleep mode active, script mode disabled"))
-            return
+            return False
 
         if self._script_mode and self._script_thread and not self._script_thread.is_alive():
             logger.warning("检测到脚本线程异常退出，自动恢复脚本状态")
             self._exit_script_mode()
 
-        if not self._script_mode:
+        if self._script_mode == enabled:
+            return False
+
+        if enabled:
             self._enter_script_mode()
         else:
             self._exit_script_mode()
+        return True
 
     @staticmethod
     def _split_text_for_script_step(text: str) -> List[str]:
@@ -472,6 +536,9 @@ class ConversationManager:
             self._script_thread = threading.Thread(target=self._run_script_mode, daemon=True)
             self._script_thread.start()
 
+        # 进入脚本模式即拉起全屏图片 UI，避免首张图前窗口不可见。
+        self._ensure_script_image_loop_started()
+
         disabled = self._set_face_tracking_enabled(False)
         self._script_face_tracking_disabled = bool(disabled)
         if not disabled:
@@ -511,7 +578,7 @@ class ConversationManager:
                 "active_user_initialized", self._active_user_initialized
             )
 
-        self._close_script_image_window()
+        self._stop_script_image_loop()
         if self._script_face_tracking_disabled:
             self._set_face_tracking_enabled(True)
         self._script_face_tracking_disabled = False
@@ -771,76 +838,228 @@ class ConversationManager:
             return None
         return resolved_path
 
+    def _get_screen_geometries(self) -> List[Tuple[int, int, int, int]]:
+        """获取屏幕几何信息列表，元素为 (x, y, width, height)。"""
+        if self._screen_geometries_cache is not None:
+            return self._screen_geometries_cache
+
+        geometries: List[Tuple[int, int, int, int]] = []
+        try:
+            output = subprocess.check_output(["xrandr", "--listmonitors"], text=True)
+            lines = output.splitlines()
+            for line in lines[1:]:
+                match = re.search(r"(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", line)
+                if not match:
+                    continue
+                width = int(match.group(1))
+                height = int(match.group(2))
+                x = int(match.group(3))
+                y = int(match.group(4))
+                geometries.append((x, y, width, height))
+        except Exception as e:
+            logger.debug(f"读取屏幕布局失败，将回退默认屏幕: {e}")
+
+        self._screen_geometries_cache = geometries
+        return geometries
+
+    def _resolve_script_image_window_origin(self) -> Tuple[int, int]:
+        """解析脚本图片窗口左上角坐标，优先使用显式坐标，其次按屏幕索引。"""
+        if self._script_image_window_x is not None and self._script_image_window_y is not None:
+            return int(self._script_image_window_x), int(self._script_image_window_y)
+
+        geometries = self._get_screen_geometries()
+        if geometries and 0 <= self._script_image_screen_index < len(geometries):
+            x, y, _, _ = geometries[self._script_image_screen_index]
+            return x, y
+
+        return 0, 0
+
+    def _resolve_script_image_target_geometry(self) -> Tuple[int, int, Optional[int], Optional[int]]:
+        """解析脚本图片目标几何信息：(x, y, width, height)。"""
+        x, y = self._resolve_script_image_window_origin()
+        width = self._script_image_target_width
+        height = self._script_image_target_height
+
+        geometries = self._get_screen_geometries()
+        if geometries and 0 <= self._script_image_screen_index < len(geometries):
+            _, _, screen_w, screen_h = geometries[self._script_image_screen_index]
+            if width is None:
+                width = screen_w
+            if height is None:
+                height = screen_h
+
+        if width is not None and width <= 0:
+            width = None
+        if height is not None and height <= 0:
+            height = None
+
+        return x, y, width, height
+
     def _script_image_loop(self) -> None:
         try:
-            import cv2
+            import tkinter as tk
         except Exception as e:
-            logger.warning(f"脚本图片显示失败，缺少 OpenCV: {e}")
+            logger.warning(f"脚本图片显示失败，缺少 tkinter: {e}")
             return
 
-        cv2.startWindowThread()
+        try:
+            from PIL import Image, ImageTk
+            pil_available = True
+        except Exception as e:
+            logger.warning(f"脚本图片显示未检测到 Pillow，将仅支持 Tk 原生格式: {e}")
+            pil_available = False
+
+        try:
+            root = tk.Tk()
+        except Exception as e:
+            logger.warning(f"脚本图片显示失败，无法创建 tkinter 窗口: {e}")
+            return
+
+        root.title(self._script_image_window)
+        root.configure(bg="black")
+        root.attributes("-topmost", True)
+        image_label = tk.Label(root, bg="black")
+        image_label.pack(fill="both", expand=True)
+
+        origin_x, origin_y, target_w, target_h = self._resolve_script_image_target_geometry()
+        window_w = int(target_w) if target_w else int(root.winfo_screenwidth())
+        window_h = int(target_h) if target_h else int(root.winfo_screenheight())
+        root.geometry(f"{window_w}x{window_h}+{origin_x}+{origin_y}")
+        root.overrideredirect(bool(self._script_image_fullscreen))
+        root.deiconify()
+        root.lift()
+        self._script_image_open = True
+
+        last_displayed_path = None
+        tk_image_ref = None
 
         while not self._script_image_stop_event.is_set():
-            self._script_image_update_event.wait(0.1)
-            self._script_image_update_event.clear()
+            has_update = self._script_image_update_event.wait(0.05)
+            if has_update:
+                self._script_image_update_event.clear()
+
+            # 持续处理窗口事件，避免界面无响应。
+            try:
+                root.update_idletasks()
+                root.update()
+            except Exception:
+                break
+
+            if not has_update:
+                # 空闲时让出 CPU，避免与 ASR 线程争抢。
+                time.sleep(0.01)
+                continue
 
             with self._script_image_lock:
                 resolved_path = self._script_image_current_path
 
             if not resolved_path:
-                if self._script_image_open:
-                    try:
-                        cv2.destroyWindow(self._script_image_window)
-                    except Exception as e:
-                        logger.debug(f"关闭脚本图片窗口失败: {e}")
-                    finally:
-                        self._script_image_open = False
-                time.sleep(0.05)
+                # 无图片时保留黑色全屏窗口，确保脚本模式 UI 持续可见。
+                image_label.configure(image="")
+                image_label.image = None
+                last_displayed_path = None
+                continue
+
+            # 同一张图重复请求时不重复绘制，避免闪烁。
+            if self._script_image_open and resolved_path == last_displayed_path:
                 continue
 
             try:
-                image = cv2.imread(resolved_path)
-                if image is None:
-                    logger.warning(f"脚本图片读取失败: {resolved_path}")
-                    continue
-                cv2.namedWindow(self._script_image_window, cv2.WINDOW_NORMAL)
-                cv2.setWindowProperty(
-                    self._script_image_window,
-                    cv2.WND_PROP_FULLSCREEN,
-                    cv2.WINDOW_FULLSCREEN,
-                )
-                cv2.imshow(self._script_image_window, image)
+                # 先固定窗口几何并显示，再更新图像，确保首帧也落在既定全屏 UI 上。
+                root.geometry(f"{window_w}x{window_h}+{origin_x}+{origin_y}")
+                root.overrideredirect(bool(self._script_image_fullscreen))
+                root.deiconify()
+                root.lift()
+
+                if pil_available:
+                    try:
+                        image = Image.open(resolved_path).convert("RGB")
+                    except Exception as e:
+                        logger.warning(f"脚本图片读取失败: {resolved_path}, err={e}")
+                        continue
+
+                    if self._script_image_force_resize_image:
+                        render_image = image.resize((window_w, window_h), Image.LANCZOS)
+                    else:
+                        scale = min(window_w / image.width, window_h / image.height)
+                        resized_w = max(1, int(image.width * scale))
+                        resized_h = max(1, int(image.height * scale))
+                        resized = image.resize((resized_w, resized_h), Image.LANCZOS)
+                        render_image = Image.new("RGB", (window_w, window_h), (0, 0, 0))
+                        paste_x = (window_w - resized_w) // 2
+                        paste_y = (window_h - resized_h) // 2
+                        render_image.paste(resized, (paste_x, paste_y))
+
+                    tk_image_ref = ImageTk.PhotoImage(render_image)
+                    image_label.configure(image=tk_image_ref)
+                else:
+                    # 无 Pillow 时退化为 Tk 原生图片格式（如 png/gif/ppm）。
+                    try:
+                        tk_image_ref = tk.PhotoImage(file=resolved_path)
+                    except Exception as e:
+                        logger.warning(f"脚本图片读取失败（无 Pillow）: {resolved_path}, err={e}")
+                        continue
+                    image_label.configure(image=tk_image_ref)
+
+                image_label.image = tk_image_ref
                 self._script_image_open = True
-                cv2.waitKey(1)
+                last_displayed_path = resolved_path
             except Exception as e:
                 logger.warning(f"脚本图片显示异常: {e}")
 
-        if self._script_image_open:
-            try:
-                cv2.destroyWindow(self._script_image_window)
-            except Exception as e:
-                logger.debug(f"关闭脚本图片窗口失败: {e}")
-            finally:
-                self._script_image_open = False
+        try:
+            root.destroy()
+        except Exception as e:
+            logger.debug(f"关闭脚本图片窗口失败: {e}")
+        finally:
+            self._script_image_open = False
+
+    def _ensure_script_image_loop_started(self) -> None:
+        image_thread_alive = self._script_image_thread is not None and self._script_image_thread.is_alive()
+        if image_thread_alive:
+            return
+
+        self._script_image_stop_event.clear()
+        self._script_image_thread = threading.Thread(target=self._script_image_loop, daemon=True)
+        self._script_image_thread.start()
 
     def _show_script_image_async(self, image_path: str) -> None:
         resolved_path = self._resolve_script_image_path(image_path)
         if not resolved_path:
             return
 
+        image_thread_alive = self._script_image_thread is not None and self._script_image_thread.is_alive()
         with self._script_image_lock:
+            # 仅在“同图且当前窗口确实已经在显示”时跳过，避免首图被误去重。
+            if (
+                self._script_image_current_path == resolved_path
+                and self._script_image_open
+                and image_thread_alive
+            ):
+                return
             self._script_image_current_path = resolved_path
         self._script_image_update_event.set()
-
-        if self._script_image_thread is None or not self._script_image_thread.is_alive():
-            self._script_image_stop_event.clear()
-            self._script_image_thread = threading.Thread(target=self._script_image_loop, daemon=True)
-            self._script_image_thread.start()
+        if not image_thread_alive:
+            self._ensure_script_image_loop_started()
 
     def _close_script_image_window(self) -> None:
         with self._script_image_lock:
             self._script_image_current_path = None
         self._script_image_update_event.set()
+
+    def _stop_script_image_loop(self, timeout: float = 1.0) -> None:
+        """停止脚本图片 UI 线程并销毁窗口。"""
+        self._script_image_stop_event.set()
+        self._script_image_update_event.set()
+
+        thread = self._script_image_thread
+        if thread and thread.is_alive() and thread != threading.current_thread():
+            thread.join(timeout=max(0.1, float(timeout)))
+
+        self._script_image_thread = None
+        with self._script_image_lock:
+            self._script_image_current_path = None
+        self._script_image_open = False
 
     def _interrupt_tts_playback(self) -> None:
         """使用与常态对话一致的方式软打断 TTS（仅置中断标记）。"""
@@ -1555,6 +1774,10 @@ class ConversationManager:
 
             if self._sleep_mode or self._script_mode:
                 logger.debug("当前在睡眠/脚本模式，忽略非模式切换语音输入")
+                if self._script_mode:
+                    print(self._msg("🎬 脚本模式进行中：可说“别介绍了”退出", "🎬 Script mode active: say 'stop the introduction' to exit"))
+                elif self._sleep_mode:
+                    print(self._msg("😴 睡眠模式中：可说“可以说话了”唤醒", "😴 Sleep mode active: say 'can speak' to wake"))
                 return
 
             if self._maybe_trigger_script_mode(user_text):
@@ -1592,6 +1815,10 @@ class ConversationManager:
 
             if self._sleep_mode or self._script_mode:
                 logger.debug("当前在睡眠/脚本模式，忽略非模式切换文本输入")
+                if self._script_mode:
+                    print(self._msg("🎬 脚本模式进行中：输入“别介绍了”可退出", "🎬 Script mode active: type 'stop the introduction' to exit"))
+                elif self._sleep_mode:
+                    print(self._msg("😴 睡眠模式中：输入“可以说话了”可唤醒", "😴 Sleep mode active: type 'can speak' to wake"))
                 return
 
             if self._maybe_trigger_script_mode(user_text):
@@ -1639,12 +1866,7 @@ class ConversationManager:
         if self._script_thread and self._script_thread.is_alive():
             self._script_stop_event.set()
             self._script_thread.join(timeout=min(timeout, 1.0))
-        if self._script_image_thread and self._script_image_thread.is_alive():
-            self._script_image_stop_event.set()
-            self._script_image_update_event.set()
-            self._script_image_thread.join(timeout=min(timeout, 1.0))
-            self._script_image_thread = None
-        self._close_script_image_window()
+        self._stop_script_image_loop(timeout=min(timeout, 1.0))
         if self._sleep_listener is not None:
             try:
                 self._sleep_listener.stop()

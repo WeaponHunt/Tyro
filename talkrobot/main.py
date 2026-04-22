@@ -60,6 +60,7 @@ class FaceIdentityResolver:
                 known_faces_dir=Config.FACE_KNOWN_FACES_DIR,
                 model_name=Config.FACE_MODEL_NAME,
                 use_gpu=Config.FACE_USE_GPU,
+                recognition_threshold=Config.FACE_RECOGNITION_THRESHOLD,
             )
 
             self._cap = cv2.VideoCapture(camera_index)
@@ -297,6 +298,7 @@ def run_chat(args):
             lang_code=Config.TTS_LANG_CODE,
             voice=Config.TTS_VOICE,
             speed=Config.TTS_SPEED,
+            playback_speed=Config.TTS_PLAYBACK_SPEED,
             provider=tts_provider,
             language=language,
             sample_rate=Config.TTS_SAMPLE_RATE,
@@ -345,7 +347,7 @@ def run_chat(args):
             )
 
         def _persona_provider(current_user: str) -> str:
-            persona_prompt = persona_manager.get_prompt_for_user(current_user)
+            persona_prompt = persona_manager.get_prompt_for_user(current_user, language=language)
             global_prompt = (selected_global_system_prompt or "").strip()
             sections = []
             if persona_prompt and str(persona_prompt).strip():
@@ -363,7 +365,7 @@ def run_chat(args):
                 if persona_update_agent is None:
                     return
 
-                current_prompt = persona_manager.get_prompt_for_user(current_user)
+                current_prompt = persona_manager.get_prompt_for_user(current_user, language=language)
                 agent_start = time.perf_counter()
                 result = persona_update_agent.run(
                     user=current_user,
@@ -398,7 +400,7 @@ def run_chat(args):
                     return
 
                 persist_start = time.perf_counter()
-                if persona_manager.update_user_prompt(current_user, updated_prompt):
+                if persona_manager.update_user_prompt(current_user, updated_prompt, language=language):
                     persist_elapsed = time.perf_counter() - persist_start
                     logger.info(
                         f"人格提示词已后台更新: user={current_user}, confidence={result.get('confidence', 0):.2f}"
@@ -459,8 +461,11 @@ def run_chat(args):
                 channels=Config.CHANNELS,
                 listen_mode=listen_mode,
                 tts_interrupt_key=Config.TTS_INTERRUPT_KEY,
+                intercom_toggle_key=Config.INTERCOM_PTT_TOGGLE_KEY,
                 vad_check_interval=Config.VAD_CHECK_INTERVAL,
+                vad_chunk_size=Config.VAD_CHUNK_SIZE,
                 pre_speech_duration=Config.VAD_PRE_SPEECH_DURATION,
+                vad_speech_threshold=Config.VAD_SPEECH_THRESHOLD,
                 silence_duration=Config.VAD_SILENCE_DURATION,
                 min_speech_duration=Config.VAD_MIN_SPEECH_DURATION,
                 ptt_trigger_threshold=Config.INTERCOM_PTT_TRIGGER_THRESHOLD,
@@ -495,13 +500,21 @@ def run_chat(args):
             script_toggle_key=Config.MODE_SWITCH_SCRIPT_KEY,
             script_pause_resume_key=Config.SCRIPT_PAUSE_RESUME_KEY,
             tts_interrupt_key=Config.TTS_INTERRUPT_KEY,
-            sleep_toggle_voice_words=Config.MODE_SWITCH_SLEEP_VOICE_WORDS.get(
+            sleep_enable_voice_words=Config.MODE_SWITCH_SLEEP_ENABLE_VOICE_WORDS.get(
                 language,
-                Config.MODE_SWITCH_SLEEP_VOICE_WORDS.get("zh", []),
+                Config.MODE_SWITCH_SLEEP_ENABLE_VOICE_WORDS.get("zh", []),
             ),
-            script_toggle_voice_words=Config.MODE_SWITCH_SCRIPT_VOICE_WORDS.get(
+            sleep_disable_voice_words=Config.MODE_SWITCH_SLEEP_DISABLE_VOICE_WORDS.get(
                 language,
-                Config.MODE_SWITCH_SCRIPT_VOICE_WORDS.get("zh", []),
+                Config.MODE_SWITCH_SLEEP_DISABLE_VOICE_WORDS.get("zh", []),
+            ),
+            script_enable_voice_words=Config.MODE_SWITCH_SCRIPT_ENABLE_VOICE_WORDS.get(
+                language,
+                Config.MODE_SWITCH_SCRIPT_ENABLE_VOICE_WORDS.get("zh", []),
+            ),
+            script_disable_voice_words=Config.MODE_SWITCH_SCRIPT_DISABLE_VOICE_WORDS.get(
+                language,
+                Config.MODE_SWITCH_SCRIPT_DISABLE_VOICE_WORDS.get("zh", []),
             ),
             visualizer_enable_topic=Config.VISUALIZER_ENABLE_TOPIC,
             visualizer_enable_voice_words=Config.VISUALIZER_ENABLE_VOICE_WORDS.get(
@@ -512,6 +525,14 @@ def run_chat(args):
                 language,
                 Config.VISUALIZER_DISABLE_VOICE_WORDS.get("zh", []),
             ),
+            script_image_screen_index=Config.SCRIPT_IMAGE_SCREEN_INDEX,
+            script_image_window_x=Config.SCRIPT_IMAGE_WINDOW_X,
+            script_image_window_y=Config.SCRIPT_IMAGE_WINDOW_Y,
+            script_image_fullscreen=Config.SCRIPT_IMAGE_FULLSCREEN,
+            script_image_target_width=Config.SCRIPT_IMAGE_TARGET_WIDTH,
+            script_image_target_height=Config.SCRIPT_IMAGE_TARGET_HEIGHT,
+            script_image_force_window_size=Config.SCRIPT_IMAGE_FORCE_WINDOW_SIZE,
+            script_image_force_resize_image=Config.SCRIPT_IMAGE_FORCE_RESIZE_IMAGE,
         )
 
         if face_resolver is not None and face_resolver.enabled:
@@ -654,6 +675,39 @@ def run_add_memory(args):
         print("👋 记忆模块已关闭")
 
 
+def run_vad_debug(args):
+    """仅启动 VAD 监听模块，用于阈值与分数调试。"""
+    _setup_logger()
+
+    from talkrobot.core.audio_recorder import AudioRecorder
+
+    def on_audio_complete(audio_data):
+        # score-only 调试模式下不会触发到这里，保留仅为接口兼容。
+        return
+
+    recorder = AudioRecorder(
+        sample_rate=args.sample_rate,
+        channels=args.channels,
+        listen_mode="continuous",
+        vad_check_interval=args.vad_check_interval,
+        vad_chunk_size=args.vad_chunk_size,
+        pre_speech_duration=args.vad_pre_speech_duration,
+        vad_speech_threshold=args.vad_speech_threshold,
+        silence_duration=args.vad_silence_duration,
+        min_speech_duration=args.vad_min_speech_duration,
+        vad_debug_scores=True,
+        vad_scores_only_mode=True,
+    )
+
+    print("\n🔧 VAD Debug 模式")
+    print("   - 仅启动麦克风 + VAD，不加载 ASR/LLM/TTS")
+    print("   - 仅输出每个 chunk 的 VAD score/rms/events，不做语音段处理")
+    print(f"   - check_interval={args.vad_check_interval}s, chunk_size={args.vad_chunk_size}s")
+    print(f"   - threshold={args.vad_speech_threshold}, silence={args.vad_silence_duration}s, min_speech={args.vad_min_speech_duration}s")
+
+    recorder.start(on_audio_complete=on_audio_complete)
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="TalkRobot - 智能对话机器人")
@@ -736,6 +790,17 @@ def main():
         help="要添加的记忆内容 (不提供则进入交互式添加模式)"
     )
 
+    # 子命令: vad-debug
+    vad_parser = subparsers.add_parser("vad-debug", help="仅启动 VAD 监听调试（实时输出每个chunk分数）")
+    vad_parser.add_argument("--sample-rate", type=int, default=Config.SAMPLE_RATE, help=f"采样率 (默认: {Config.SAMPLE_RATE})")
+    vad_parser.add_argument("--channels", type=int, default=Config.CHANNELS, help=f"通道数 (默认: {Config.CHANNELS})")
+    vad_parser.add_argument("--vad-check-interval", type=float, default=Config.VAD_CHECK_INTERVAL, help=f"VAD 检测间隔秒 (默认: {Config.VAD_CHECK_INTERVAL})")
+    vad_parser.add_argument("--vad-chunk-size", type=float, default=Config.VAD_CHUNK_SIZE, help=f"单次 VAD 检测窗口秒 (默认: {Config.VAD_CHUNK_SIZE})")
+    vad_parser.add_argument("--vad-pre-speech-duration", type=float, default=Config.VAD_PRE_SPEECH_DURATION, help=f"前置补偿秒 (默认: {Config.VAD_PRE_SPEECH_DURATION})")
+    vad_parser.add_argument("--vad-speech-threshold", type=float, default=Config.VAD_SPEECH_THRESHOLD, help=f"VAD 语音阈值 (默认: {Config.VAD_SPEECH_THRESHOLD})")
+    vad_parser.add_argument("--vad-silence-duration", type=float, default=Config.VAD_SILENCE_DURATION, help=f"静默结束阈值秒 (默认: {Config.VAD_SILENCE_DURATION})")
+    vad_parser.add_argument("--vad-min-speech-duration", type=float, default=Config.VAD_MIN_SPEECH_DURATION, help=f"最短语音秒 (默认: {Config.VAD_MIN_SPEECH_DURATION})")
+
     # 兼容旧版: python -m talkrobot.main --user xxx
     parser.add_argument(
         "--user", type=str, default=None,
@@ -804,6 +869,8 @@ def main():
 
     if args.command == "add-memory":
         run_add_memory(args)
+    elif args.command == "vad-debug":
+        run_vad_debug(args)
     elif args.command == "chat":
         run_chat(args)
     else:

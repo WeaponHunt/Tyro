@@ -1,0 +1,46 @@
+{
+  "name": "demo",
+  "steps": [
+    {
+      "text": "Hi, I’m Little Suansuan, let me introduce the Lab for Affective and Cognitive Intelligent Robotics.",
+      "expression": "happy",
+      "gesture": "greet()",
+      "image": "assets/1.png",
+      "delay": 2
+    },
+    {
+      "text": "Our core mission is to empower robots with true intelligence, cognition, and emotional abilities. We want robots to understand humans, possess emotional intelligence, perform tasks effectively, and communicate naturally.",
+      "expression": "happy",
+      "image": "assets/2.png",
+      "delay": 1
+    },    
+    {
+      "text": "We focus on affective and cognitive models: observe human cues, infer emotions and intentions, and let robots respond appropriately.",
+      "expression": "happy",
+      "gesture": "arm_right_up(45)",
+      "head_control_deg": {"x": 18, "y": 0},
+      "image": "assets/3.png",
+      "delay": 1
+    },
+    {
+      "text": "We have built three prototypes to run our models: AISR, Big Suansuan, and me — Little Suansuan.",
+      "expression": "happy",
+      "image": "assets/4.png",
+      "delay": 1
+    },
+    {
+      "text": "We have published over 80 high-quality papers, secured 24 patents, and our work has been featured by many media. We also have wide industry adoption.",
+      "expression": "happy",
+      "image": "assets/5.png",      
+      "delay": 1
+    },
+    {
+      "text": "This is our actual workspace where we learn, research, and experiment. Welcome to experience our daily work!",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",   
+      "head_control_deg": {"x": -12, "y": 0},         
+      "image": "assets/6.png",       
+      "delay": 1
+    }    
+  ]
+}

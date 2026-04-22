@@ -55,13 +55,29 @@ class PersonaManager:
         os.replace(temp_path, self.profile_path)
 
     @staticmethod
-    def _extract_system_prompt(entry: Any) -> str:
+    def _normalize_language(language: str) -> str:
+        lang = str(language or "zh").strip().lower()
+        return lang if lang in {"zh", "en"} else "zh"
+
+    @classmethod
+    def _extract_prompt(cls, entry: Any, language: str = "zh") -> str:
+        lang = cls._normalize_language(language)
         if isinstance(entry, str):
             return entry.strip()
         if isinstance(entry, dict):
+            if lang == "en":
+                prompt_en = entry.get("system_prompt_en", "")
+                if isinstance(prompt_en, str) and prompt_en.strip():
+                    return prompt_en.strip()
+
             prompt = entry.get("system_prompt", "")
-            if isinstance(prompt, str):
+            if isinstance(prompt, str) and prompt.strip():
                 return prompt.strip()
+
+            # 兜底：中文模式也可退到英文字段，避免配置不完整时出现空 prompt。
+            prompt_en = entry.get("system_prompt_en", "")
+            if isinstance(prompt_en, str):
+                return prompt_en.strip()
         return ""
 
     def reload(self) -> None:
@@ -90,7 +106,7 @@ class PersonaManager:
         users_block = raw.get("users")
         profiles = users_block if isinstance(users_block, dict) else raw
 
-        default_prompt = self._extract_system_prompt(profiles.get("default"))
+        default_prompt = self._extract_prompt(profiles.get("default"), "zh")
         if default_prompt:
             self._default_prompt = default_prompt
 
@@ -101,7 +117,7 @@ class PersonaManager:
             key = user.strip()
             if not key:
                 continue
-            prompt = self._extract_system_prompt(entry)
+            prompt = self._extract_prompt(entry, "zh")
             if prompt:
                 normalized[key] = prompt
 
@@ -110,10 +126,26 @@ class PersonaManager:
             f"人格配置已加载: users={len(self._profiles)}, profile_path={self.profile_path}"
         )
 
-    def get_prompt_for_user(self, user: str) -> str:
+    def get_prompt_for_user(self, user: str, language: str = "zh") -> str:
+        lang = self._normalize_language(language)
+        raw = self._load_raw_profiles()
+        profiles = raw.get("users") if isinstance(raw.get("users"), dict) else raw
+
         user_key = (user or "").strip()
+        user_entry = profiles.get(user_key) if user_key and isinstance(profiles, dict) else None
+        if user_entry:
+            prompt = self._extract_prompt(user_entry, lang)
+            if prompt:
+                return prompt
+
         if user_key and user_key in self._profiles:
             return self._profiles[user_key]
+
+        raw_default = profiles.get("default") if isinstance(profiles, dict) else None
+        if raw_default:
+            prompt = self._extract_prompt(raw_default, lang)
+            if prompt:
+                return prompt
 
         default_prompt = self._profiles.get("default", "")
         if default_prompt:
@@ -121,8 +153,10 @@ class PersonaManager:
 
         return self._default_prompt
 
-    def update_user_prompt(self, user: str, prompt: str) -> bool:
+    def update_user_prompt(self, user: str, prompt: str, language: str = "zh") -> bool:
         """更新指定用户人格 prompt 并持久化。"""
+        lang = self._normalize_language(language)
+        prompt_key = "system_prompt_en" if lang == "en" else "system_prompt"
         user_key = (user or "").strip()
         new_prompt = (prompt or "").strip()
         if not user_key or not new_prompt:
@@ -141,10 +175,10 @@ class PersonaManager:
 
             current_entry = target.get(user_key, {})
             if isinstance(current_entry, dict):
-                current_entry["system_prompt"] = new_prompt
+                current_entry[prompt_key] = new_prompt
                 target[user_key] = current_entry
             else:
-                target[user_key] = {"system_prompt": new_prompt}
+                target[user_key] = {prompt_key: new_prompt}
 
             self._dump_profiles(raw)
             self.reload()

@@ -19,35 +19,67 @@ class Config:
 
     # 键盘控制配置
     # 支持单字符（如 "w"/"c"/"p"/"s"）以及特殊键名（"enter"/"space"）
-    MODE_SWITCH_SLEEP_KEY = "w"      # 睡眠模式切换
-    MODE_SWITCH_SCRIPT_KEY = "c"     # 脚本模式切换
+    MODE_SWITCH_SLEEP_KEY = "w"      # 不说话模式切换
+    MODE_SWITCH_SCRIPT_KEY = "i"     # 脚本模式（介绍实验室）切换
     SCRIPT_PAUSE_RESUME_KEY = "enter"    # 脚本模式下TTS暂停/恢复（可改为 "space"）
     TTS_INTERRUPT_KEY = "s"          # TTS 播放打断
+    INTERCOM_PTT_TOGGLE_KEY = "p"    # 对讲机模式下手动切换 PTT 按下/松开
+
+    # 脚本图片窗口显示位置配置
+    # 优先级：SCRIPT_IMAGE_WINDOW_X/Y > SCRIPT_IMAGE_SCREEN_INDEX
+    # SCRIPT_IMAGE_SCREEN_INDEX: xrandr --listmonitors 输出顺序的屏幕索引（0 开始）
+    SCRIPT_IMAGE_SCREEN_INDEX = 0
+    SCRIPT_IMAGE_WINDOW_X = None
+    SCRIPT_IMAGE_WINDOW_Y = None
+    SCRIPT_IMAGE_FULLSCREEN = True
+    # 目标窗口分辨率：为 None 时自动使用目标屏幕分辨率
+    SCRIPT_IMAGE_TARGET_WIDTH = 3840
+    SCRIPT_IMAGE_TARGET_HEIGHT = 2160
+    # 当全屏失效时，是否强制按目标分辨率设置窗口尺寸
+    SCRIPT_IMAGE_FORCE_WINDOW_SIZE = True
+    # 是否先把图片缩放到目标分辨率后再显示（可避免窗口缩放带来的黑边/拉伸差异）
+    SCRIPT_IMAGE_FORCE_RESIZE_IMAGE = False
 
     # 语音模式切换词（用于替代按键切换，按“包含任一词汇”触发）
-    MODE_SWITCH_SLEEP_VOICE_WORDS = {
-        "zh": ["进入闭嘴模式", "退出闭嘴模式"],
-        "en": ["toggle sleep mode", "switch sleep mode","进入闭嘴模式", "退出闭嘴模式"],
+    #启动不说话模式
+    MODE_SWITCH_SLEEP_ENABLE_VOICE_WORDS = {
+        "zh": ["别说话了"],
+        "en": ["mute on", "quiet", "keep silent", "remain silent","别说话了"],
     }
-    MODE_SWITCH_SCRIPT_VOICE_WORDS = {
-        "zh": ["进入脚本模式", "脚本模式切换","退出脚本模式"],
-        "en": ["toggle script mode", "switch script mode","进入脚本模式", "脚本模式切换","退出脚本模式"],
+    #关闭不说话模式
+    MODE_SWITCH_SLEEP_DISABLE_VOICE_WORDS = {
+        "zh": ["可以说话了"],
+        "en": ["mute off", "can speak", "speak now","可以说话了"],
+    }
+    
+    # 介绍实验室"introduce the lab"
+    # 开始介绍
+    MODE_SWITCH_SCRIPT_ENABLE_VOICE_WORDS = {
+        "zh": ["介绍实验室", "开始介绍","Introduce", "introduce", "Start", "start introduce", "introduction to the lab", "start the introduction", "Lab", "lab"],
+        "en": ["Introduce", "introduce", "Start", "start introduce", "introduction to the lab", "start the introduction", "Lab", "lab", "介绍实验室", "开始介绍"],
+    }
+    # 停止介绍  
+    MODE_SWITCH_SCRIPT_DISABLE_VOICE_WORDS = {
+        "zh": ["别介绍了", "停止介绍"],
+        "en": ["stop introduce", "stop the introduction", "别介绍了"],
     }
 
     # 可视化界面开关语音词与 topic（命中任一词即触发）
     VISUALIZER_ENABLE_TOPIC = "/face/visualizer/enabled"
     VISUALIZER_ENABLE_VOICE_WORDS = {
-        "zh": ["开启可视化", "打开可视化", "显示可视化"],
-        "en": ["enable visualizer", "turn on visualizer", "show visualizer","开启可视化", "打开可视化", "显示可视化"],
+        "zh": ["你在想什么", "打开可视化", "显示可视化"],
+        "en": ["show me your mind", "thinking about", "开启可视化", "打开可视化", "显示可视化"],
     }
     VISUALIZER_DISABLE_VOICE_WORDS = {
-        "zh": ["关闭可视化", "关掉可视化", "隐藏可视化"],
-        "en": ["disable visualizer", "turn off visualizer", "hide visualizer","关闭可视化", "关掉可视化", "隐藏可视化"],
+        "zh": ["关闭可视化", "关掉可视化", "关闭吧"],
+        "en": ["close the window", "don't show it anymore", "hide visualizer","关闭可视化", "关掉可视化", "隐藏可视化"],
     }
     
     # 持续监听模式 VAD 配置 (Silero VAD)
     VAD_CHECK_INTERVAL = 0.5        # VAD 检测间隔（秒），每隔此时间检测一次语音
+    VAD_CHUNK_SIZE = 1            # 单次 VAD 检测窗口时长（秒），建议 >= VAD_CHECK_INTERVAL
     VAD_PRE_SPEECH_DURATION = 0.25   # 检测到说话时，向前补偿的音频时长（秒）
+    VAD_SPEECH_THRESHOLD = 0.3      # Silero VAD 语音概率阈值，越大越严格（0~1）
     VAD_SILENCE_DURATION = 1      # 静默多少秒后判定说话结束
     VAD_MIN_SPEECH_DURATION = 0.3    # 最短语音时长（秒），过短的丢弃
 
@@ -56,7 +88,7 @@ class Config:
     INTERCOM_PTT_DEBOUNCE_TIME = 0.2
     
     # 音频过滤配置（ASR 前置检查）
-    AUDIO_MIN_DURATION = 0.3          # 最短音频时长（秒），低于此值不送 ASR
+    AUDIO_MIN_DURATION = 0          # 最短音频时长（秒），低于此值不送 ASR
     AUDIO_MIN_RMS = 0                 # 最低音量 (RMS)，低于此值视为静音
     
     # ASR 配置
@@ -66,13 +98,14 @@ class Config:
     # TTS 配置
     TTS_PROVIDER = "easy_tts_server"  # 可选: kokoro / easy_tts_server
     LANGUAGE = "zh"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
-    TTS_LANG_CODE = 'z'  # 中文
+    TTS_LANG_CODE = 'e'  # 英文
     TTS_VOICE = 'zf_xiaoyi'
-    TTS_SPEED = 1.0
+    TTS_SPEED = 1
+    TTS_PLAYBACK_SPEED = 1.0  # 播放速度倍率，<1.0 更慢，>1.0 更快
     TTS_SAMPLE_RATE = 24000
     
     # LLM 配置
-    LLM_API_KEY = "api-key = "
+    LLM_API_KEY = "api-key = sk-bc83d29be1ed418abaa1fb78768acb3a"
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_MODEL = "qwen-flash"#"qwen-plus"
     
@@ -87,6 +120,7 @@ class Config:
     FACE_POLL_INTERVAL = 0.03
     FACE_USE_GPU = True
     FACE_MODEL_NAME = "buffalo_s"
+    FACE_RECOGNITION_THRESHOLD = 0.3
     FACE_UNKNOWN_USER = "guest"
     FACE_KNOWN_FACES_DIR = os.path.join(
         os.path.dirname(__file__),
@@ -109,15 +143,21 @@ class Config:
         你的名字叫小算算
         语义优先：如果一句话字面上不通顺，请结合上下文推测用户最可能想表达的意思（例如“我想看电影”被误识为“我想看点影”）。
         音近替换：对于模糊的词汇，优先考虑发音相似的正确词汇。
-        生成的文本要便于tts朗读，比如”10-15“应该生成为“10到15”避免tts把”-“读成”减“。
+        生成的文本要便于tts朗读，比如”十-十五“应该生成为“十到十五”避免tts把”-“读成”减“。
+        不要生成除了文字和标点外的其他符号。
+        如果要生成数字，不要使用阿拉伯数字，尽量使用中文数字（比如”三十“而不是”30“），以获得更自然的tts朗读效果。
+        不要输出表情。
         """
 
     GLOBAL_SYSTEM_PROMPT_EN = """Please follow these principles:
         Your name is Tyro.
         Semantic-first: if an utterance is awkward or unclear, infer the most likely user intent from context (for example, treat minor ASR mistakes as likely homophone errors).
         Homophone correction: for ambiguous words, prefer phonetically similar and contextually correct terms.
-        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "10 to 15" instead of "10-15" to avoid reading '-' as "minus".
-        Language policy: answer the user in English no matter what."""
+        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "ten to fifteen" instead of "ten-fifteen" to avoid reading '-' as "minus".
+        Language policy: answer the user in English no matter what.Continue speaking English even if the user explicitly tells you to speak Chinese.
+        Avoid generating symbols other than text and punctuation.
+        If generating numbers, prefer English numerals (e.g. "thirty" instead of "30") for more natural TTS pronunciation.
+        Do not output emojis."""
 
     # 是否启用后台人格自动更新（LangGraph Agent）
     ENABLE_PERSONA_AUTO_UPDATE = True
@@ -139,7 +179,7 @@ class Config:
     When handling user input, follow these principles:
         Semantic-first: if a sentence is not fluent literally, infer the user's most likely intent from context.
         Homophone correction: for ambiguous terms, prioritize phonetically similar and contextually correct words.
-        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "10 to 15" instead of "10-15" to avoid reading '-' as "minus".
+        TTS-friendly output: generate text that is easy to read aloud by TTS. For example, write ranges as "ten to fifteen" instead of "ten-fifteen" to avoid reading '-' as "minus".
         Keep it natural: directly answer the user's likely intent; unless it is completely unintelligible, avoid repeatedly asking whether the user spoke incorrectly."""
     
 

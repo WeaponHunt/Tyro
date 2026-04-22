@@ -56,3 +56,48 @@ def test_persona_manager_config_fallback_when_file_missing(tmp_path):
     missing_path = tmp_path / "not_exists.json"
     manager = PersonaManager(str(missing_path), fallback_prompt="fallback-prompt")
     assert manager.get_prompt_for_user("any") == "fallback-prompt"
+
+
+def test_persona_manager_english_prompt_selection(tmp_path):
+    profile_path = tmp_path / "persona_profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "default": {
+                    "system_prompt": "default-zh",
+                    "system_prompt_en": "default-en",
+                },
+                "alice": {
+                    "system_prompt": "alice-zh",
+                    "system_prompt_en": "alice-en",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manager = PersonaManager(str(profile_path), fallback_prompt="fallback-en")
+    assert manager.get_prompt_for_user("alice", language="en") == "alice-en"
+    assert manager.get_prompt_for_user("new_user", language="en") == "default-en"
+
+
+def test_persona_manager_update_english_prompt(tmp_path):
+    profile_path = tmp_path / "persona_profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "default": {"system_prompt": "default-zh"},
+                "alice": {"system_prompt": "alice-zh"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manager = PersonaManager(str(profile_path), fallback_prompt="fallback")
+    assert manager.update_user_prompt("alice", "alice-en", language="en") is True
+
+    raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert raw["alice"]["system_prompt"] == "alice-zh"
+    assert raw["alice"]["system_prompt_en"] == "alice-en"

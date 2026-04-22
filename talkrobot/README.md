@@ -97,10 +97,8 @@ python -m talkrobot.main chat --enable-face
 python -m talkrobot.main chat --enable-face --face-camera-index 0
 
 # 在 continuous 非响应阶段，见到熟人主动问好
-python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous 
+python -m talkrobot.main chat --enable-face  --listen-mode continuous 
 
-# 对讲机模式
-python -m talkrobot.main chat --enable-face --say-hallo --listen-mode intercom --language en
 ```
 
 ### 2. 手动添加记忆

@@ -2,76 +2,45 @@
   "name": "demo",
   "steps": [
     {
-      "text": "Your Royal Highness, distinguished guests, good afternoon。",
+      "text": "大家好，我是小算算，我来给大家介绍情感与认知智能机器人实验室。",
       "expression": "happy",
       "gesture": "greet()",
-      "image": "assets/01.png",
-      "delay": 1
+      "image": "assets/1.png",
+      "delay": 2
     },
     {
-      "text": "My name is Xiaosuan Suan, and my English name is Tyro, I am an emotional robot independently developed by the ACIR Lab,It is my great honor to give a presentation of the lab to all the distinguished guests,",
+      "text": "我们实验室的核心目标，是让机器人具备真正的智能、认知与情感能力。让机器人“能懂人、有情商、会干活、善表达”。",
       "expression": "happy",
-      "image": "assets/01.png",
+      "image": "assets/2.png",
       "delay": 1
     },    
     {
-      "text": "The full name of the lab is the Lab for Affective and Cognitive Intelligent Robotics, which was founded in 2017, Its goal is to give robots real emotion intelligence, and cognitive abilities, Right now, the lab have a total of 17 members in the lab, and it is headed by Researcher Wang Tao,",
+      "text": "我们专注研究情感与认知模型：首先通过多模态观测，识别人类的表现；然后进行综合推理，算出对方的情绪和意图；最后再使机器人做出合适的反应。",
       "expression": "happy",
       "gesture": "arm_right_up(45)",
       "head_control_deg": {"x": 18, "y": 0},
-      "image": "assets/02.png",
+      "image": "assets/3.png",
       "delay": 1
     },
     {
-      "text": "Wang Tao also directs the Affective Intelligence Application Joint Lab,which was set up by PKU and the Beijing Innovation Center of Humanoid Robotics, This joint lab focus on exploring, developing, and testing how affective and cognitive models works on humanoid robots,",
+      "text": "我们还研发了三款机器人以承载实验室的模型算法，爱瑟尔，大算算，和我自己，小算算。",
       "expression": "happy",
-      "image": "assets/03.png",
+      "image": "assets/4.png",
       "delay": 1
     },
     {
-      "text": "The lab also holds positions in the Beijing Computer Federation, and organizes science popularization activities for young people,Recently, the lab has been approved as the Beijing Artificial Intelligence and Affective Robot Science Popularization Base, Science popularization is also a key part of its work,",
+      "text": "我们已发表了八十多篇优秀论文，获得二十四项发明专利，成果被央视等媒体报道，同时也落地产业、还和企业共建了联合实验室。",
       "expression": "happy",
-      "image": "assets/04.png",      
+      "image": "assets/5.png",      
       "delay": 1
     },
     {
-      "text": "The lab's main focus is affective and cognitive models and algorithms — the core technology behind emotional companion robots,It has developed emotion recognition model, attention analysis model, personality recognition model, and physiological signal detection model, etc,",
+      "text": "这里就是我们真正学习、研究、做实验的地方，欢迎大家实地来看看，感受我们的日常工作！",
       "expression": "happy",
-      "image": "assets/05.png",       
+      "gesture": "wave_right_hand()",   
+      "head_control_deg": {"x": -12, "y": 0},         
+      "image": "assets/6.png",       
       "delay": 1
-    },   
-    {
-      "text": "These technologies have already made an impact in industry, They’ve been used by several top companies in their robots,",
-      "expression": "happy",
-      "image": "assets/06.png",       
-      "delay": 1
-    },  
-    {
-      "text": "The lab had developed emotional robot prototypes—myself and Da SuanSuan—for teaching and research,Additionally, the lab can also empower third-party robots, making them more emotional and intelligent,",
-      "expression": "happy",
-      "image": "assets/07.png",       
-      "delay": 1
-    },  
-    {
-      "text": "So far, the lab has published over 80 academic papers, been granted more than 20 patents, and completed over 10 national, provincial, and industry-funded research projects, ",
-      "expression": "happy",
-      "image": "assets/08.png",       
-      "delay": 1
-    },  
-    {
-      "text": "The lab has has participated in many presentations, conferences, and exhibitions on behalf of Peking University, and they had been covered by media outlets including CCTV,",
-      "expression": "happy",
-      "gesture": "wave_right_hand()",
-      "head_control_deg": {"x": -12, "y": 0},
-      "image": "assets/09.png",       
-      "delay": 1
-    },  
-    {
-      "text": "That’s all for the lab’s brief introduction.  Welcome to continue your tour or interact with me.",
-      "expression": "happy",
-      "gesture": "reset()",
-      "image": "assets/09.png",       
-      "delay": 1
-    }       
+    }    
   ]
 }

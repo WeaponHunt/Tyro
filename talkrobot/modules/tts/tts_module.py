@@ -4,6 +4,7 @@
 """
 import threading
 import time
+import unicodedata
 from collections.abc import Iterable
 from typing import List, Optional, Union
 
@@ -19,6 +20,7 @@ class TTSModule:
         lang_code: str = 'z',
         voice: str = 'zf_xiaoyi',
         speed: float = 1.0,
+        playback_speed: float = 1.0,
         provider: str = 'kokoro',
         language: Optional[str] = None,
         sample_rate: int = 24000,
@@ -30,6 +32,7 @@ class TTSModule:
             lang_code: Kokoro语言代码（兼容保留，默认'z'）
             voice: 音色名称
             speed: 语速
+            playback_speed: 播放速度倍率，<1.0更慢，>1.0更快（不改变合成文本）
             provider: TTS后端，支持 'kokoro' / 'easy_tts_server'
             language: 语言，支持 'zh' / 'en'，不传则沿用 lang_code
             sample_rate: 采样率
@@ -39,6 +42,7 @@ class TTSModule:
         self.sample_rate = sample_rate
         self.voice = voice
         self.speed = speed
+        self.playback_speed = self._normalize_playback_speed(playback_speed)
         self.pipeline = None
         self.easy_tts_engine = None
         self._state_lock = threading.Lock()
@@ -49,7 +53,7 @@ class TTSModule:
 
         logger.info(
             f"正在初始化TTS模块: provider={self.provider}, language={self.language}, "
-            f"lang_code={lang_code}, voice={voice}"
+            f"lang_code={lang_code}, voice={voice}, playback_speed={self.playback_speed}"
         )
 
         if self.provider == "kokoro":
@@ -72,6 +76,15 @@ class TTSModule:
 
         self._interrupted = threading.Event()
         logger.info("TTS模块初始化完成")
+
+    @staticmethod
+    def _normalize_playback_speed(playback_speed: float) -> float:
+        """标准化播放速度，避免无效或极端值导致播放异常。"""
+        try:
+            value = float(playback_speed)
+        except (TypeError, ValueError):
+            return 1.0
+        return min(max(value, 0.5), 2.0)
 
     @staticmethod
     def _normalize_language(language: str) -> str:
@@ -167,11 +180,12 @@ class TTSModule:
     def _play_audio_chunk(self, audio: np.ndarray, index: int) -> bool:
         """播放单段音频，返回是否被中断。"""
         logger.debug(f"播放第{index}段音频，长度{len(audio)}")
-        sd.play(audio, self.sample_rate, blocking=False)
+        playback_sample_rate = max(1, int(self.sample_rate * self.playback_speed))
+        sd.play(audio, playback_sample_rate, blocking=False)
 
         # 某些设备/驱动下 get_stream().latency 并不表示已播放采样数，
         # 使用预计时长 + 安全余量避免等待循环卡死。
-        expected_seconds = max(0.0, float(len(audio)) / float(self.sample_rate))
+        expected_seconds = max(0.0, float(len(audio)) / float(playback_sample_rate))
         deadline = time.monotonic() + expected_seconds + 1.0
 
         while True:
@@ -207,7 +221,7 @@ class TTSModule:
         if not text:
             return []
 
-        delimiters = {"，", ",", "。", "."}
+        delimiters = {"，", ",", "。", ".","～","~","！","!","？","?","；",";","：",":","…","..."}
         segments: List[str] = []
         buffer = ""
 
@@ -224,6 +238,31 @@ class TTSModule:
             segments.append(tail)
 
         return segments
+
+    @staticmethod
+    def _is_cjk_char(ch: str) -> bool:
+        code = ord(ch)
+        return 0x4E00 <= code <= 0x9FFF
+
+    @staticmethod
+    def _is_english_char(ch: str) -> bool:
+        return ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+
+    @staticmethod
+    def _is_punctuation_char(ch: str) -> bool:
+        return unicodedata.category(ch).startswith("P")
+
+    @classmethod
+    def _sanitize_text(cls, text: str) -> str:
+        """仅保留中文、英文、标点和空白，其它字符直接忽略。"""
+        if not text:
+            return ""
+
+        cleaned_chars: List[str] = []
+        for ch in str(text):
+            if ch.isspace() or cls._is_cjk_char(ch) or cls._is_english_char(ch) or cls._is_punctuation_char(ch):
+                cleaned_chars.append(ch)
+        return "".join(cleaned_chars)
 
     def _synthesize_segments(
         self,
@@ -328,7 +367,7 @@ class TTSModule:
                 break
             if part is None:
                 continue
-            merged_text_parts.append(str(part))
+            merged_text_parts.append(self._sanitize_text(str(part)))
 
         merged_text = "".join(merged_text_parts)
         segments = self._split_text_by_punctuation(merged_text)
@@ -370,7 +409,8 @@ class TTSModule:
 
             if isinstance(text, str):
                 logger.info(f"正在合成语音: {text}")
-                segments = self._split_text_by_punctuation(text)
+                sanitized_text = self._sanitize_text(text)
+                segments = self._split_text_by_punctuation(sanitized_text)
                 with self._state_lock:
                     self._resume_segments = segments
                     self._resume_segment_index = 0
