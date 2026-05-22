@@ -5,10 +5,14 @@
 import numpy as np
 import time
 import re
+import os
 from loguru import logger
 from typing import Optional, Callable, Tuple
 import threading
-from pynput import keyboard
+
+from talkrobot.agent import AgentRuntime
+from talkrobot.core.dialogue_history import SlidingWindowDialogueHistory
+from talkrobot.core.tts_playback_controller import TTSPlaybackController
 
 class ConversationManager:
     """对话管理器"""
@@ -78,8 +82,13 @@ class ConversationManager:
         self._persona_update_lock = threading.Lock()
         self._user_state_lock = threading.Lock()
         self._proactive_lock = threading.Lock()
-        self._history_lock = threading.Lock()
-        self._recent_dialogue_rounds_by_user = {}  # dict[user, list[(user_text, assistant_text)]]
+        self._history = SlidingWindowDialogueHistory(self.history_rounds)
+        self._tts_playback = TTSPlaybackController(tts_module, audio_recorder)
+        self._agent_runtime = AgentRuntime(
+            project_root=os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            language=self.language,
+        )
+        self._last_agent_status_tts_ts = 0.0
         self._active_user = self.default_user
         self._active_user_has_long_term_memory = True
         self._active_user_initialized = False
@@ -143,8 +152,7 @@ class ConversationManager:
             previous_user = self._active_user if self._active_user_initialized else None
 
             if previous_user is not None and previous_user != user:
-                with self._history_lock:
-                    self._recent_dialogue_rounds_by_user.clear()
+                self._history.clear()
                 self._pending_user_switch_notice = (
                     f"会话对象已切换：上一位交互对象是[{previous_user}]，当前对象是[{user}]。"
                     "请不要把上一位对象的对话内容当作当前对象的个人信息。"
@@ -322,13 +330,7 @@ class ConversationManager:
             self._pending_greeting_deadline = time.time() + self._greeting_response_window_seconds
 
             if self.tts_enabled and self.tts is not None:
-                if self.audio_recorder:
-                    self.audio_recorder.is_tts_playing = True
-                try:
-                    self.tts.synthesize(response, play_audio=True)
-                finally:
-                    if self.audio_recorder:
-                        self.audio_recorder.is_tts_playing = False
+                self._tts_playback.play(response)
 
             if expression_name and self.expression and self.expression.is_available:
                 self.expression.reset_expression()
@@ -341,31 +343,11 @@ class ConversationManager:
 
     def _build_sliding_window_context(self, user: str) -> str:
         """构建最近 n 轮对话窗口文本。"""
-        if self.history_rounds <= 0:
-            return ""
-
-        with self._history_lock:
-            rounds = list(self._recent_dialogue_rounds_by_user.get(user, []))
-
-        if not rounds:
-            return ""
-
-        lines = [f"最近对话窗口（最近{len(rounds)}轮）:"]
-        for idx, (user_text, assistant_text) in enumerate(rounds, start=1):
-            lines.append(f"第{idx}轮 用户: {user_text}")
-            lines.append(f"第{idx}轮 机器人: {assistant_text}")
-        return "\n".join(lines)
+        return self._history.build_context(user)
 
     def _append_dialogue_round(self, user: str, user_text: str, assistant_text: str) -> None:
         """将一轮对话写入滑动窗口。"""
-        if self.history_rounds <= 0:
-            return
-
-        with self._history_lock:
-            rounds = self._recent_dialogue_rounds_by_user.setdefault(user, [])
-            rounds.append((user_text, assistant_text))
-            if len(rounds) > self.history_rounds:
-                self._recent_dialogue_rounds_by_user[user] = rounds[-self.history_rounds:]
+        self._history.append(user, user_text, assistant_text)
 
     def _clear_sliding_window(self, user: Optional[str] = None) -> None:
         """清空指定用户（默认当前用户）的滑动窗口短期记忆。"""
@@ -373,10 +355,8 @@ class ConversationManager:
             return
 
         target_user = user or self._active_user
-        with self._history_lock:
-            if target_user in self._recent_dialogue_rounds_by_user:
-                self._recent_dialogue_rounds_by_user[target_user] = []
-                logger.info(f"已清空滑动窗口短期记忆: user={target_user}")
+        self._history.clear(target_user)
+        logger.info(f"已清空滑动窗口短期记忆: user={target_user}")
 
     @staticmethod
     def _merge_context(memory_context, sliding_window_context: str) -> str:
@@ -405,6 +385,49 @@ class ConversationManager:
         msg = f"⏱️ {stage} 用时: {elapsed:.3f}s"
         print(msg)
         logger.debug(msg)
+
+    def _handle_agent_event(self, event) -> None:
+        """Render non-final agent events for terminal/TTS feedback."""
+        if event.type == "plan":
+            logger.debug(f"Agent计划: {event.data}")
+            return
+
+        if event.type == "tool_start":
+            tool = event.data.get("tool", "")
+            if tool == "memory_search":
+                print(self._msg("🔍 正在检索相关记忆...", "🔍 Retrieving relevant memory..."))
+            elif event.text:
+                print(f"🛠️ {event.text}")
+            self._maybe_speak_agent_status(event)
+            return
+
+        if event.type == "tool_result":
+            logger.debug(f"Agent工具结果: {event.data}")
+            return
+
+        if event.type == "llm_start":
+            print(self._msg("🤖 正在整理回复...", "🤖 Composing reply..."))
+            logger.debug(f"Agent LLM开始: {event.data}")
+            return
+
+        if event.type == "error":
+            if event.text:
+                print(f"⚠️ {event.text}")
+            logger.warning(f"Agent事件错误: {event.data}")
+            self._maybe_speak_agent_status(event)
+
+    def _maybe_speak_agent_status(self, event) -> None:
+        """Speak sparse agent progress messages without turning every event into audio."""
+        if self.streaming:
+            return
+        if not self.tts_enabled or self.tts is None or not event.speakable or not event.text:
+            return
+
+        now = time.time()
+        if now - self._last_agent_status_tts_ts < 2.0:
+            return
+        self._last_agent_status_tts_ts = now
+        self._tts_playback.play(event.text)
 
     def _handle_continuous_mode_command(self, user_text: str) -> bool:
         """处理 continuous 模式下的唤醒/休眠指令。返回是否继续后续对话流程。"""
@@ -440,13 +463,7 @@ class ConversationManager:
             print(f"🤖 {self._msg('机器人', 'Assistant')}: {farewell}")
             logger.info(self._msg("检测到“再见”，机器人主动告别", "Sleep word detected, assistant says goodbye"))
             if self.tts_enabled and self.tts is not None:
-                if self.audio_recorder:
-                    self.audio_recorder.is_tts_playing = True
-                try:
-                    self.tts.synthesize(farewell, play_audio=True)
-                finally:
-                    if self.audio_recorder:
-                        self.audio_recorder.is_tts_playing = False
+                self._tts_playback.play(farewell)
 
             self._clear_sliding_window(self._active_user)
             self._response_enabled = False
@@ -465,50 +482,17 @@ class ConversationManager:
         if current_user != self._active_user or not self._active_user_initialized:
             self._switch_user_if_needed(current_user)
 
-        # 2. 异步存储用户输入到记忆 (不阻塞后续流程)
-        if self._active_user_has_long_term_memory and self.memory is not None:
-            logger.debug("开始存储用户输入到记忆")
-            self.memory.add_memory(f"用户说: {user_text}", async_mode=True)
-        else:
-            logger.debug("当前对象无长期记忆，跳过用户输入写入")
-
-        # 3. 从记忆中检索相关上下文
-        logger.debug("开始检索记忆")
-        memory_start = time.perf_counter()
-        memory_context = ""
-        if self._active_user_has_long_term_memory and self.memory is not None:
-            print(self._msg("🔍 正在检索相关记忆...", "🔍 Retrieving relevant memory..."))
-            memory_context = self.memory.search_memory(user_text)
-        else:
-            print(self._msg("🧠 当前仅使用短期记忆（滑动窗口）...", "🧠 Using short-term memory only (sliding window)..."))
-
         sliding_window_context = self._build_sliding_window_context(self._active_user)
-        context = self._merge_context(memory_context, sliding_window_context)
         switch_notice = self._consume_user_switch_notice()
-        if switch_notice:
-            context = f"{switch_notice}\n\n{context}" if context else switch_notice
-        memory_elapsed = time.perf_counter() - memory_start
-        self._print_stage_timing("查询相关记忆", memory_elapsed)
-        logger.debug(f"记忆检索完成，记忆上下文长度: {len(str(memory_context)) if memory_context else 0}")
-        logger.debug(f"滑动窗口上下文长度: {len(sliding_window_context) if sliding_window_context else 0}")
-
-        # 3.1 并行后台人格更新（不影响当前轮回复）
-        persona_async_schedule_ts = self._start_persona_update_async(self._active_user, user_text, context)
-
-        # 4. LLM: 生成回复
-        print(self._msg("🤖 正在思考回复...", "🤖 Thinking..."))
-        logger.debug("开始LLM生成回复")
-        llm_start = time.perf_counter()
-        if self.debug_timing and persona_async_schedule_ts > 0:
-            overlap_start_delta = llm_start - persona_async_schedule_ts
-            msg = f"⏱️ 人格更新与主回复并行启动差: {overlap_start_delta:.3f}s"
-            print(msg)
-            logger.debug(msg)
-        logger.debug(f"💡 输入给LLM的上下文: {context}")
         persona_prompt = self._resolve_persona_prompt(self._active_user)
         tts_played_in_streaming = False
         expression_name = None
         expression_set_in_streaming = False
+        raw_response = ""
+        context = ""
+        tool_results = []
+        llm_start = time.perf_counter()
+
         if self.streaming:
             logger.debug("使用流式模式生成回复")
             raw_response_parts = []
@@ -565,15 +549,39 @@ class ConversationManager:
                 buffered_prefix = ""
                 return rest
 
+            agent_events = self._agent_runtime.run_stream(
+                user_text=user_text,
+                llm=self.llm,
+                memory_module=self.memory,
+                long_term_memory=self._active_user_has_long_term_memory,
+                sliding_window_context=sliding_window_context,
+                switch_notice=switch_notice,
+                system_prompt_override=persona_prompt,
+                streaming=True,
+            )
+
+            assistant_prefix_printed = False
+
             def _stream_with_capture():
-                for chunk in self.llm.generate_response_stream(
-                    user_text,
-                    context,
-                    system_prompt_override=persona_prompt,
-                ):
+                nonlocal raw_response, context, tool_results, assistant_prefix_printed
+                for event in agent_events:
+                    if event.type == "llm_chunk":
+                        chunk = event.text
+                    elif event.type == "final_response":
+                        raw_response = event.text
+                        context = event.data.get("context", "")
+                        tool_results = event.data.get("tool_results", [])
+                        continue
+                    else:
+                        self._handle_agent_event(event)
+                        continue
+
                     raw_response_parts.append(chunk)
                     clean_chunk = _handle_stream_chunk(chunk)
                     if clean_chunk:
+                        if not assistant_prefix_printed:
+                            print(self._msg("🤖 机器人: ", "🤖 Assistant: "), end="", flush=True)
+                            assistant_prefix_printed = True
                         print(clean_chunk, end="", flush=True)
                         yield clean_chunk
 
@@ -582,55 +590,48 @@ class ConversationManager:
                     print(buffered_prefix, end="", flush=True)
                     yield buffered_prefix
 
-            print(self._msg("🤖 机器人: ", "🤖 Assistant: "), end="", flush=True)
-
             if self.tts_enabled:
                 print(self._msg("\n🔊 正在播放语音... (按 'S' 键可打断)", "\n🔊 Playing audio... (press 'S' to interrupt)"))
                 logger.debug("开始流式TTS播放")
 
-                def _on_press_interrupt_streaming(key):
-                    try:
-                        if hasattr(key, 'char') and key.char == 's':
-                            logger.info("检测到S键，触发TTS打断")
-                            self.tts._interrupted.set()
-                    except Exception as e:
-                        logger.debug(f"回调异常: {e}")
-
-                interrupt_listener = keyboard.Listener(on_press=_on_press_interrupt_streaming, daemon=True)
-                interrupt_listener.start()
-                logger.debug("流式TTS打断监听器已启动（daemon模式）")
-
-                if self.audio_recorder:
-                    logger.debug("设置 is_tts_playing = True")
-                    self.audio_recorder.is_tts_playing = True
-
                 tts_start = time.perf_counter()
-                try:
-                    self.tts.synthesize(_stream_with_capture(), play_audio=True)
-                    tts_elapsed = time.perf_counter() - tts_start
-                    self._print_stage_timing("TTS合成", tts_elapsed)
-                    tts_played_in_streaming = True
-                finally:
-                    if self.audio_recorder:
-                        logger.debug("设置 is_tts_playing = False")
-                        self.audio_recorder.is_tts_playing = False
-                    logger.debug("流式TTS播放流程已结束")
+                self._tts_playback.play(_stream_with_capture())
+                tts_elapsed = time.perf_counter() - tts_start
+                self._print_stage_timing("TTS合成", tts_elapsed)
+                tts_played_in_streaming = True
             else:
                 for _ in _stream_with_capture():
                     pass
 
             print()
-            raw_response = "".join(raw_response_parts)
+            if not raw_response:
+                raw_response = "".join(raw_response_parts)
         else:
-            raw_response = self.llm.generate_response(
-                user_text,
-                context,
+            for event in self._agent_runtime.run_stream(
+                user_text=user_text,
+                llm=self.llm,
+                memory_module=self.memory,
+                long_term_memory=self._active_user_has_long_term_memory,
+                sliding_window_context=sliding_window_context,
+                switch_notice=switch_notice,
                 system_prompt_override=persona_prompt,
-            )
+                streaming=False,
+            ):
+                if event.type == "final_response":
+                    raw_response = event.text
+                    context = event.data.get("context", "")
+                    tool_results = event.data.get("tool_results", [])
+                else:
+                    self._handle_agent_event(event)
 
         llm_elapsed = time.perf_counter() - llm_start
-        self._print_stage_timing("大模型生成回复", llm_elapsed)
+        self._print_stage_timing("Agent/LLM生成回复", llm_elapsed)
+        logger.debug(f"Agent工具结果: {tool_results}")
+        logger.debug(f"💡 输入给LLM的上下文: {context}")
         logger.debug(f"LLM回复生成完成: {raw_response[:50]}...")
+
+        # 3.1 后台人格更新（不影响当前轮回复）
+        self._start_persona_update_async(self._active_user, user_text, context)
 
         # 4.1 解析表情标签
         if self.expression and self.expression.is_available:
@@ -651,55 +652,31 @@ class ConversationManager:
             logger.debug(f"切换表情: {expression_name}")
             self.expression.set_expression(expression_name)
 
-        # 5. 异步存储机器人回复到记忆 (不阻塞后续流程)
-        if self._active_user_has_long_term_memory and self.memory is not None:
-            logger.debug("开始存储机器人回复到记忆")
-            self.memory.add_memory(f"机器人回复: {response}", async_mode=True)
-        else:
-            logger.debug("当前对象无长期记忆，跳过机器人回复写入")
-
-        # 5.1 更新滑动窗口
+        # 5. 机器人回复不写入长期记忆；短期连续性由滑动窗口负责。
         self._append_dialogue_round(self._active_user, user_text, response)
+
+        # 5.1 本轮回复生成后，再异步保存稳定用户信息，避免阻塞当前轮检索。
+        if self._active_user_has_long_term_memory and self.memory is not None:
+            logger.debug("回复后判断用户输入是否为稳定记忆")
+            if hasattr(self.memory, "add_user_memory_if_stable"):
+                self.memory.add_user_memory_if_stable(user_text, async_mode=True)
+            else:
+                self.memory.add_memory(f"用户说: {user_text}", async_mode=True)
+        else:
+            logger.debug("当前对象无长期记忆，跳过用户输入写入")
 
         # 6. TTS: 文字转语音并播放
         if self.tts_enabled and not tts_played_in_streaming:
             print(self._msg("🔊 正在播放语音... (按 'S' 键可打断)", "🔊 Playing audio... (press 'S' to interrupt)"))
             logger.debug("开始TTS播放")
-
-            # 启动临时键盘监听器，按 S 键打断 TTS
-            # 重要：不在回调里返回 False，避免监听器自阻塞；用 daemon=True 让主线程不等待
-            def _on_press_interrupt(key):
-                try:
-                    if hasattr(key, 'char') and key.char == 's':
-                        logger.info("检测到S键，触发TTS打断")
-                        self.tts._interrupted.set()
-                        # 不调用 sd.stop()，让 TTS 模块自己在轮询里检查到中断后调用
-                except Exception as e:
-                    logger.debug(f"回调异常: {e}")
-
-            interrupt_listener = keyboard.Listener(on_press=_on_press_interrupt, daemon=True)
-            interrupt_listener.start()
-            logger.debug("TTS打断监听器已启动（daemon模式）")
-
-            # 通知录音器 TTS 正在播放（continuous 模式下屏蔽麦克风）
-            if self.audio_recorder:
-                logger.debug("设置 is_tts_playing = True")
-                self.audio_recorder.is_tts_playing = True
             tts_start = time.perf_counter()
-            try:
-                logger.debug("开始调用 tts.synthesize()")
-                self.tts.synthesize(response, play_audio=True)
-                tts_elapsed = time.perf_counter() - tts_start
-                self._print_stage_timing("TTS合成", tts_elapsed)
-                logger.debug("tts.synthesize() 返回")
-            finally:
-                # 先恢复录音器状态，daemon 监听器自动退出，无需显式 stop()
-                if self.audio_recorder:
-                    logger.debug("设置 is_tts_playing = False")
-                    self.audio_recorder.is_tts_playing = False
-                logger.debug("TTS播放流程已结束")
+            logger.debug("开始调用 tts.synthesize()")
+            interrupted = self._tts_playback.play(response)
+            tts_elapsed = time.perf_counter() - tts_start
+            self._print_stage_timing("TTS合成", tts_elapsed)
+            logger.debug("tts.synthesize() 返回")
 
-            if self.tts._interrupted.is_set():
+            if interrupted:
                 print(self._msg("⏹️ 语音播放已打断", "⏹️ Audio playback interrupted"))
                 logger.debug("TTS播放被打断")
             else:

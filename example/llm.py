@@ -2,8 +2,7 @@ import os
 from openai import OpenAI
 
 client = OpenAI(
-    # 若没有配置环境变量，请用百炼API Key将下行替换为：api_key="sk-xxx"
-    api_key="sk-9d42be35fbba4ef8ab8d217c2a613869",
+    api_key=os.getenv("TALKROBOT_LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY", ""),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 

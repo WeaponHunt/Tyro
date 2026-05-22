@@ -1,6 +1,8 @@
 import os
 from mem0 import Memory
 
+api_key = os.getenv("TALKROBOT_LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
+
 # 1. 定义 Qwen 的配置
 config = {
     "vector_store": {
@@ -14,7 +16,7 @@ config = {
         "provider": "openai", # 阿里兼容 OpenAI 协议，所以 provider 选 openai
         "config": {
             "model": "qwen-plus", # 使用你代码里的模型名
-            "api_key": "sk-9d42be35fbba4ef8ab8d217c2a613869",
+            "api_key": api_key,
             "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", # 关键：指向阿里服务器
             "max_tokens": 1500,
             "temperature": 0.1
@@ -24,7 +26,7 @@ config = {
         "provider": "openai",
         "config": {
             "model": "text-embedding-v2", # 注意：阿里向量模型建议用这个
-            "api_key": "sk-9d42be35fbba4ef8ab8d217c2a613869",
+            "api_key": api_key,
             "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
         }
     }

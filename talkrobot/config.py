@@ -4,73 +4,120 @@
 """
 import os
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 class Config:
     """全局配置类"""
     
     # 调试模式（运行时由命令行参数设置）
-    DEBUG = False
+    DEBUG = _env_bool("TALKROBOT_DEBUG", False)
     
     # 音频配置
-    SAMPLE_RATE = 16000
-    CHANNELS = 1
+    SAMPLE_RATE = _env_int("TALKROBOT_SAMPLE_RATE", 16000)
+    CHANNELS = _env_int("TALKROBOT_CHANNELS", 1)
     
     # 监听模式: "push"=按住Q键说话, "continuous"=持续监听
-    DEFAULT_LISTEN_MODE = "push"
+    DEFAULT_LISTEN_MODE = os.getenv("TALKROBOT_LISTEN_MODE", "push")
     
     # 持续监听模式 VAD 配置 (Silero VAD)
-    VAD_CHECK_INTERVAL = 0.5        # VAD 检测间隔（秒），每隔此时间检测一次语音
-    VAD_PRE_SPEECH_DURATION = 0.25   # 检测到说话时，向前补偿的音频时长（秒）
-    VAD_SILENCE_DURATION = 1      # 静默多少秒后判定说话结束
-    VAD_MIN_SPEECH_DURATION = 0.3    # 最短语音时长（秒），过短的丢弃
+    VAD_CHECK_INTERVAL = _env_float("TALKROBOT_VAD_CHECK_INTERVAL", 0.5)
+    VAD_PRE_SPEECH_DURATION = _env_float("TALKROBOT_VAD_PRE_SPEECH_DURATION", 0.25)
+    VAD_SILENCE_DURATION = _env_float("TALKROBOT_VAD_SILENCE_DURATION", 1)
+    VAD_MIN_SPEECH_DURATION = _env_float("TALKROBOT_VAD_MIN_SPEECH_DURATION", 0.3)
     
     # 音频过滤配置（ASR 前置检查）
-    AUDIO_MIN_DURATION = 0.3          # 最短音频时长（秒），低于此值不送 ASR
-    AUDIO_MIN_RMS = 0                 # 最低音量 (RMS)，低于此值视为静音
+    AUDIO_MIN_DURATION = _env_float("TALKROBOT_AUDIO_MIN_DURATION", 0.3)
+    AUDIO_MIN_RMS = _env_float("TALKROBOT_AUDIO_MIN_RMS", 0)
     
     # ASR 配置
-    ASR_MODEL = "iic/SenseVoiceSmall"
-    ASR_DEVICE = "cuda"  # 或 "cpu"
+    ASR_MODEL = os.getenv("TALKROBOT_ASR_MODEL", "iic/SenseVoiceSmall")
+    ASR_DEVICE = os.getenv("TALKROBOT_ASR_DEVICE", "cuda")  # 或 "cpu"
     
     # TTS 配置
-    TTS_PROVIDER = "easy_tts_server"  # 可选: kokoro / easy_tts_server
-    LANGUAGE = "zh"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
-    TTS_LANG_CODE = 'z'  # 中文
-    TTS_VOICE = 'zf_xiaoyi'
-    TTS_SPEED = 1.0
-    TTS_SAMPLE_RATE = 24000
+    TTS_PROVIDER = os.getenv("TALKROBOT_TTS_PROVIDER", "easy_tts_server")
+    LANGUAGE = os.getenv("TALKROBOT_LANGUAGE", "zh")
+    TTS_LANG_CODE = os.getenv("TALKROBOT_TTS_LANG_CODE", "z")
+    TTS_VOICE = os.getenv("TALKROBOT_TTS_VOICE", "zf_xiaoyi")
+    TTS_SPEED = _env_float("TALKROBOT_TTS_SPEED", 1.0)
+    TTS_SAMPLE_RATE = _env_int("TALKROBOT_TTS_SAMPLE_RATE", 24000)
     
     # LLM 配置
-    LLM_API_KEY = "api-key = "
-    LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    LLM_MODEL = "qwen-flash"#"qwen-plus"
+    LLM_API_KEY = os.getenv("TALKROBOT_LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
+    LLM_BASE_URL = os.getenv(
+        "TALKROBOT_LLM_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    LLM_MODEL = os.getenv("TALKROBOT_LLM_MODEL", "qwen-flash")
     
     # 表情服务器配置
-    EXPRESSION_SERVER_URL = "http://localhost:8001"
-    EXPRESSION_DEFAULT = "neutral"
-    EXPRESSION_ENABLED = True  # 是否启用表情功能
+    EXPRESSION_SERVER_URL = os.getenv("TALKROBOT_EXPRESSION_SERVER_URL", "http://localhost:8001")
+    EXPRESSION_DEFAULT = os.getenv("TALKROBOT_EXPRESSION_DEFAULT", "neutral")
+    EXPRESSION_ENABLED = _env_bool("TALKROBOT_EXPRESSION_ENABLED", True)
 
     # 人脸识别配置
-    FACE_ENABLED = False
-    FACE_CAMERA_INDEX = 0
-    FACE_POLL_INTERVAL = 0.03
-    FACE_USE_GPU = True
-    FACE_MODEL_NAME = "buffalo_s"
-    FACE_UNKNOWN_USER = "guest"
-    FACE_KNOWN_FACES_DIR = os.path.join(
-        os.path.dirname(__file__),
-        "modules",
-        "face_recognize",
-        "known_faces",
+    FACE_ENABLED = _env_bool("TALKROBOT_FACE_ENABLED", False)
+    FACE_CAMERA_INDEX = _env_int("TALKROBOT_FACE_CAMERA_INDEX", 0)
+    FACE_POLL_INTERVAL = _env_float("TALKROBOT_FACE_POLL_INTERVAL", 0.03)
+    FACE_USE_GPU = _env_bool("TALKROBOT_FACE_USE_GPU", True)
+    FACE_MODEL_NAME = os.getenv("TALKROBOT_FACE_MODEL_NAME", "buffalo_s")
+    FACE_UNKNOWN_USER = os.getenv("TALKROBOT_FACE_UNKNOWN_USER", "guest")
+    FACE_KNOWN_FACES_DIR = os.getenv(
+        "TALKROBOT_FACE_KNOWN_FACES_DIR",
+        os.path.join(
+            os.path.dirname(__file__),
+            "modules",
+            "face_recognize",
+            "known_faces",
+        ),
     )
 
     # Memory 基础数据库路径
-    MEMORY_DB_BASE_PATH = os.path.join(os.path.dirname(__file__), "mem_db")
+    MEMORY_DB_BASE_PATH = os.getenv(
+        "TALKROBOT_MEMORY_DB_BASE_PATH",
+        os.path.join(os.path.dirname(__file__), "mem_db"),
+    )
     
     # 默认用户
-    DEFAULT_USER = "default"
+    DEFAULT_USER = os.getenv("TALKROBOT_DEFAULT_USER", "default")
 
     # 人格配置文件路径
-    PERSONA_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "persona_profiles.json")
+    PERSONA_PROFILE_PATH = os.getenv(
+        "TALKROBOT_PERSONA_PROFILE_PATH",
+        os.path.join(os.path.dirname(__file__), "persona_profiles.json"),
+    )
 
     # 全局提示词：对所有用户生效，拼接在用户人格 prompt 后
     GLOBAL_SYSTEM_PROMPT = """请遵循以下原则：
@@ -85,10 +132,11 @@ class Config:
         Language policy: answer the user in English no matter what."""
 
     # 是否启用后台人格自动更新（LangGraph Agent）
-    ENABLE_PERSONA_AUTO_UPDATE = True
+    ENABLE_PERSONA_AUTO_UPDATE = _env_bool("TALKROBOT_ENABLE_PERSONA_AUTO_UPDATE", True)
+    PERSONA_SENTIMENT_THRESHOLD = _env_float("TALKROBOT_PERSONA_SENTIMENT_THRESHOLD", 0.82)
 
     # 滑动窗口记忆：大模型可见的最近对话轮数（0 表示关闭）
-    SLIDING_WINDOW_ROUNDS = 5
+    SLIDING_WINDOW_ROUNDS = _env_int("TALKROBOT_SLIDING_WINDOW_ROUNDS", 5)
     
     # 系统提示词
     SYSTEM_PROMPT = """你名叫Tyro,一个友好、乐于助人且高效的AI助手。请用简洁、自然的方式回答用户的问题,请尽量不要生成英文。

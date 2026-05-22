@@ -69,6 +69,15 @@ class TTSModule:
         self._interrupted = threading.Event()
         logger.info("TTS模块初始化完成")
 
+    @property
+    def is_interrupted(self) -> bool:
+        """当前播放是否已被请求打断。"""
+        return self._interrupted.is_set()
+
+    def interrupt(self) -> None:
+        """请求打断当前 TTS 播放。"""
+        self._interrupted.set()
+
     @staticmethod
     def _normalize_language(language: str) -> str:
         language = str(language).strip().lower()
@@ -108,7 +117,7 @@ class TTSModule:
     
     def stop(self):
         """打断当前TTS播放"""
-        self._interrupted.set()
+        self.interrupt()
         try:
             sd.stop()
         except Exception as e:

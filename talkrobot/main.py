@@ -5,232 +5,16 @@
 import sys
 import os
 import time
-import subprocess
-import atexit
 import argparse
-import re
-import threading
-from typing import Optional, Dict, Tuple
 from loguru import logger
 
 from talkrobot.config import Config
-from talkrobot.modules.memory.memory_module import MemoryModule
 from talkrobot.core.persona_manager import PersonaManager
+from talkrobot.core.expression_server_manager import ExpressionServerManager
+from talkrobot.core.face_identity_resolver import FaceIdentityResolver
+from talkrobot.core.memory_router import UserMemoryRouter
 
-# 全局变量：表情服务器子进程
-_expression_server_process = None
-
-os.environ['HF_HUB_OFFLINE'] = '1'
-
-
-class FaceIdentityResolver:
-    """根据当前摄像头识别人脸，解析当前交互对象。"""
-
-    _NON_TARGET_LABELS = {"", "无人脸", "识别中"}
-
-    def __init__(
-        self,
-        enabled: bool,
-        default_user: str,
-        camera_index: int,
-        poll_interval: float = Config.FACE_POLL_INTERVAL,
-    ):
-        self.enabled = False
-        self.default_user = default_user
-        self.camera_index = camera_index
-        self.unknown_user = Config.FACE_UNKNOWN_USER
-        self.poll_interval = max(0.0, float(poll_interval))
-        self._cap = None
-        self._module = None
-        self._on_user_change = None
-        self._state_lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._track_thread = None
-        self._current_user = self.unknown_user
-        self._current_is_familiar = False
-
-        if not enabled:
-            return
-
-        try:
-            import cv2
-            from talkrobot.modules.face_recognize.face_recognition import FaceRecognitionModule
-
-            self._module = FaceRecognitionModule(
-                known_faces_dir=Config.FACE_KNOWN_FACES_DIR,
-                model_name=Config.FACE_MODEL_NAME,
-                use_gpu=Config.FACE_USE_GPU,
-            )
-
-            self._cap = cv2.VideoCapture(camera_index)
-            if not self._cap.isOpened():
-                raise RuntimeError(f"无法打开摄像头: index={camera_index}")
-
-            self.enabled = True
-            logger.info(f"人脸识别已启用，摄像头 index={camera_index}")
-            self._track_thread = threading.Thread(target=self._tracking_loop, daemon=True)
-            self._track_thread.start()
-        except Exception as e:
-            logger.warning(f"人脸识别初始化失败，已回退普通模式: {e}")
-            self.shutdown()
-
-    @staticmethod
-    def _sanitize_user_name(name: str) -> str:
-        clean = re.sub(r"\s+", "_", name.strip())
-        clean = re.sub(r"[^0-9a-zA-Z_\-\u4e00-\u9fff]", "_", clean)
-        return clean or Config.DEFAULT_USER
-
-    def _detect_user_once(self) -> Tuple[str, bool]:
-        """执行单次人脸检测并返回 (用户, 是否熟人)。"""
-        if not self.enabled or self._cap is None or self._module is None:
-            return self.default_user, False
-
-        ok, frame = self._cap.read()
-        if not ok:
-            logger.debug("读取摄像头帧失败，回退陌生人用户")
-            return self.unknown_user, False
-
-        try:
-            result = self._module.process_frame(frame)
-            label = str(result.get("label", "")).strip()
-        except Exception as e:
-            logger.warning(f"人脸识别处理失败，回退陌生人用户: {e}")
-            return self.unknown_user, False
-
-        if label in self._NON_TARGET_LABELS:
-            return self.unknown_user, False
-        if label == "陌生人":
-            return self.unknown_user, False
-        return self._sanitize_user_name(label), True
-
-    def _tracking_loop(self) -> None:
-        """后台持续人脸追踪，检测到对象变化时触发回调。"""
-        while not self._stop_event.is_set():
-            user, is_familiar = self._detect_user_once()
-            changed = False
-            with self._state_lock:
-                if user != self._current_user:
-                    self._current_user = user
-                    self._current_is_familiar = is_familiar
-                    changed = True
-
-            if changed:
-                logger.info(f"人脸交互对象变化: {user}")
-                callback = self._on_user_change
-                if callback is not None:
-                    try:
-                        callback(user, is_familiar)
-                    except Exception as e:
-                        logger.warning(f"人脸用户切换回调异常: {e}")
-
-            self._stop_event.wait(self.poll_interval)
-
-    def set_on_user_change(self, callback) -> None:
-        """设置交互对象变化回调。"""
-        self._on_user_change = callback
-
-    def resolve_user(self) -> str:
-        """返回当前交互对象用户名。"""
-        if not self.enabled:
-            return self.default_user
-        with self._state_lock:
-            return self._current_user
-
-    def is_current_user_familiar(self) -> bool:
-        """返回当前交互对象是否熟人。"""
-        if not self.enabled:
-            return False
-        with self._state_lock:
-            return self._current_is_familiar
-
-    def shutdown(self) -> None:
-        self._stop_event.set()
-        if self._track_thread is not None and self._track_thread.is_alive():
-            self._track_thread.join(timeout=1.0)
-        if self._cap is not None:
-            try:
-                self._cap.release()
-            except Exception as e:
-                logger.warning(f"释放摄像头失败: {e}")
-        self._cap = None
-        self._module = None
-        self._track_thread = None
-        self.enabled = False
-
-
-class UserMemoryRouter:
-    """按用户动态提供记忆模块；无持久记忆时仅启用滑动窗口短期记忆。"""
-
-    def __init__(self):
-        self._cache: Dict[str, Tuple[Optional[MemoryModule], bool]] = {}
-
-    def get_memory_for_user(self, user: str) -> Tuple[Optional[MemoryModule], bool]:
-        user = (user or Config.DEFAULT_USER).strip()
-        if user in self._cache:
-            return self._cache[user]
-
-        has_persistent = Config.has_persistent_memory(user)
-        if not has_persistent:
-            logger.info(f"用户[{user}]不存在长期记忆，使用短期记忆模式")
-            self._cache[user] = (None, False)
-            return self._cache[user]
-
-        module = MemoryModule(
-            config=Config.get_memory_config(user),
-            user_id=Config.get_user_id(user)
-        )
-        self._cache[user] = (module, True)
-        logger.info(f"用户[{user}]已接入长期记忆")
-        return self._cache[user]
-
-    def shutdown(self) -> None:
-        for user, (module, _) in self._cache.items():
-            if module is None:
-                continue
-            try:
-                module.shutdown()
-            except Exception as e:
-                logger.warning(f"关闭用户[{user}]记忆模块异常: {e}")
-
-
-def _start_expression_server():
-    """自动启动表情服务器子进程"""
-    global _expression_server_process
-    script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "expression", "expression_server.py")
-    if not os.path.exists(script_path):
-        logger.warning(f"表情服务器脚本不存在: {script_path}")
-        return False
-    try:
-        logger.info(f"正在自动启动表情服务器: {script_path}")
-        # 继承环境变量（包括 DISPLAY）以确保 OpenCV 窗口能正常弹出
-        env = os.environ.copy()
-        _expression_server_process = subprocess.Popen(
-            [sys.executable, script_path],
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(__file__)),
-        )
-        atexit.register(_stop_expression_server)
-        # 等待服务器就绪
-        time.sleep(2)
-        logger.info(f"表情服务器已启动 (PID: {_expression_server_process.pid})")
-        return True
-    except Exception as e:
-        logger.error(f"启动表情服务器失败: {e}")
-        return False
-
-
-def _stop_expression_server():
-    """终止表情服务器子进程"""
-    global _expression_server_process
-    if _expression_server_process and _expression_server_process.poll() is None:
-        logger.info("正在关闭表情服务器...")
-        _expression_server_process.terminate()
-        try:
-            _expression_server_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _expression_server_process.kill()
-        logger.info("表情服务器已关闭")
-    _expression_server_process = None
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
 
 
 def _setup_logger():
@@ -261,6 +45,7 @@ def run_chat(args):
     tts_module = None
     audio_recorder = None
     conversation_manager = None
+    expression_server_manager = None
 
     try:
         _setup_logger()
@@ -307,8 +92,10 @@ def run_chat(args):
         expression_prompt = ""
         if Config.EXPRESSION_ENABLED:
             from talkrobot.modules.expression.expression_module import ExpressionModule
-            # 自动启动表情服务器
-            _start_expression_server()
+            expression_server_manager = ExpressionServerManager(
+                project_root=os.path.dirname(os.path.dirname(__file__))
+            )
+            expression_server_manager.start()
             expression_module = ExpressionModule(
                 server_url=Config.EXPRESSION_SERVER_URL,
                 default_expression=Config.EXPRESSION_DEFAULT
@@ -341,6 +128,7 @@ def run_chat(args):
             persona_update_agent = PersonaUpdateAgent(
                 llm_client=llm_module.client,
                 model=Config.LLM_MODEL,
+                sentiment_threshold=Config.PERSONA_SENTIMENT_THRESHOLD,
             )
 
         def _persona_provider(current_user: str) -> str:
@@ -375,7 +163,8 @@ def run_chat(args):
                     "人格更新handler耗时: "
                     f"user={current_user}, agent_call={agent_elapsed:.3f}s, "
                     f"agent_total={float(result.get('total_elapsed_s', 0.0) or 0.0):.3f}s, "
-                    f"graph={float(result.get('graph_elapsed_s', 0.0) or 0.0):.3f}s, "
+                    f"sentiment={float(result.get('sentiment_elapsed_s', 0.0) or 0.0):.3f}s, "
+                    f"reflection={float(result.get('reflection_elapsed_s', 0.0) or 0.0):.3f}s, "
                     f"decide={float(result.get('decide_elapsed_s', 0.0) or 0.0):.3f}s, "
                     f"propose={float(result.get('propose_elapsed_s', 0.0) or 0.0):.3f}s"
                 )
@@ -433,6 +222,8 @@ def run_chat(args):
                 logger.warning("人脸识别不可用，继续使用固定用户模式")
 
         if memory_provider is None:
+            from talkrobot.modules.memory.memory_module import MemoryModule
+
             memory_module = MemoryModule(
                 config=Config.get_memory_config(user),
                 user_id=Config.get_user_id(user)
@@ -587,11 +378,14 @@ def run_chat(args):
             except Exception as e:
                 logger.warning(f"关闭人脸识别异常: {e}")
 
-        _stop_expression_server()
+        if expression_server_manager is not None:
+            expression_server_manager.stop()
 
 
 def run_add_memory(args):
     """手动添加记忆"""
+    from talkrobot.modules.memory.memory_module import MemoryModule
+
     _setup_logger()
 
     user = args.user

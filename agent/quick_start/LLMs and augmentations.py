@@ -6,7 +6,7 @@ llm = init_chat_model(
     "qwen-turbo",
     model_provider="openai",
     openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    openai_api_key="sk-9d42be35fbba4ef8ab8d217c2a613869",
+    openai_api_key=os.getenv("TALKROBOT_LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY", ""),
     temperature=0
 )
 

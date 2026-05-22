@@ -38,7 +38,7 @@ talkrobot/
 ## 安装依赖
 
 ```bash
-pip install funasr kokoro easy_tts_server openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
+pip install -r requirements.txt
 ```
 
 ## 使用方法
@@ -125,17 +125,18 @@ python -m talkrobot.tests.test_memory
 
 ## 配置说明
 
-在 `config.py` 中修改以下配置:
+优先通过环境变量或 `.env` 配置。可复制 `.env.example` 为 `.env` 后填写 API Key：
 
-- `ASR_DEVICE`: ASR运行设备 (cuda/cpu)
+- `TALKROBOT_LLM_API_KEY` / `DASHSCOPE_API_KEY`: 阿里云 API 密钥
+- `TALKROBOT_ASR_DEVICE`: ASR运行设备 (cuda/cpu)
 - `TTS_VOICE`: TTS音色选择
 - `TTS_PROVIDER`: TTS后端选择 (`kokoro` / `easy_tts_server`)
 - `LANGUAGE`: 统一语言开关 (`zh` / `en`，同时作用于TTS和LLM)
-- `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
 - `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
 - `GLOBAL_SYSTEM_PROMPT`: 全局提示词（会拼接在用户人格 prompt 后）
 - `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
+- `TALKROBOT_PERSONA_SENTIMENT_THRESHOLD`: 人格更新前的情绪门控阈值（默认 `0.82`）
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）

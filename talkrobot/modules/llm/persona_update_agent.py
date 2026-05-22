@@ -1,6 +1,6 @@
 """
 人格更新 Agent
-并行判断是否更新人格 prompt，并生成候选 prompt
+先用本地情绪模型做门控，再用 LLM 反思是否更新人格 prompt。
 """
 import json
 import re
@@ -26,43 +26,108 @@ class PersonaUpdateState(TypedDict, total=False):
     candidate_reason: str
     decide_elapsed_s: float
     propose_elapsed_s: float
+    reflection_elapsed_s: float
+    sentiment_label: int
+    sentiment_negative: float
+    sentiment_positive: float
+
+
+class SentimentGate:
+    """Lazy local sentiment classifier used before expensive persona reflection."""
+
+    def __init__(
+        self,
+        model_name: str = "IDEA-CCNL/Erlangshen-Roberta-110M-Sentiment",
+        threshold: float = 0.82,
+    ):
+        self.model_name = model_name
+        self.threshold = float(threshold)
+        self._tokenizer = None
+        self._model = None
+        self._load_error = ""
+
+    @property
+    def load_error(self) -> str:
+        return self._load_error
+
+    def _ensure_loaded(self) -> bool:
+        if self._tokenizer is not None and self._model is not None:
+            return True
+        if self._load_error:
+            return False
+
+        try:
+            import torch
+            import torch.nn.functional as F  # noqa: F401
+            from transformers import BertForSequenceClassification, BertTokenizer
+
+            self._torch = torch
+            self._softmax = F.softmax
+            self._tokenizer = BertTokenizer.from_pretrained(self.model_name)
+            self._model = BertForSequenceClassification.from_pretrained(self.model_name)
+            self._model.eval()
+            logger.info(f"情绪门控模型已加载: {self.model_name}")
+            return True
+        except Exception as e:
+            self._load_error = str(e)
+            logger.warning(f"情绪门控模型加载失败，跳过人格自动更新: {e}")
+            return False
+
+    def score(self, text: str) -> Dict[str, Any]:
+        if not self._ensure_loaded():
+            return {
+                "should_reflect": False,
+                "reason": "sentiment_model_unavailable",
+                "load_error": self._load_error,
+            }
+
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return {"should_reflect": False, "reason": "empty_input"}
+
+        try:
+            encoded = self._tokenizer.encode(
+                clean_text,
+                truncation=True,
+                max_length=256,
+            )
+            with self._torch.no_grad():
+                output = self._model(self._torch.tensor([encoded]))
+                probs = self._softmax(output.logits, dim=1)[0]
+            negative = float(probs[0].item())
+            positive = float(probs[1].item())
+            label = 1 if positive >= negative else 0
+            should_reflect = max(negative, positive) >= self.threshold
+            return {
+                "should_reflect": should_reflect,
+                "label": label,
+                "negative": negative,
+                "positive": positive,
+                "threshold": self.threshold,
+                "reason": "above_threshold" if should_reflect else "below_threshold",
+            }
+        except Exception as e:
+            logger.warning(f"情绪门控推理失败，跳过人格自动更新: {e}")
+            return {"should_reflect": False, "reason": "sentiment_infer_error"}
 
 
 class PersonaUpdateAgent:
-    """基于 LangGraph 的人格更新 Agent。"""
+    """人格更新 Agent。"""
 
-    def __init__(self, llm_client, model: str, cooldown_seconds: float = 20.0, min_confidence: float = 0.65):
+    def __init__(
+        self,
+        llm_client,
+        model: str,
+        cooldown_seconds: float = 20.0,
+        min_confidence: float = 0.65,
+        sentiment_threshold: float = 0.82,
+    ):
         self.client = llm_client
         self.model = model
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self.min_confidence = float(min_confidence)
+        self.sentiment_gate = SentimentGate(threshold=sentiment_threshold)
         self._last_update_ts_by_user: Dict[str, float] = {}
-        self._graph = None
-        self._langgraph_available = False
-        self._build_graph_if_available()
-
-    def _build_graph_if_available(self) -> None:
-        try:
-            from langgraph.graph import StateGraph, START, END
-        except Exception as e:
-            logger.warning(f"LangGraph 不可用，跳过人格更新 Agent: {e}")
-            self._langgraph_available = False
-            return
-
-        graph = StateGraph(PersonaUpdateState)
-        graph.add_node("decide_update", self._node_decide_update)
-        graph.add_node("propose_prompt", self._node_propose_prompt)
-        graph.add_node("merge", self._node_merge)
-
-        graph.add_edge(START, "decide_update")
-        graph.add_edge(START, "propose_prompt")
-        graph.add_edge("decide_update", "merge")
-        graph.add_edge("propose_prompt", "merge")
-        graph.add_edge("merge", END)
-
-        self._graph = graph.compile()
-        self._langgraph_available = True
-        logger.info("PersonaUpdateAgent 已启用 LangGraph 并行节点")
 
     @staticmethod
     def _extract_json(text: str) -> Dict[str, Any]:
@@ -101,81 +166,45 @@ class PersonaUpdateAgent:
         content = completion.choices[0].message.content or ""
         return self._extract_json(content)
 
-    def _node_decide_update(self, state: PersonaUpdateState) -> PersonaUpdateState:
+    def _reflect_update(self, state: PersonaUpdateState) -> PersonaUpdateState:
         start = time.perf_counter()
         system_prompt = (
-            "你是一个严格的 JSON 决策器。"
+            "你是一个严格的人格更新反思器。"
             "请仅输出 JSON，不要输出其它文本。"
         )
         user_prompt = (
-            "你作为一个对话机器人"
-            "请判断用户输入是否明确提出了‘改变你说话风格/人格/语气/行为规则’的请求。\n"
+            "请判断用户输入是否明确提出了‘改变你说话风格/人格/语气/行为规则’的请求，"
+            "并在确实需要更新时生成新人格 system_prompt。\n"
             "若只是普通问答、闲聊、任务请求，need_update 应为 false。\n"
+            "若需要更新，candidate_prompt 要中文、简洁、不超过220字，"
+            "不包含模型供应商、API、密钥、系统路径等信息。"
+            "如果用户输入的内容和当前人格的部分特质矛盾，删掉矛盾的特质并按用户的新需求生成。\n"
             "输出格式："
-            "{\"need_update\": boolean, \"confidence\": number, \"reason\": string}\n"
+            "{\"need_update\": boolean, \"confidence\": number, "
+            "\"candidate_prompt\": string, \"reason\": string}\n"
             f"用户输入: {state.get('user_input', '')}\n"
             f"当前人格 prompt: {state.get('current_prompt', '')}"
         )
 
         try:
             data = self._invoke_json_task(system_prompt, user_prompt)
-            print(f"decide_update data: {data}")
         except Exception as e:
-            logger.warning(f"decide_update 调用失败: {e}")
+            logger.warning(f"人格更新反思调用失败: {e}")
             return {
                 "need_update": False,
                 "confidence": 0.0,
                 "decision_reason": "llm_error",
-                "decide_elapsed_s": time.perf_counter() - start,
+                "candidate_prompt": "",
+                "reflection_elapsed_s": time.perf_counter() - start,
             }
 
         return {
             "need_update": bool(data.get("need_update", False)),
             "confidence": float(data.get("confidence", 0.0) or 0.0),
-            "decision_reason": str(data.get("reason", "") or "").strip(),
-            "decide_elapsed_s": time.perf_counter() - start,
-        }
-
-    def _node_propose_prompt(self, state: PersonaUpdateState) -> PersonaUpdateState:
-        start = time.perf_counter()
-        system_prompt = (
-            "你是一个人格 prompt 生成器。"
-            "请仅输出 JSON，不要输出其它文本。"
-        )
-        context = state.get("context", "")
-        if len(context) > 1200:
-            context = context[:1200]
-
-        user_prompt = (
-            "请基于用户输入，生成一个可能的新人格 system_prompt。\n"
-            "要求：中文，简洁，不超过220字，不包含模型供应商、API、密钥、系统路径等信息。\n"
-            "如果用户输入的内容和当前人格的部分特质矛盾，删掉矛盾的特质并按用户的新需求生成，形成新的 prompt；"
-            "输出格式："
-            "{\"candidate_prompt\": string, \"reason\": string}\n"
-            f"当前人格 prompt: {state.get('current_prompt', '')}\n"
-            f"用户输入: {state.get('user_input', '')}\n"
-            #f"辅助上下文: {context}"
-        )
-
-        try:
-            data = self._invoke_json_task(system_prompt, user_prompt)
-            print(f"propose_prompt data: {data}")
-        except Exception as e:
-            logger.warning(f"propose_prompt 调用失败: {e}")
-            return {
-                "candidate_prompt": "",
-                "candidate_reason": "llm_error",
-                "propose_elapsed_s": time.perf_counter() - start,
-            }
-
-        return {
             "candidate_prompt": str(data.get("candidate_prompt", "") or "").strip(),
-            "candidate_reason": str(data.get("reason", "") or "").strip(),
-            "propose_elapsed_s": time.perf_counter() - start,
+            "decision_reason": str(data.get("reason", "") or "").strip(),
+            "reflection_elapsed_s": time.perf_counter() - start,
         }
-
-    def _node_merge(self, state: PersonaUpdateState) -> PersonaUpdateState:
-        return state
 
     @staticmethod
     def _sanitize_prompt(prompt: str) -> str:
@@ -194,9 +223,6 @@ class PersonaUpdateAgent:
             payload["total_elapsed_s"] = time.perf_counter() - total_start
             return payload
 
-        if not self._langgraph_available or self._graph is None:
-            return _with_timing({"should_update": False, "reason": "langgraph_unavailable"})
-
         user_key = (user or "").strip()
         now = time.time()
         last_ts = self._last_update_ts_by_user.get(user_key)
@@ -211,25 +237,36 @@ class PersonaUpdateAgent:
         if not state["user_input"]:
             return _with_timing({"should_update": False, "reason": "empty_input"})
 
-        graph_start = time.perf_counter()
-        try:
-            result = self._graph.invoke(state)
-        except Exception as e:
-            logger.warning(f"人格更新 Agent 执行失败: {e}")
-            return _with_timing({"should_update": False, "reason": "graph_error"})
-        graph_elapsed = time.perf_counter() - graph_start
+        sentiment_start = time.perf_counter()
+        sentiment = self.sentiment_gate.score(state["user_input"])
+        sentiment_elapsed = time.perf_counter() - sentiment_start
+        if not sentiment.get("should_reflect", False):
+            return _with_timing(
+                {
+                    "should_update": False,
+                    "reason": sentiment.get("reason", "sentiment_gate_skip"),
+                    "sentiment_elapsed_s": sentiment_elapsed,
+                    "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                    "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                    "sentiment_label": int(sentiment.get("label", -1)),
+                }
+            )
 
-        need_update = bool(result.get("need_update", False))
-        confidence = float(result.get("confidence", 0.0) or 0.0)
-        candidate_prompt = self._sanitize_prompt(str(result.get("candidate_prompt", "") or ""))
-        decision_reason = str(result.get("decision_reason", "") or "").strip()
-        decide_elapsed_s = float(result.get("decide_elapsed_s", 0.0) or 0.0)
-        propose_elapsed_s = float(result.get("propose_elapsed_s", 0.0) or 0.0)
+        reflection_start = time.perf_counter()
+        reflection = self._reflect_update(state)
+        reflection_elapsed = time.perf_counter() - reflection_start
+        need_update = bool(reflection.get("need_update", False))
+        confidence = float(reflection.get("confidence", 0.0) or 0.0)
+        decision_reason = str(reflection.get("decision_reason", "") or "").strip()
+        candidate_prompt = self._sanitize_prompt(str(reflection.get("candidate_prompt", "") or ""))
+        decide_elapsed_s = reflection_elapsed
+        propose_elapsed_s = 0.0
 
         logger.debug(
             "人格更新Agent耗时: "
-            f"user={user_key}, graph={graph_elapsed:.3f}s, "
-            f"decide={decide_elapsed_s:.3f}s, propose={propose_elapsed_s:.3f}s"
+            f"user={user_key}, sentiment={sentiment_elapsed:.3f}s, "
+            f"reflection={reflection_elapsed:.3f}s, decide={decide_elapsed_s:.3f}s, "
+            f"propose={propose_elapsed_s:.3f}s"
         )
 
         if not need_update:
@@ -239,8 +276,12 @@ class PersonaUpdateAgent:
                     "reason": f"need_update_false:{decision_reason}",
                     "decide_elapsed_s": decide_elapsed_s,
                     "propose_elapsed_s": propose_elapsed_s,
+                    "reflection_elapsed_s": reflection_elapsed,
+                    "sentiment_elapsed_s": sentiment_elapsed,
+                    "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                    "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                    "sentiment_label": int(sentiment.get("label", -1)),
                 },
-                graph_elapsed,
             )
         if confidence < self.min_confidence:
             return _with_timing(
@@ -249,8 +290,12 @@ class PersonaUpdateAgent:
                     "reason": f"low_confidence:{confidence:.2f}",
                     "decide_elapsed_s": decide_elapsed_s,
                     "propose_elapsed_s": propose_elapsed_s,
+                    "reflection_elapsed_s": reflection_elapsed,
+                    "sentiment_elapsed_s": sentiment_elapsed,
+                    "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                    "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                    "sentiment_label": int(sentiment.get("label", -1)),
                 },
-                graph_elapsed,
             )
         if not candidate_prompt:
             return _with_timing(
@@ -259,8 +304,12 @@ class PersonaUpdateAgent:
                     "reason": "empty_candidate_prompt",
                     "decide_elapsed_s": decide_elapsed_s,
                     "propose_elapsed_s": propose_elapsed_s,
+                    "reflection_elapsed_s": reflection_elapsed,
+                    "sentiment_elapsed_s": sentiment_elapsed,
+                    "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                    "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                    "sentiment_label": int(sentiment.get("label", -1)),
                 },
-                graph_elapsed,
             )
         if candidate_prompt == (current_prompt or "").strip():
             return _with_timing(
@@ -269,8 +318,12 @@ class PersonaUpdateAgent:
                     "reason": "unchanged",
                     "decide_elapsed_s": decide_elapsed_s,
                     "propose_elapsed_s": propose_elapsed_s,
+                    "reflection_elapsed_s": reflection_elapsed,
+                    "sentiment_elapsed_s": sentiment_elapsed,
+                    "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                    "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                    "sentiment_label": int(sentiment.get("label", -1)),
                 },
-                graph_elapsed,
             )
 
         self._last_update_ts_by_user[user_key] = now
@@ -280,9 +333,13 @@ class PersonaUpdateAgent:
                 "updated_prompt": candidate_prompt,
                 "confidence": confidence,
                 "decision_reason": decision_reason,
-                "candidate_reason": str(result.get("candidate_reason", "") or "").strip(),
+                "candidate_reason": decision_reason,
                 "decide_elapsed_s": decide_elapsed_s,
                 "propose_elapsed_s": propose_elapsed_s,
+                "reflection_elapsed_s": reflection_elapsed,
+                "sentiment_elapsed_s": sentiment_elapsed,
+                "sentiment_positive": float(sentiment.get("positive", 0.0) or 0.0),
+                "sentiment_negative": float(sentiment.get("negative", 0.0) or 0.0),
+                "sentiment_label": int(sentiment.get("label", -1)),
             },
-            graph_elapsed,
         )

@@ -38,6 +38,8 @@ talkrobot/
 
 ```bash
 pip install funasr kokoro openai mem0 sounddevice pynput loguru numpy soundfile silero-vad
+# 或安装项目依赖清单
+pip install -r requirements.txt
 ```
 
 ## 使用方法
@@ -103,12 +105,13 @@ python -m talkrobot.tests.test_memory
 
 ## 配置说明
 
-在 `config.py` 中修改以下配置:
+优先通过环境变量或 `.env` 配置。可复制 `.env.example` 为 `.env` 后填写 API Key：
 
-- `ASR_DEVICE`: ASR运行设备 (cuda/cpu)
+- `TALKROBOT_LLM_API_KEY` / `DASHSCOPE_API_KEY`: 阿里云 API 密钥
+- `TALKROBOT_ASR_DEVICE`: ASR运行设备 (cuda/cpu)
 - `TTS_VOICE`: TTS音色选择
-- `LLM_API_KEY`: 阿里云API密钥
 - `SYSTEM_PROMPT`: 机器人人设
+- `TALKROBOT_PERSONA_SENTIMENT_THRESHOLD`: 人格更新前的情绪门控阈值（默认 `0.82`）
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
