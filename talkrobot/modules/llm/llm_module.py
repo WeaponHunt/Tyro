@@ -7,6 +7,9 @@ from typing import Iterator, List, Dict
 from openai import OpenAI
 from loguru import logger
 
+from talkrobot.core.proxy_env import drop_unsupported_proxy_env
+
+
 class LLMModule:
     """大语言模型模块"""
     
@@ -31,6 +34,7 @@ class LLMModule:
             language: 输出语言（zh/en）
         """
         logger.info(f"正在初始化LLM模块: model={model}")
+        drop_unsupported_proxy_env(prefix="LLMModule")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.system_prompt = system_prompt + expression_prompt

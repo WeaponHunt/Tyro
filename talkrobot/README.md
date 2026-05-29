@@ -305,6 +305,36 @@ tools:
 
 当用户输入命中 `triggers` 或 planner 计划使用对应工具时，Agent 会把 Skill 说明注入上下文。若命中的 Skill 在 `tools` 中声明了可规划工具，planner 也会尝试通过该工具的 `plan_from_skill()` 生成调用步骤。
 
+### Agent CLI
+
+Agent 可直接通过命令行使用：
+
+```bash
+python -m talkrobot.agent_cli ask "帮我 review 当前改动"
+python -m talkrobot.agent_cli chat
+python -m talkrobot.agent_cli tools
+python -m talkrobot.agent_cli skills
+python -m talkrobot.agent_cli mcp
+```
+
+安装 editable package 后可使用：
+
+```bash
+pip install -e .
+tyro-agent ask "读取这个网页并总结：https://example.com"
+```
+
+常用调试参数：
+
+```bash
+--planner llm|rule
+--show-events
+--json
+--memory-provider none|simple|mem0
+```
+
+详细说明见 `talkrobot/docs/AGENT_CLI.md`。
+
 ## 开发说明
 
 每个模块都是独立的,可以单独测试和改进:

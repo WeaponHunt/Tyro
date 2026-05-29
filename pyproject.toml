@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tyro-talkrobot"
+version = "0.1.0"
+description = "Tyro TalkRobot assistant and agent runtime"
+requires-python = ">=3.10"
+
+[project.scripts]
+tyro-agent = "talkrobot.agent_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["talkrobot*"]
+
+[tool.setuptools.package-data]
+talkrobot = [
+  "agent/mcp_servers.json",
+  "agent/mcp_servers.example.json",
+  "agent/skills/*/SKILL.md",
+  "docs/*.md",
+  "web/static/*",
+  "persona_profiles.json",
+]

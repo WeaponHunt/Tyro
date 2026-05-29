@@ -5,6 +5,7 @@
 ## 入口
 
 - `talkrobot/main.py`: 命令行入口，负责初始化 ASR、TTS、LLM、Memory、Expression、Face、ConversationManager，并提供 `chat` 与 `add-memory` 子命令。
+- `talkrobot/agent_cli.py`: Agent 专用命令行入口，提供 `ask`、`chat`、`tools`、`skills`、`mcp`，便于调试 ReAct、MCP 和 Skill。
 - `talkrobot/web_app.py`: FastAPI Web 入口，复用 LLM、Memory、Persona、AgentRuntime，提供文本聊天、记忆管理和静态页面服务。
 - `talkrobot/config.py`: 全局配置与环境变量读取，集中管理模型、音频、TTS、LLM、记忆、人脸识别、人格和日志配置。
 

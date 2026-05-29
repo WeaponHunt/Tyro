@@ -46,6 +46,21 @@ class SkillOnlyProvider(ToolProvider):
         return {"skill_only_tool": SkillOnlyTool()}
 
 
+class StrictArgTool(BaseTool):
+    name = "strict_arg_tool"
+    description = "Accepts only one named argument."
+    speakable_start = "strict"
+    context_label = "Strict Tool Result"
+
+    def run(self, query: str) -> ToolResult:
+        return ToolResult(ok=True, content=f"strict: {query}")
+
+
+class StrictArgProvider(ToolProvider):
+    def build_tools(self, context):
+        return {"strict_arg_tool": StrictArgTool()}
+
+
 class UnstableTool(BaseTool):
     name = "unstable_tool"
     description = "Fails with a retryable error for ReAct tests."
@@ -80,6 +95,20 @@ class PlannerLLM:
                 '{"mode":"tool_assisted","reason":"needs arithmetic",'
                 '"steps":[{"tool":"calculator","args":{"expression":"2+3"},"reason":"calculate"}]}'
             )
+        return "ok"
+
+
+class ExtraArgPlannerLLM:
+    def __init__(self):
+        self.context = ""
+
+    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
+        if "tool planner" in system_prompt_override.lower():
+            return (
+                '{"mode":"tool_assisted","reason":"extra arg regression",'
+                '"steps":[{"tool":"strict_arg_tool","args":{"query":"weather","max_chars":2048},"reason":"call tool"}]}'
+            )
+        self.context = context
         return "ok"
 
 
@@ -132,6 +161,23 @@ def test_runtime_reacts_after_retryable_tool_failure(tmp_path):
     assert "failed" in llm.context
     assert "temporary bad arguments" in llm.context
     assert "echoed: fallback" in llm.context
+
+
+def test_runtime_ignores_extra_planner_args_instead_of_crashing(tmp_path):
+    llm = ExtraArgPlannerLLM()
+    runtime = AgentRuntime(
+        project_root=str(tmp_path),
+        tool_registry=ToolRegistry([StrictArgProvider()]),
+        planner_provider="llm",
+    )
+
+    events = list(runtime.run_stream("check weather", llm))
+    final = events[-1]
+
+    assert final.type == "final_response"
+    assert final.data["used_tools"] == ["strict_arg_tool"]
+    assert final.data["observations"][0]["ok"] is True
+    assert "strict: weather" in llm.context
 
 
 def test_runtime_uses_registered_tool_and_skill(tmp_path):

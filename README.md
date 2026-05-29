@@ -77,7 +77,33 @@ python -m talkrobot.main --user ljc --streaming
 python -m talkrobot.main --user ljc --history-rounds 5
 ```
 
-### 2. 手动添加记忆
+### 2. 启动 Agent CLI
+
+Agent CLI 只启动文本 agent，不依赖 ASR、TTS 或 Web UI，适合调试 ReAct、tool、skill 和 MCP：
+
+```bash
+# 单轮提问
+python -m talkrobot.agent_cli ask "帮我 review 当前改动" --show-events
+
+# 多轮交互
+python -m talkrobot.agent_cli chat --history-rounds 5
+
+# 查看当前可用 tool / skill / MCP tool
+python -m talkrobot.agent_cli tools
+python -m talkrobot.agent_cli skills
+python -m talkrobot.agent_cli mcp
+```
+
+安装为 editable package 后可使用命令：
+
+```bash
+python -m pip install -e .
+tyro-agent ask "当前仓库状态怎么样"
+```
+
+更多说明见 `talkrobot/docs/AGENT_CLI.md`。
+
+### 3. 手动添加记忆
 
 ```bash
 # 单条添加
@@ -87,7 +113,7 @@ python -m talkrobot.main add-memory --user ljc --content "我喜欢吃苹果"
 python -m talkrobot.main add-memory --user ljc
 ```
 
-### 3. 测试单个模块
+### 4. 测试单个模块
 
 ```bash
 # 测试ASR

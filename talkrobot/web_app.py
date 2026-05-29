@@ -35,6 +35,7 @@ from talkrobot.core.app_logging import configure_logging
 from talkrobot.core.dialogue_history import SlidingWindowDialogueHistory
 from talkrobot.core.interaction_log import log_interaction
 from talkrobot.core.persona_manager import PersonaManager
+from talkrobot.core.proxy_env import drop_unsupported_proxy_env
 
 
 WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
@@ -52,37 +53,8 @@ AVAILABLE_EXPRESSIONS = [
     "nauty_smile",
     "pitying",
 ]
-PROXY_ENV_NAMES = (
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-)
-UNSUPPORTED_PROXY_SCHEMES = ("socks://", "socks4://", "socks5://")
-
-
 configure_logging(debug=Config.DEBUG)
-
-
-def _drop_unsupported_proxy_env() -> None:
-    """Avoid httpx/OpenAI failures when socks proxy support is not installed."""
-    removed = []
-    for name in PROXY_ENV_NAMES:
-        value = (os.environ.get(name) or "").strip()
-        if value.lower().startswith(UNSUPPORTED_PROXY_SCHEMES):
-            os.environ.pop(name, None)
-            removed.append(name)
-
-    if removed:
-        logger.warning(
-            "Web UI 已忽略不受当前 httpx 环境支持的 socks 代理变量: "
-            + ", ".join(removed)
-        )
-
-
-_drop_unsupported_proxy_env()
+drop_unsupported_proxy_env(prefix="Web UI")
 
 
 class ChatRequest(BaseModel):

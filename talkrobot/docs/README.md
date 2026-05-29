@@ -21,6 +21,11 @@
   - Python 构造接口
   - 当前实验 MCP tools
 
+- **[Agent CLI](AGENT_CLI.md)** - 命令行使用 Agent
+  - `ask` / `chat` / `tools` / `skills` / `mcp`
+  - ReAct 事件调试
+  - JSON 输出
+
 - **[ASR Module](ASR_MODULE.md)** - 语音识别模块完整文档
   - 接口说明
   - 使用示例
@@ -70,6 +75,7 @@ talkrobot/docs/
 ├── CODE_STRUCTURE.md   # 代码结构说明
 ├── MEMORY_ARCHITECTURE.md # Memory 架构说明
 ├── MCP_INTEGRATION.md  # MCP 接入说明
+├── AGENT_CLI.md        # Agent CLI 说明
 ├── ASR_MODULE.md       # ASR 模块文档
 ├── AUDIO_RECORDER.md   # AudioRecorder 模块文档
 └── TESTING.md          # 测试指南

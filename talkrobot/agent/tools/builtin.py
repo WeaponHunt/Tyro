@@ -289,13 +289,17 @@ class WebFetchTool(BaseTool):
     def __init__(self, max_chars: int = 6000):
         self.max_chars = max(1000, int(max_chars))
 
-    def run(self, url: str) -> ToolResult:
+    def run(self, url: str, max_chars: Optional[int] = None) -> ToolResult:
         url = (url or "").strip()
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return ToolResult(ok=False, error="only http/https urls are supported")
 
         try:
+            limit = self.max_chars
+            if max_chars is not None:
+                limit = max(1000, min(int(max_chars), 20000))
+
             import requests
 
             response = requests.get(url, timeout=8)
@@ -307,8 +311,8 @@ class WebFetchTool(BaseTool):
                 parser.feed(text)
                 text = "\n".join(parser.parts)
             text = text.strip()
-            if len(text) > self.max_chars:
-                text = text[: self.max_chars].rstrip() + "\n..."
+            if len(text) > limit:
+                text = text[:limit].rstrip() + "\n..."
             return ToolResult(ok=True, content=text, data={"url": url, "content_type": content_type})
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))

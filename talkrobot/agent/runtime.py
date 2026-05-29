@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import os
 import json
+import inspect
 import time
 from typing import Iterable, Iterator, Optional
 
 from talkrobot.agent.events import AgentEvent
 from talkrobot.agent.planner import AgentPlanner
 from talkrobot.agent.skills import SkillRegistry
-from talkrobot.agent.tools import RuntimeToolContext, ToolRegistry
+from talkrobot.agent.tools import RuntimeToolContext, ToolRegistry, ToolResult
 from talkrobot.config import Config
 
 
@@ -160,7 +161,7 @@ class AgentRuntime:
                     data={"tool": step.tool, "reason": step.reason, "iteration": iteration},
                 )
                 started = time.perf_counter()
-                result = tool.run(**step.args)
+                result = self._run_tool(tool, step.args)
                 elapsed_ms = round((time.perf_counter() - started) * 1000)
                 retryable = (not result.ok) and self._is_retryable_tool_error(result.error)
                 any_retryable_failure = any_retryable_failure or retryable
@@ -303,6 +304,33 @@ class AgentRuntime:
             sort_keys=True,
             default=str,
         )
+
+    def _run_tool(self, tool, args) -> ToolResult:
+        try:
+            safe_args = self._filter_tool_args(tool.run, args or {})
+            return tool.run(**safe_args)
+        except Exception as exc:
+            return ToolResult(ok=False, error=f"{exc.__class__.__name__}: {exc}")
+
+    @staticmethod
+    def _filter_tool_args(run_callable, args) -> dict:
+        if not isinstance(args, dict):
+            return {}
+        try:
+            signature = inspect.signature(run_callable)
+        except (TypeError, ValueError):
+            return dict(args)
+
+        parameters = signature.parameters.values()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+            return dict(args)
+
+        allowed = {
+            name
+            for name, param in signature.parameters.items()
+            if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        return {key: value for key, value in args.items() if key in allowed}
 
     @staticmethod
     def _is_retryable_tool_error(error: str) -> bool:
