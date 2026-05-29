@@ -3,6 +3,7 @@
 集中管理所有组件的配置参数
 """
 import os
+import re
 
 try:
     from dotenv import load_dotenv
@@ -81,6 +82,10 @@ class Config:
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     LLM_MODEL = os.getenv("TALKROBOT_LLM_MODEL", "qwen-flash")
+
+    # Agent planner: "llm" uses the chat model to choose tools; "rule" uses deterministic heuristics.
+    AGENT_PLANNER_PROVIDER = os.getenv("TALKROBOT_AGENT_PLANNER", "llm").strip().lower()
+    AGENT_REACT_MAX_ITERATIONS = _env_int("TALKROBOT_AGENT_REACT_MAX_ITERATIONS", 4)
     
     # 表情服务器配置
     EXPRESSION_SERVER_URL = os.getenv("TALKROBOT_EXPRESSION_SERVER_URL", "http://localhost:8001")
@@ -105,9 +110,14 @@ class Config:
     )
 
     # Memory 基础数据库路径
+    MEMORY_PROVIDER = os.getenv("TALKROBOT_MEMORY_PROVIDER", "mem0").strip().lower()
     MEMORY_DB_BASE_PATH = os.getenv(
         "TALKROBOT_MEMORY_DB_BASE_PATH",
         os.path.join(os.path.dirname(__file__), "mem_db"),
+    )
+    SIMPLE_MEMORY_DB_PATH = os.getenv(
+        "TALKROBOT_SIMPLE_MEMORY_DB_PATH",
+        os.path.join(MEMORY_DB_BASE_PATH, "simple"),
     )
     
     # 默认用户
@@ -165,8 +175,17 @@ class Config:
         return os.path.join(cls.MEMORY_DB_BASE_PATH, user)
 
     @classmethod
+    def get_simple_memory_path(cls) -> str:
+        """本地 JSON memory backend 的存储目录。"""
+        return cls.SIMPLE_MEMORY_DB_PATH
+
+    @classmethod
     def has_persistent_memory(cls, user: str) -> bool:
         """判断用户是否已有持久化记忆数据。"""
+        if cls.MEMORY_PROVIDER in {"simple", "json", "local"}:
+            safe_user_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", cls.get_user_id(user))
+            return os.path.isfile(os.path.join(cls.get_simple_memory_path(), f"{safe_user_id}.json"))
+
         db_path = cls.get_memory_db_path(user)
         if not os.path.isdir(db_path):
             return False

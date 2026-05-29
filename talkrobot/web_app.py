@@ -31,7 +31,9 @@ from pydantic import BaseModel, Field
 
 from talkrobot.agent import AgentRuntime
 from talkrobot.config import Config
+from talkrobot.core.app_logging import configure_logging
 from talkrobot.core.dialogue_history import SlidingWindowDialogueHistory
+from talkrobot.core.interaction_log import log_interaction
 from talkrobot.core.persona_manager import PersonaManager
 
 
@@ -59,6 +61,9 @@ PROXY_ENV_NAMES = (
     "all_proxy",
 )
 UNSUPPORTED_PROXY_SCHEMES = ("socks://", "socks4://", "socks5://")
+
+
+configure_logging(debug=Config.DEBUG)
 
 
 def _drop_unsupported_proxy_env() -> None:
@@ -109,15 +114,6 @@ def _selected_prompts(language: str) -> Tuple[str, str]:
     if _normalize_language(language) == "en":
         return Config.SYSTEM_PROMPT_EN, Config.GLOBAL_SYSTEM_PROMPT_EN
     return Config.SYSTEM_PROMPT, Config.GLOBAL_SYSTEM_PROMPT
-
-
-def _merge_context(memory_context: str, history_context: str) -> str:
-    sections = []
-    if memory_context:
-        sections.append(f"检索到的相关记忆:\n{memory_context}")
-    if history_context:
-        sections.append(history_context)
-    return "\n\n".join(sections)
 
 
 def _normalize_memories(raw: Any) -> List[Dict[str, str]]:
@@ -235,7 +231,7 @@ class WebChatSession:
             sections.append(self._expression_prompt.strip())
         return "\n\n".join(sections)
 
-    def _generate_response(self, message: str, context: str, system_prompt_override: str = "") -> str:
+    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
         system_prompt = (system_prompt_override or "").strip() or self._persona_prompt() or self._system_prompt
         messages = [{"role": "system", "content": system_prompt}]
         if context:
@@ -249,7 +245,7 @@ class WebChatSession:
                     ),
                 }
             )
-        messages.append({"role": "user", "content": message})
+        messages.append({"role": "user", "content": user_input})
 
         try:
             completion = self._llm_client.chat.completions.create(
@@ -263,9 +259,6 @@ class WebChatSession:
                 return "Sorry, I can't answer your question right now."
             return "抱歉，我现在无法回答您的问题。"
 
-    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
-        return self._generate_response(user_input, context, system_prompt_override)
-
     def chat(self, message: str) -> Dict[str, Any]:
         message = message.strip()
         if not message:
@@ -278,6 +271,10 @@ class WebChatSession:
             agent_context = ""
             used_memory = False
             used_tools = []
+            used_skills = []
+            tool_results = []
+            final_event_data: Dict[str, Any] = {}
+            persona_prompt = self._persona_prompt()
 
             for event in self._agent_runtime.run_stream(
                 user_text=message,
@@ -285,14 +282,17 @@ class WebChatSession:
                 memory_module=self._memory,
                 long_term_memory=self._memory is not None,
                 sliding_window_context=history_context,
-                system_prompt_override=self._persona_prompt(),
+                system_prompt_override=persona_prompt,
                 streaming=False,
             ):
                 if event.type == "final_response":
                     raw_response = event.text
-                    agent_context = event.data.get("context", "")
-                    used_memory = bool(event.data.get("used_memory", False))
-                    used_tools = event.data.get("used_tools", [])
+                    final_event_data = event.data or {}
+                    agent_context = final_event_data.get("context", "")
+                    used_memory = bool(final_event_data.get("used_memory", False))
+                    used_tools = final_event_data.get("used_tools", [])
+                    used_skills = final_event_data.get("used_skills", [])
+                    tool_results = final_event_data.get("tool_results", [])
                 elif event.type == "error":
                     logger.warning(f"Web Agent事件错误: {event.data}")
 
@@ -300,14 +300,20 @@ class WebChatSession:
             response = response.strip() or raw_response.strip()
 
             self._history.append(self.user, message, response)
-            if self._memory is not None:
+            memory_written_by_tool = any(
+                result.get("tool") == "memory_write" and result.get("ok")
+                for result in tool_results
+            )
+            if memory_written_by_tool:
+                logger.debug("Web Agent 已通过 memory_write 工具写入记忆，跳过自动稳定记忆写入")
+            elif self._memory is not None:
                 if hasattr(self._memory, "add_user_memory_if_stable"):
                     self._memory.add_user_memory_if_stable(message, async_mode=True)
                 else:
                     self._memory.add_memory(f"用户说: {message}", async_mode=True)
 
             elapsed_ms = round((time.perf_counter() - started) * 1000)
-            return {
+            result = {
                 "reply": response,
                 "expression": expression or "neutral",
                 "user": self.user,
@@ -317,9 +323,41 @@ class WebChatSession:
                 "used_memory": used_memory,
                 "used_history": bool(history_context),
                 "used_tools": used_tools,
+                "used_skills": used_skills,
                 "context_chars": len(agent_context),
                 "elapsed_ms": elapsed_ms,
             }
+            log_interaction(
+                {
+                    "source": "web",
+                    "input_mode": "text",
+                    "status": "completed",
+                    "user": self.user,
+                    "language": self.language,
+                    "history_rounds": self.history_rounds,
+                    "long_term_memory_enabled": self.memory_enabled,
+                    "user_text": message,
+                    "assistant_response": response,
+                    "raw_response": raw_response,
+                    "expression": expression,
+                    "sliding_window_context": history_context,
+                    "llm_context": agent_context,
+                    "persona_prompt": persona_prompt,
+                    "tools": {
+                        "results": tool_results,
+                        "used_tools": used_tools,
+                        "used_skills": used_skills,
+                        "used_memory": used_memory,
+                    },
+                    "timings_ms": {
+                        "request_total": elapsed_ms,
+                        "llm_call": final_event_data.get("llm_elapsed_ms"),
+                        "turn_total": final_event_data.get("total_elapsed_ms"),
+                    },
+                    "response_payload": result,
+                }
+            )
+            return result
 
     def add_memory(self, content: str) -> None:
         if self._memory is None:
@@ -417,6 +455,19 @@ def chat(payload: ChatRequest):
         return session.chat(payload.message)
     except Exception as exc:
         logger.exception(f"Web UI 对话失败: {exc}")
+        log_interaction(
+            {
+                "source": "web",
+                "input_mode": "text",
+                "status": "error",
+                "user": payload.user,
+                "language": payload.language,
+                "history_rounds": payload.history_rounds,
+                "long_term_memory_enabled": payload.use_memory,
+                "user_text": payload.message,
+                "error": str(exc),
+            }
+        )
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

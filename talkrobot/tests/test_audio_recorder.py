@@ -6,7 +6,6 @@ import numpy as np
 import time
 import threading
 import sys
-from talkrobot.config import Config
 from talkrobot.core.audio_recorder import AudioRecorder
 
 
@@ -110,7 +109,7 @@ def test_parameters_validation():
         print(f"\n   测试: {config['name']}")
         try:
             recorder = AudioRecorder(**config['params'])
-            print(f"      ✅ 配置有效")
+            print("      ✅ 配置有效")
             for key, value in config['params'].items():
                 if hasattr(recorder, key):
                     print(f"         {key}: {value}")
@@ -432,7 +431,7 @@ def test_concurrent_callbacks():
         with recorder._chunk_lock:
             buffer_size = len(recorder._chunk_buffer)
         
-        print(f"   并发测试完成")
+        print("   并发测试完成")
         print(f"   耗时: {elapsed:.2f}s")
         print(f"   缓冲区大小: {buffer_size}")
         print("   ✅ 并发测试通过")

@@ -6,6 +6,21 @@
 
 ### 模块文档
 
+- **[Code Structure](CODE_STRUCTURE.md)** - 当前代码结构与扩展点说明
+  - 入口、Core、Modules、Agent 分层
+  - Tool、MCP、Skill 扩展方式
+  - 日志、测试与清理原则
+
+- **[Memory Architecture](MEMORY_ARCHITECTURE.md)** - 可替换长期记忆架构
+  - `MemoryModule` facade 与 `MemoryBackend` 接口
+  - Mem0 与本地 JSON backend
+  - provider 配置与测试方式
+
+- **[MCP Integration](MCP_INTEGRATION.md)** - 外部 MCP server 接入说明
+  - JSON 配置与环境变量
+  - Python 构造接口
+  - 当前实验 MCP tools
+
 - **[ASR Module](ASR_MODULE.md)** - 语音识别模块完整文档
   - 接口说明
   - 使用示例
@@ -52,6 +67,9 @@ python -m talkrobot.tests.test_audio_recorder
 ```
 talkrobot/docs/
 ├── README.md           # 本文件
+├── CODE_STRUCTURE.md   # 代码结构说明
+├── MEMORY_ARCHITECTURE.md # Memory 架构说明
+├── MCP_INTEGRATION.md  # MCP 接入说明
 ├── ASR_MODULE.md       # ASR 模块文档
 ├── AUDIO_RECORDER.md   # AudioRecorder 模块文档
 └── TESTING.md          # 测试指南

@@ -1,0 +1,24 @@
+{
+  "servers": {
+    "example": {
+      "enabled": false,
+      "command": "python",
+      "args": ["-m", "your_mcp_server"],
+      "env": {},
+      "discover": false,
+      "tools": [
+        {
+          "name": "search",
+          "alias": "mcp_example_search",
+          "description": "Search with an external MCP server.",
+          "triggers": ["外部搜索", "mcp search"],
+          "argument_template": {
+            "query": "{user_text}"
+          },
+          "context_label": "MCP 搜索结果",
+          "speakable_start": "我调用外部搜索工具。"
+        }
+      ]
+    }
+  }
+}

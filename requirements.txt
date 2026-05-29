@@ -11,7 +11,9 @@ soundfile
 silero-vad
 python-dotenv
 requests
+mcp
 fastapi
+starlette>=0.40.0,<0.47.0
 uvicorn
 opencv-python
 Pillow

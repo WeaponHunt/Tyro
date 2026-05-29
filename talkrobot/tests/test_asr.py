@@ -22,7 +22,7 @@ def test_initialization():
             device=Config.ASR_DEVICE
         )
         load_time = time.time() - start_time
-        print(f"✅ 模块初始化成功")
+        print("✅ 模块初始化成功")
         print(f"   加载时间: {load_time:.2f} 秒")
         return asr
     except Exception as e:
@@ -83,7 +83,7 @@ def test_audio_length(asr):
         if duration >= 0.1:  # 只有长度足够才期望有结果
             print(f"      结果: {result if result else '(空)'}")
         else:
-            print(f"      结果: 跳过识别（音频过短）")
+            print("      结果: 跳过识别（音频过短）")
 
 
 def test_audio_volume(asr):

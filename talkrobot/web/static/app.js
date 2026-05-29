@@ -116,6 +116,7 @@ async function sendMessage(message) {
       data.used_memory ? "命中记忆" : null,
       data.used_history ? "使用上下文" : null,
       data.used_tools && data.used_tools.length ? `工具 ${data.used_tools.join(", ")}` : null,
+      data.used_skills && data.used_skills.length ? `技能 ${data.used_skills.join(", ")}` : null,
       `${data.elapsed_ms} ms`,
     ].filter(Boolean);
     appendMessage("assistant", data.reply, details.length ? `Tyro · ${details.join(" · ")}` : "Tyro");

@@ -95,6 +95,9 @@ python -m talkrobot.main chat --enable-face --face-camera-index 0
 
 # 在 continuous 非响应阶段，见到熟人主动问好
 python -m talkrobot.main chat --enable-face --say-hallo --listen-mode continuous
+
+#web ui启动
+conda run -n robot_sys python -m talkrobot.web_app
 ```
 
 ### 2. 手动添加记忆
@@ -245,11 +248,62 @@ python -m talkrobot.main chat --disable-persona-auto-update
 - 可自定义人设
 
 ### MemoryModule (记忆管理)
-- 使用 Mem0 向量数据库
+- 通过 `MemoryModule` facade 封装长期记忆接口，便于替换 backend
+- 默认使用 Mem0 向量数据库
+- 支持 `TALKROBOT_MEMORY_PROVIDER=simple` 切换到本地 JSON backend，用于离线测试
 - 自动存储对话历史
 - 智能检索相关记忆
 - 支持手动添加记忆（单条 / 交互式批量）
 - 多用户独立数据库，路径: `mem_db/<用户名>/`
+- 详细结构见 `talkrobot/docs/MEMORY_ARCHITECTURE.md`
+
+### Agent Runtime、Tools 与 Skills
+
+系统已内置轻量 AgentRuntime：通过 ReAct 循环让 planner 选择低风险工具、执行工具、记录 observation，再按需要继续规划下一步，最后把工具结果交给大模型整理回复。默认 planner 为大模型规划，可通过 `TALKROBOT_AGENT_PLANNER=rule` 切换为规则规划；ReAct 最大轮数可用 `TALKROBOT_AGENT_REACT_MAX_ITERATIONS` 配置。工具通过 `ToolRegistry` / `ToolProvider` 注册，后续可以追加内置 Python 工具、MCP 工具或外部 skill 目录。当前内置工具包括：
+
+- `memory_search` / `memory_write`
+- `current_time`
+- `calculator`
+- `project_file_search` / `project_file_read` / `project_file_list`
+- `web_fetch`
+
+新增 Python 工具时，实现 `talkrobot.agent.tools.base.BaseTool`，并通过自定义 `ToolProvider` 注册到 `ToolRegistry`。工具可以覆写 `plan(user_text)`，返回 `ToolStep` 后即可被 planner 自动调用。
+
+MCP 工具使用 JSON 配置加载。默认读取 `talkrobot/agent/mcp_servers.json`，也可以通过 `TALKROBOT_MCP_CONFIG` 指向其他文件。配置模板见 `talkrobot/agent/mcp_servers.example.json`。启用 MCP 工具需要安装 Python 包 `mcp`，并提供对应 MCP server 的启动命令。配置内的 `triggers` 命中用户输入后，会按 `argument_template` 生成参数并调用 MCP tool。
+
+如果要同时加载多个外部 MCP 配置，可用 `TALKROBOT_MCP_CONFIGS` 按系统路径分隔符追加。代码中也可以使用 `AgentRuntime.with_mcp_servers()`、`mcp_stdio_server()` 和 `mcp_tool()` 直接接入开源 MCP server；详见 `talkrobot/docs/MCP_INTEGRATION.md`。
+
+当前仓库内置一组实验 MCP 工具，配置在 `talkrobot/agent/mcp_servers.json`，server 为 `python -m talkrobot.agent.mcp_servers.dev_tools`：
+
+- `mcp_git_status` / `mcp_git_diff` / `mcp_git_log`
+- `mcp_sqlite_schema` / `mcp_sqlite_query`
+- `mcp_fetch_url`
+
+对应实验 Skill：
+
+- `code_review_helper`: 当前改动、diff、代码审查。
+- `local_data_analyst`: 本地 SQLite schema 与只读查询。
+- `research_helper`: URL / 网页资料读取。
+
+Skill 文件默认放在 `talkrobot/agent/skills/<skill_name>/SKILL.md`。也可以用 `TALKROBOT_SKILL_DIRS` 追加外部 skill 目录，多个目录用系统路径分隔符分开。每个 Skill 可用 front matter 声明触发词与建议工具，例如：
+
+```markdown
+---
+name: project_helper
+description: 帮助 Agent 阅读和检索项目代码。
+triggers:
+  - 项目
+  - 代码
+tools:
+  - project_file_search
+  - project_file_read
+---
+# Project Helper
+
+当用户询问项目实现时，先检索文件，再基于工具结果回答。
+```
+
+当用户输入命中 `triggers` 或 planner 计划使用对应工具时，Agent 会把 Skill 说明注入上下文。若命中的 Skill 在 `tools` 中声明了可规划工具，planner 也会尝试通过该工具的 `plan_from_skill()` 生成调用步骤。
 
 ## 开发说明
 

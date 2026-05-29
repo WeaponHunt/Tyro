@@ -9,24 +9,13 @@ import argparse
 from loguru import logger
 
 from talkrobot.config import Config
+from talkrobot.core.app_logging import configure_logging
 from talkrobot.core.persona_manager import PersonaManager
 from talkrobot.core.expression_server_manager import ExpressionServerManager
 from talkrobot.core.face_identity_resolver import FaceIdentityResolver
 from talkrobot.core.memory_router import UserMemoryRouter
 
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
-
-
-def _setup_logger():
-    """配置日志"""
-    level = "DEBUG" if Config.DEBUG else "INFO"
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level:8}</level> | <level>{message}</level>",
-        level=level
-    )
-    logger.add("talkrobot/logs/robot_{time}.log", rotation="1 day", retention="7 days", level=level)
 
 
 def run_chat(args):
@@ -48,7 +37,7 @@ def run_chat(args):
     expression_server_manager = None
 
     try:
-        _setup_logger()
+        configure_logging(debug=Config.DEBUG)
 
         language = (getattr(args, "language", None) or Config.LANGUAGE or "zh").strip().lower()
         if language not in {"zh", "en"}:
@@ -386,7 +375,7 @@ def run_add_memory(args):
     """手动添加记忆"""
     from talkrobot.modules.memory.memory_module import MemoryModule
 
-    _setup_logger()
+    configure_logging(debug=Config.DEBUG)
 
     user = args.user
     content = args.content

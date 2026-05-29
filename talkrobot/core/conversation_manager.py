@@ -7,11 +7,12 @@ import time
 import re
 import os
 from loguru import logger
-from typing import Optional, Callable, Tuple
+from typing import Any, Dict, Optional, Callable, Tuple
 import threading
 
 from talkrobot.agent import AgentRuntime
 from talkrobot.core.dialogue_history import SlidingWindowDialogueHistory
+from talkrobot.core.interaction_log import log_interaction
 from talkrobot.core.tts_playback_controller import TTSPlaybackController
 
 class ConversationManager:
@@ -82,6 +83,9 @@ class ConversationManager:
         self._persona_update_lock = threading.Lock()
         self._user_state_lock = threading.Lock()
         self._proactive_lock = threading.Lock()
+        self.language = (language or "zh").strip().lower()
+        if self.language not in {"zh", "en"}:
+            self.language = "zh"
         self._history = SlidingWindowDialogueHistory(self.history_rounds)
         self._tts_playback = TTSPlaybackController(tts_module, audio_recorder)
         self._agent_runtime = AgentRuntime(
@@ -95,9 +99,6 @@ class ConversationManager:
         self._pending_user_switch_notice = ""
         self._is_continuous_mode = bool(audio_recorder and audio_recorder.listen_mode == "continuous")
         self._response_enabled = not self._is_continuous_mode
-        self.language = (language or "zh").strip().lower()
-        if self.language not in {"zh", "en"}:
-            self.language = "zh"
         self._wake_words = ["hello", "hi", "hey"] if self._is_english else ["你好"]
         self._sleep_words = ["goodbye", "bye", "seeyou"] if self._is_english else ["再见"]
         self._say_hallo = bool(say_hallo)
@@ -325,6 +326,16 @@ class ConversationManager:
                 self._msg("（机器人主动问好）", "(Assistant proactive greeting)"),
                 response,
             )
+            self._log_interaction(
+                input_mode="proactive",
+                status="completed",
+                reason="say_hallo",
+                user_text=self._msg("（机器人主动问好）", "(Assistant proactive greeting)"),
+                assistant_response=response,
+                raw_response=raw_response,
+                expression=expression_name,
+                llm_context=memory_context,
+            )
 
             # 开启“问好后应答窗口”：5秒内用户应答可直接进入响应模式
             self._pending_greeting_deadline = time.time() + self._greeting_response_window_seconds
@@ -386,6 +397,37 @@ class ConversationManager:
         print(msg)
         logger.debug(msg)
 
+    def _log_interaction(self, **record: Any) -> None:
+        """写入一条可复现的交互记录。"""
+        base = {
+            "source": "cli",
+            "user": self._active_user,
+            "default_user": self.default_user,
+            "language": self.language,
+            "listen_mode": getattr(self.audio_recorder, "listen_mode", "text"),
+            "continuous_response_enabled": self._response_enabled,
+            "streaming": self.streaming,
+            "tts_enabled": self.tts_enabled,
+            "history_rounds": self.history_rounds,
+            "long_term_memory_enabled": self._active_user_has_long_term_memory,
+        }
+        base.update(record)
+        log_interaction(base)
+
+    def _continuous_command_action(self, user_text: str, response_enabled_before: bool) -> str:
+        """描述 continuous 模式中未进入完整对话链路的原因。"""
+        if not self._is_continuous_mode:
+            return ""
+
+        normalized_text = self._normalize_text(user_text)
+        if any(word in normalized_text for word in self._sleep_words):
+            return "sleep"
+        if not response_enabled_before:
+            if any(word in normalized_text for word in self._wake_words):
+                return "wake"
+            return "ignored_non_response_mode"
+        return "command_handled"
+
     def _handle_agent_event(self, event) -> None:
         """Render non-final agent events for terminal/TTS feedback."""
         if event.type == "plan":
@@ -403,6 +445,10 @@ class ConversationManager:
 
         if event.type == "tool_result":
             logger.debug(f"Agent工具结果: {event.data}")
+            return
+
+        if event.type == "skill_loaded":
+            logger.debug(f"Agent技能加载: {event.data}")
             return
 
         if event.type == "llm_start":
@@ -474,7 +520,12 @@ class ConversationManager:
 
         return True
 
-    def _process_user_text(self, user_text: str) -> None:
+    def _process_user_text(
+        self,
+        user_text: str,
+        input_mode: str = "text",
+        audio: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """处理已获得的用户文本（来自 ASR 或终端输入）。"""
         logger.debug(f"处理用户文本: {user_text}")
 
@@ -491,15 +542,19 @@ class ConversationManager:
         raw_response = ""
         context = ""
         tool_results = []
+        final_event_data: Dict[str, Any] = {}
         llm_start = time.perf_counter()
+        tts_elapsed_ms = None
+        tts_interrupted = None
+        ExpressionModule = None
+        if self.streaming or (self.expression and self.expression.is_available):
+            from talkrobot.modules.expression.expression_module import ExpressionModule
 
         if self.streaming:
             logger.debug("使用流式模式生成回复")
             raw_response_parts = []
             buffered_prefix = ""
             expression_prefix_finalized = False
-
-            from talkrobot.modules.expression.expression_module import ExpressionModule
 
             def _handle_stream_chunk(chunk: str) -> str:
                 """处理流式增量，剥离起始表情标签并返回可展示/可播报文本。"""
@@ -563,14 +618,15 @@ class ConversationManager:
             assistant_prefix_printed = False
 
             def _stream_with_capture():
-                nonlocal raw_response, context, tool_results, assistant_prefix_printed
+                nonlocal raw_response, context, tool_results, final_event_data, assistant_prefix_printed
                 for event in agent_events:
                     if event.type == "llm_chunk":
                         chunk = event.text
                     elif event.type == "final_response":
                         raw_response = event.text
-                        context = event.data.get("context", "")
-                        tool_results = event.data.get("tool_results", [])
+                        final_event_data = event.data or {}
+                        context = final_event_data.get("context", "")
+                        tool_results = final_event_data.get("tool_results", [])
                         continue
                     else:
                         self._handle_agent_event(event)
@@ -595,8 +651,9 @@ class ConversationManager:
                 logger.debug("开始流式TTS播放")
 
                 tts_start = time.perf_counter()
-                self._tts_playback.play(_stream_with_capture())
+                tts_interrupted = self._tts_playback.play(_stream_with_capture())
                 tts_elapsed = time.perf_counter() - tts_start
+                tts_elapsed_ms = round(tts_elapsed * 1000)
                 self._print_stage_timing("TTS合成", tts_elapsed)
                 tts_played_in_streaming = True
             else:
@@ -619,8 +676,9 @@ class ConversationManager:
             ):
                 if event.type == "final_response":
                     raw_response = event.text
-                    context = event.data.get("context", "")
-                    tool_results = event.data.get("tool_results", [])
+                    final_event_data = event.data or {}
+                    context = final_event_data.get("context", "")
+                    tool_results = final_event_data.get("tool_results", [])
                 else:
                     self._handle_agent_event(event)
 
@@ -635,7 +693,6 @@ class ConversationManager:
 
         # 4.1 解析表情标签
         if self.expression and self.expression.is_available:
-            from talkrobot.modules.expression.expression_module import ExpressionModule
             response, parsed_expression_name = ExpressionModule.parse_expression_from_response(raw_response)
             if not expression_name:
                 expression_name = parsed_expression_name
@@ -656,7 +713,13 @@ class ConversationManager:
         self._append_dialogue_round(self._active_user, user_text, response)
 
         # 5.1 本轮回复生成后，再异步保存稳定用户信息，避免阻塞当前轮检索。
-        if self._active_user_has_long_term_memory and self.memory is not None:
+        memory_written_by_tool = any(
+            result.get("tool") == "memory_write" and result.get("ok")
+            for result in tool_results
+        )
+        if memory_written_by_tool:
+            logger.debug("本轮已通过 memory_write 工具写入记忆，跳过自动稳定记忆写入")
+        elif self._active_user_has_long_term_memory and self.memory is not None:
             logger.debug("回复后判断用户输入是否为稳定记忆")
             if hasattr(self.memory, "add_user_memory_if_stable"):
                 self.memory.add_user_memory_if_stable(user_text, async_mode=True)
@@ -673,6 +736,8 @@ class ConversationManager:
             logger.debug("开始调用 tts.synthesize()")
             interrupted = self._tts_playback.play(response)
             tts_elapsed = time.perf_counter() - tts_start
+            tts_elapsed_ms = round(tts_elapsed * 1000)
+            tts_interrupted = bool(interrupted)
             self._print_stage_timing("TTS合成", tts_elapsed)
             logger.debug("tts.synthesize() 返回")
 
@@ -697,7 +762,40 @@ class ConversationManager:
         else:
             print(self._msg("✅ 对话完成，请继续输入", "✅ Done. Please continue typing"))
         print("-"*50 + "\n")
+        interaction_record = {
+            "input_mode": input_mode,
+            "status": "completed",
+            "user_text": user_text,
+            "assistant_response": response,
+            "raw_response": raw_response,
+            "expression": expression_name,
+            "switch_notice": switch_notice,
+            "sliding_window_context": sliding_window_context,
+            "llm_context": context,
+            "persona_prompt": persona_prompt,
+            "tools": {
+                "results": tool_results,
+                "used_tools": final_event_data.get("used_tools", []),
+                "used_skills": final_event_data.get("used_skills", []),
+                "used_memory": bool(final_event_data.get("used_memory", False)),
+            },
+            "timings_ms": {
+                "agent_llm_total": round(llm_elapsed * 1000),
+                "llm_call": final_event_data.get("llm_elapsed_ms"),
+                "turn_total": final_event_data.get("total_elapsed_ms"),
+                "tts": tts_elapsed_ms,
+            },
+            "tts": {
+                "played": bool(self.tts_enabled),
+                "played_in_streaming": tts_played_in_streaming,
+                "interrupted": tts_interrupted,
+            },
+        }
+        if audio is not None:
+            interaction_record["audio"] = audio
+        self._log_interaction(**interaction_record)
         logger.debug("对话流程完成")
+        return interaction_record
     
     def process_audio(self, audio_data: np.ndarray) -> None:
         """
@@ -706,22 +804,46 @@ class ConversationManager:
         Args:
             audio_data: 音频数据
         """
+        audio_meta: Dict[str, Any] = {}
+        user_text = ""
         try:
             logger.debug("开始处理音频数据")
             # 0. 音频前置过滤：时长和音量检查
             duration = len(audio_data) / self.sample_rate
             rms = float(np.sqrt(np.mean(audio_data ** 2)))
+            audio_meta = {
+                "duration_s": round(duration, 3),
+                "rms": round(rms, 6),
+                "sample_rate": self.sample_rate,
+                "samples": int(len(audio_data)),
+                "min_duration_s": self.audio_min_duration,
+                "min_rms": self.audio_min_rms,
+            }
             
             logger.debug(f"音频参数: 时长={duration:.2f}s, RMS={rms:.4f}")
             
             if duration < self.audio_min_duration:
                 logger.info(f"音频过短 ({duration:.2f}s < {self.audio_min_duration}s)，已忽略")
                 print(self._msg(f"\n⚠️ 音频过短 ({duration:.2f}秒)，已忽略", f"\n⚠️ Audio too short ({duration:.2f}s), ignored"))
+                self._log_interaction(
+                    input_mode="audio",
+                    status="ignored",
+                    reason="audio_too_short",
+                    user_text="",
+                    audio=audio_meta,
+                )
                 return
             
             if rms < self.audio_min_rms:
                 logger.info(f"音量过低 (RMS={rms:.4f} < {self.audio_min_rms})，已忽略")
                 print(self._msg("\n⚠️ 音量过低，已忽略", "\n⚠️ Volume too low, ignored"))
+                self._log_interaction(
+                    input_mode="audio",
+                    status="ignored",
+                    reason="audio_volume_too_low",
+                    user_text="",
+                    audio=audio_meta,
+                )
                 return
             
             logger.debug(f"音频检查通过: 时长={duration:.2f}s, RMS={rms:.4f}")
@@ -732,22 +854,45 @@ class ConversationManager:
             asr_start = time.perf_counter()
             user_text = self.asr.transcribe(audio_data)
             asr_elapsed = time.perf_counter() - asr_start
+            audio_meta["asr_elapsed_ms"] = round(asr_elapsed * 1000)
             self._print_stage_timing("ASR生成文本", asr_elapsed)
             logger.debug(f"ASR识别完成: {user_text}")
             
             if not user_text or user_text.strip() == "":
                 print(self._msg("⚠️ 未识别到有效内容,请重试", "⚠️ No valid speech recognized, please try again"))
                 logger.debug("ASR识别为空")
+                self._log_interaction(
+                    input_mode="audio",
+                    status="ignored",
+                    reason="asr_empty",
+                    user_text="",
+                    audio=audio_meta,
+                )
                 return
             
             print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
+            response_enabled_before = self._response_enabled
             if not self._handle_continuous_mode_command(user_text):
+                self._log_interaction(
+                    input_mode="audio",
+                    status="command_only",
+                    reason=self._continuous_command_action(user_text, response_enabled_before),
+                    user_text=user_text,
+                    audio=audio_meta,
+                )
                 return
 
-            self._process_user_text(user_text)
+            self._process_user_text(user_text, input_mode="audio", audio=audio_meta)
             
         except Exception as e:
             logger.error(f"对话处理出错: {e}", exc_info=True)
+            self._log_interaction(
+                input_mode="audio",
+                status="error",
+                user_text=user_text,
+                error=str(e),
+                audio=audio_meta,
+            )
             print(f"❌ 处理出错: {e}")
         finally:
             # 通知录音器处理完成，可以采集下一段语音
@@ -761,17 +906,36 @@ class ConversationManager:
         try:
             if not user_text or user_text.strip() == "":
                 print(self._msg("⚠️ 输入为空，请重试", "⚠️ Empty input, please try again"))
+                self._log_interaction(
+                    input_mode="text",
+                    status="ignored",
+                    reason="empty_text",
+                    user_text="",
+                )
                 return
 
             user_text = user_text.strip()
             print(f"👤 {self._msg('您输入', 'You typed')}: {user_text}")
 
+            response_enabled_before = self._response_enabled
             if not self._handle_continuous_mode_command(user_text):
+                self._log_interaction(
+                    input_mode="text",
+                    status="command_only",
+                    reason=self._continuous_command_action(user_text, response_enabled_before),
+                    user_text=user_text,
+                )
                 return
 
-            self._process_user_text(user_text)
+            self._process_user_text(user_text, input_mode="text")
         except Exception as e:
             logger.error(f"文本对话处理出错: {e}", exc_info=True)
+            self._log_interaction(
+                input_mode="text",
+                status="error",
+                user_text=user_text,
+                error=str(e),
+            )
             print(f"❌ 处理出错: {e}")
     
     def process_audio_async(self, audio_data: np.ndarray) -> None:

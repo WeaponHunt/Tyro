@@ -1,0 +1,107 @@
+{
+  "servers": {
+    "talkrobot_dev": {
+      "enabled": true,
+      "command": "python",
+      "args": ["-m", "talkrobot.agent.mcp_servers.dev_tools"],
+      "env": {},
+      "discover": false,
+      "tools": [
+        {
+          "name": "git_status",
+          "alias": "mcp_git_status",
+          "description": "Show git status for the current repository. Args: {}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "triggers": ["git status", "当前改动", "仓库状态"],
+          "skill_argument_template": {},
+          "context_label": "Git 状态",
+          "speakable_start": "我查看一下仓库状态。"
+        },
+        {
+          "name": "git_diff",
+          "alias": "mcp_git_diff",
+          "description": "Show git diff. Args: {\"path\": optional relative path, \"staged\": optional boolean}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"},
+              "staged": {"type": "boolean"}
+            },
+            "required": []
+          },
+          "triggers": ["git diff", "代码审查", "review 当前改动"],
+          "skill_argument_template": {},
+          "context_label": "Git Diff",
+          "speakable_start": "我查看一下代码改动。"
+        },
+        {
+          "name": "git_log",
+          "alias": "mcp_git_log",
+          "description": "Show recent git commits. Args: {\"limit\": optional integer, default 5}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "limit": {"type": "integer"}
+            },
+            "required": []
+          },
+          "triggers": ["git log", "最近提交"],
+          "context_label": "Git 提交记录",
+          "speakable_start": "我查看一下最近提交。"
+        },
+        {
+          "name": "sqlite_schema",
+          "alias": "mcp_sqlite_schema",
+          "description": "Inspect schema of a sqlite database under the project. Args: {\"database_path\": relative sqlite database path}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "database_path": {"type": "string"}
+            },
+            "required": ["database_path"]
+          },
+          "triggers": ["sqlite schema", "数据库结构", "表结构"],
+          "context_label": "SQLite Schema",
+          "speakable_start": "我查看一下数据库结构。"
+        },
+        {
+          "name": "sqlite_query",
+          "alias": "mcp_sqlite_query",
+          "description": "Run read-only sqlite SQL under the project. Args: {\"database_path\": relative sqlite path, \"query\": SELECT/PRAGMA/EXPLAIN SQL, \"limit\": optional integer}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "database_path": {"type": "string"},
+              "query": {"type": "string"},
+              "limit": {"type": "integer"}
+            },
+            "required": ["database_path", "query"]
+          },
+          "triggers": ["sqlite query", "查询数据库", "统计数据库"],
+          "context_label": "SQLite 查询结果",
+          "speakable_start": "我查询一下数据库。"
+        },
+        {
+          "name": "fetch_url",
+          "alias": "mcp_fetch_url",
+          "description": "Fetch readable text from a public http/https URL. Args: {\"url\": http/https URL, \"max_chars\": optional integer}.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "url": {"type": "string"},
+              "max_chars": {"type": "integer"}
+            },
+            "required": ["url"]
+          },
+          "triggers": ["fetch url", "读取网页", "网页资料"],
+          "context_label": "网页读取结果",
+          "speakable_start": "我读取一下网页资料。"
+        }
+      ]
+    }
+  }
+}
