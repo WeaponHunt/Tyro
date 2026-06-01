@@ -41,6 +41,7 @@ class RuntimeToolContext:
     memory_module: Optional[Any] = None
     long_term_memory: bool = False
     language: str = "zh"
+    tool_authorization: Optional[Any] = None
 
 
 class ToolProvider:

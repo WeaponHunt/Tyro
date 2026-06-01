@@ -5,6 +5,8 @@ import ast
 import operator
 import os
 import re
+import shlex
+import subprocess
 from html.parser import HTMLParser
 from datetime import datetime
 from urllib.parse import urlparse
@@ -237,7 +239,7 @@ class ProjectFileReadTool(BaseTool):
     speakable_start = "我打开文件看一下。"
     context_label = "项目文件内容"
 
-    def __init__(self, project_root: str, max_chars: int = 6000):
+    def __init__(self, project_root: str, max_chars: int = 20000):
         self.project_root = os.path.abspath(project_root)
         self.max_chars = max(1000, int(max_chars))
 
@@ -252,6 +254,203 @@ class ProjectFileReadTool(BaseTool):
             return ToolResult(ok=True, content=f"{rel}\n{content}", data={"path": rel})
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
+
+
+class RepoBootstrapTool(BaseTool):
+    name = "repo_bootstrap"
+    description = "Summarizes repository structure, config files, and likely test commands."
+    speakable_start = "我先读取仓库结构。"
+    context_label = "仓库启动信息"
+
+    CONFIG_FILES = (
+        "AGENTS.md",
+        "README.md",
+        "pyproject.toml",
+        "pytest.ini",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "package.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "go.mod",
+        "Cargo.toml",
+    )
+
+    def __init__(self, project_root: str, max_entries: int = 120):
+        self.project_root = os.path.abspath(project_root)
+        self.max_entries = max(20, int(max_entries))
+
+    def run(self) -> ToolResult:
+        entries = []
+        for root, dirs, files in os.walk(self.project_root):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith(".venv")]
+            depth = os.path.relpath(root, self.project_root).count(os.sep)
+            if depth > 1:
+                dirs[:] = []
+                continue
+            for dirname in dirs:
+                entries.append(os.path.relpath(os.path.join(root, dirname), self.project_root) + "/")
+            for filename in files:
+                if filename.endswith(IGNORED_BINARY_SUFFIXES):
+                    continue
+                entries.append(os.path.relpath(os.path.join(root, filename), self.project_root))
+            if len(entries) >= self.max_entries:
+                break
+
+        config_files = [path for path in self.CONFIG_FILES if os.path.isfile(os.path.join(self.project_root, path))]
+        test_commands = self._infer_test_commands(config_files)
+        sections = [
+            f"Project root: {self.project_root}",
+            "Top-level files:\n" + "\n".join(entries[: self.max_entries]),
+            "Config files:\n" + ("\n".join(config_files) if config_files else "(none detected)"),
+            "Likely test/check commands:\n" + ("\n".join(test_commands) if test_commands else "(none inferred)"),
+        ]
+        return ToolResult(
+            ok=True,
+            content="\n\n".join(sections),
+            data={
+                "project_root": self.project_root,
+                "entries": entries[: self.max_entries],
+                "config_files": config_files,
+                "test_commands": test_commands,
+            },
+        )
+
+    def _infer_test_commands(self, config_files: List[str]) -> List[str]:
+        commands = []
+        if "pyproject.toml" in config_files or "pytest.ini" in config_files or "setup.cfg" in config_files:
+            commands.append("python -m pytest")
+        if "requirements.txt" in config_files and "python -m pytest" not in commands:
+            commands.append("python -m pytest")
+        if "pyproject.toml" in config_files:
+            commands.append("python -m compileall .")
+        if "package.json" in config_files:
+            commands.append("npm test")
+        if "go.mod" in config_files:
+            commands.append("go test ./...")
+        if "Cargo.toml" in config_files:
+            commands.append("cargo test")
+        return commands
+
+
+class ShellCommandTool(BaseTool):
+    name = "shell_command"
+    description = "Runs an authorized safe command from inside the project root."
+    speakable_start = "我运行一个检查命令。"
+    context_label = "命令执行结果"
+
+    def __init__(self, project_root: str, timeout: int = 30, max_chars: int = 12000):
+        self.project_root = os.path.abspath(project_root)
+        self.timeout = max(1, min(int(timeout), 120))
+        self.max_chars = max(1000, int(max_chars))
+
+    def run(self, command, cwd: str = ".", timeout: Optional[int] = None) -> ToolResult:
+        argv = _command_to_argv(command)
+        if not argv:
+            return ToolResult(ok=False, error="empty command")
+        resolved_cwd = _resolve_project_path(self.project_root, cwd, require_dir=True)
+        if resolved_cwd is None:
+            return ToolResult(ok=False, error="cwd is outside project or not a directory")
+        try:
+            effective_timeout = self.timeout if timeout is None else max(1, min(int(timeout), 120))
+            completed = subprocess.run(
+                argv,
+                cwd=resolved_cwd,
+                text=True,
+                capture_output=True,
+                timeout=effective_timeout,
+                shell=False,
+            )
+            stdout = _truncate(completed.stdout or "", self.max_chars // 2)
+            stderr = _truncate(completed.stderr or "", self.max_chars // 2)
+            content = (
+                f"$ {' '.join(argv)}\n"
+                f"exit_code={completed.returncode}\n"
+                f"stdout:\n{stdout}\n"
+                f"stderr:\n{stderr}"
+            ).strip()
+            return ToolResult(
+                ok=completed.returncode == 0,
+                content=content,
+                data={
+                    "command": argv,
+                    "cwd": os.path.relpath(resolved_cwd, self.project_root),
+                    "exit_code": completed.returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                },
+                error="" if completed.returncode == 0 else f"command failed with exit code {completed.returncode}",
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = _truncate((exc.stdout or "") + "\n" + (exc.stderr or ""), self.max_chars)
+            return ToolResult(
+                ok=False,
+                content=output,
+                data={"command": argv, "timeout": True},
+                error=f"command timed out after {timeout or self.timeout}s",
+            )
+        except Exception as exc:
+            return ToolResult(ok=False, error=str(exc), data={"command": argv})
+
+
+class FileEditTool(BaseTool):
+    name = "file_edit"
+    description = "Creates or edits a text file inside the project root using old_text/new_text; content is accepted as a new_text alias; set create=true for new files."
+    speakable_start = "我修改文件。"
+    context_label = "文件修改结果"
+
+    def __init__(self, project_root: str):
+        self.project_root = os.path.abspath(project_root)
+
+    def run(
+        self,
+        path: str,
+        old_text: str = "",
+        new_text: str = "",
+        create: bool = False,
+        content: str = "",
+    ) -> ToolResult:
+        resolved = _resolve_project_path(self.project_root, path, require_file=False)
+        if resolved is None:
+            return ToolResult(ok=False, error="path is outside project")
+        rel = os.path.relpath(resolved, self.project_root)
+        if os.path.isdir(resolved):
+            return ToolResult(ok=False, error="path is a directory")
+        if not new_text and content:
+            new_text = content
+
+        exists = os.path.exists(resolved)
+        if not exists and not create:
+            return ToolResult(ok=False, error="file does not exist; set create=true to create it")
+
+        try:
+            if exists:
+                with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+                    original = f.read()
+            else:
+                original = ""
+
+            if old_text:
+                count = original.count(old_text)
+                if count != 1:
+                    return ToolResult(ok=False, error=f"old_text matched {count} times; expected exactly 1")
+                updated = original.replace(old_text, new_text, 1)
+            elif create and not exists:
+                updated = new_text
+            else:
+                return ToolResult(ok=False, error="old_text is required for existing files")
+
+            os.makedirs(os.path.dirname(resolved), exist_ok=True)
+            with open(resolved, "w", encoding="utf-8") as f:
+                f.write(updated)
+            return ToolResult(
+                ok=True,
+                content=f"{rel}: changed {len(original)} -> {len(updated)} chars",
+                data={"path": rel, "created": not exists, "bytes": len(updated.encode("utf-8"))},
+            )
+        except Exception as exc:
+            return ToolResult(ok=False, error=str(exc), data={"path": rel})
 
 
 def extract_file_path(text: str) -> str:
@@ -321,3 +520,19 @@ class WebFetchTool(BaseTool):
 def extract_url(text: str) -> str:
     match = re.search(r"https?://[^\s，。！？)）]+", text or "")
     return match.group(0) if match else ""
+
+
+def _command_to_argv(command) -> List[str]:
+    if isinstance(command, list):
+        return [str(part) for part in command if str(part)]
+    try:
+        return shlex.split(str(command or ""))
+    except ValueError:
+        return []
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) > limit:
+        return text[:limit].rstrip() + "\n..."
+    return text

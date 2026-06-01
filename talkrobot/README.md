@@ -331,7 +331,19 @@ tyro-agent ask "读取这个网页并总结：https://example.com"
 --show-events
 --json
 --memory-provider none|simple|mem0
+--step-trace off|live|clear
 ```
+
+示例启动指令：
+
+```bash
+tyro-agent chat \
+  --project-root /path/to/project \
+  --allow-file-write \
+  --allowed-write-path . \
+  --step-trace live
+```
+
 
 详细说明见 `talkrobot/docs/AGENT_CLI.md`。
 

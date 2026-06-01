@@ -81,7 +81,7 @@ class Config:
         "TALKROBOT_LLM_BASE_URL",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
-    LLM_MODEL = os.getenv("TALKROBOT_LLM_MODEL", "qwen-flash")
+    LLM_MODEL = os.getenv("TALKROBOT_LLM_MODEL", "qwen3.7-max")
 
     # Agent planner: "llm" uses the chat model to choose tools; "rule" uses deterministic heuristics.
     AGENT_PLANNER_PROVIDER = os.getenv("TALKROBOT_AGENT_PLANNER", "llm").strip().lower()

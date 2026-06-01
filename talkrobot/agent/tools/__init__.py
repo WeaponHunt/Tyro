@@ -4,11 +4,14 @@ from talkrobot.agent.tools.base import BaseTool, RuntimeToolContext, ToolProvide
 from talkrobot.agent.tools.builtin import (
     CalculatorTool,
     CurrentTimeTool,
+    FileEditTool,
     MemoryWriteTool,
     MemorySearchTool,
     ProjectFileListTool,
     ProjectFileReadTool,
     ProjectFileSearchTool,
+    RepoBootstrapTool,
+    ShellCommandTool,
     WebFetchTool,
 )
 from talkrobot.agent.tools.registry import BuiltinToolProvider, ToolRegistry
@@ -25,11 +28,14 @@ __all__ = [
     "mcp_tool",
     "CalculatorTool",
     "CurrentTimeTool",
+    "FileEditTool",
     "MemoryWriteTool",
     "MemorySearchTool",
     "ProjectFileListTool",
     "ProjectFileReadTool",
     "ProjectFileSearchTool",
+    "RepoBootstrapTool",
+    "ShellCommandTool",
     "WebFetchTool",
 ]
 

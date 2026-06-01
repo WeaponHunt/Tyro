@@ -15,11 +15,14 @@ from talkrobot.agent.tools.base import BaseTool, RuntimeToolContext, ToolProvide
 from talkrobot.agent.tools.builtin import (
     CalculatorTool,
     CurrentTimeTool,
+    FileEditTool,
     MemorySearchTool,
     MemoryWriteTool,
     ProjectFileListTool,
     ProjectFileReadTool,
     ProjectFileSearchTool,
+    RepoBootstrapTool,
+    ShellCommandTool,
     WebFetchTool,
 )
 
@@ -42,6 +45,9 @@ class BuiltinToolProvider(ToolProvider):
             "project_file_search": ProjectFileSearchTool(context.project_root),
             "project_file_list": ProjectFileListTool(context.project_root),
             "project_file_read": ProjectFileReadTool(context.project_root),
+            "repo_bootstrap": RepoBootstrapTool(context.project_root),
+            "shell_command": ShellCommandTool(context.project_root),
+            "file_edit": FileEditTool(context.project_root),
             "web_fetch": WebFetchTool(),
         }
 

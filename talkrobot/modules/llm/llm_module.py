@@ -33,7 +33,7 @@ class LLMModule:
             expression_prompt: 表情指令提示词（追加到 system_prompt 后）
             language: 输出语言（zh/en）
         """
-        logger.info(f"正在初始化LLM模块: model={model}")
+        logger.debug(f"正在初始化LLM模块: model={model}")
         drop_unsupported_proxy_env(prefix="LLMModule")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
@@ -41,7 +41,7 @@ class LLMModule:
         self.language = (language or "zh").strip().lower()
         if self.language not in {"zh", "en"}:
             self.language = "zh"
-        logger.info("LLM模块初始化完成")
+        logger.debug("LLM模块初始化完成")
 
     @property
     def _is_english(self) -> bool:
@@ -81,7 +81,7 @@ class LLMModule:
         try:
             messages = self._build_messages(user_input, context, system_prompt_override)
             
-            logger.info(f"正在生成回复,用户输入: {user_input}")
+            logger.debug(f"正在生成回复,用户输入: {user_input}")
             
             completion = self.client.chat.completions.create(
                 model=self.model,
@@ -89,7 +89,7 @@ class LLMModule:
             )
             
             response = completion.choices[0].message.content
-            logger.info(f"生成回复: {response}")
+            logger.debug(f"生成回复: {response}")
             return response
             
         except Exception as e:
@@ -111,7 +111,7 @@ class LLMModule:
         """
         try:
             messages = self._build_messages(user_input, context, system_prompt_override)
-            logger.info(f"正在流式生成回复,用户输入: {user_input}")
+            logger.debug(f"正在流式生成回复,用户输入: {user_input}")
 
             completion = self.client.chat.completions.create(
                 model=self.model,
@@ -128,7 +128,7 @@ class LLMModule:
                 if delta and delta.content:
                     yield delta.content
 
-            logger.info("流式回复生成完成")
+            logger.debug("流式回复生成完成")
 
         except Exception as e:
             logger.error(f"LLM流式生成回复出错: {e}")

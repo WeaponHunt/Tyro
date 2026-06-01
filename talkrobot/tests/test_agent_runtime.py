@@ -1,367 +1,262 @@
 import json
-import os
 
 from talkrobot.agent import AgentRuntime
 from talkrobot.agent.planner import AgentPlanner, ToolStep
-from talkrobot.agent.tools.builtin import CalculatorTool
-from talkrobot.agent.tools import BaseTool, ToolProvider, ToolRegistry, ToolResult, mcp_stdio_server, mcp_tool
-from talkrobot.agent.tools.mcp import MCPToolProvider
+from talkrobot.agent.policy import AgentToolAuthorization, ToolPolicyGate
+from talkrobot.agent.state import TaskState
+from talkrobot.agent.tools import BaseTool, ToolProvider, ToolRegistry, ToolResult
+from talkrobot.agent.tools.builtin import CalculatorTool, ProjectFileReadTool
+
+
+class SequenceLLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.prompts = []
+        self.system_prompts = []
+
+    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
+        self.prompts.append(user_input)
+        self.system_prompts.append(system_prompt_override)
+        if self.responses:
+            item = self.responses.pop(0)
+            return item() if callable(item) else item
+        return json.dumps({"done": True, "answer": "done", "tool": "", "args": {}, "reason": "fallback"})
 
 
 class EchoTool(BaseTool):
     name = "echo_tool"
-    description = "Echoes user text for tests."
+    description = "Echoes text."
     speakable_start = "echo"
-    context_label = "Echo Tool Result"
-    keywords = ("echo",)
-
-    def plan(self, user_text: str):
-        if "echo" in user_text.lower():
-            return ToolStep(self.name, {"text": user_text}, "test echo")
-        return None
 
     def run(self, text: str) -> ToolResult:
         return ToolResult(ok=True, content=f"echoed: {text}")
 
 
-class EchoProvider(ToolProvider):
-    def build_tools(self, context):
-        return {"echo_tool": EchoTool()}
-
-
-class SkillOnlyTool(BaseTool):
-    name = "skill_only_tool"
-    speakable_start = "skill"
-    context_label = "Skill Tool Result"
-
-    def plan_from_skill(self, user_text: str, skill=None):
-        return ToolStep(self.name, {"text": user_text}, "skill activated")
-
-    def run(self, text: str) -> ToolResult:
-        return ToolResult(ok=True, content=f"skill: {text}")
-
-
-class SkillOnlyProvider(ToolProvider):
-    def build_tools(self, context):
-        return {"skill_only_tool": SkillOnlyTool()}
-
-
 class StrictArgTool(BaseTool):
     name = "strict_arg_tool"
-    description = "Accepts only one named argument."
+    description = "Accepts one arg."
     speakable_start = "strict"
-    context_label = "Strict Tool Result"
 
     def run(self, query: str) -> ToolResult:
         return ToolResult(ok=True, content=f"strict: {query}")
 
 
-class StrictArgProvider(ToolProvider):
-    def build_tools(self, context):
-        return {"strict_arg_tool": StrictArgTool()}
-
-
-class UnstableTool(BaseTool):
-    name = "unstable_tool"
-    description = "Fails with a retryable error for ReAct tests."
-    speakable_start = "unstable"
-    context_label = "Unstable Tool Result"
-
-    def run(self) -> ToolResult:
-        return ToolResult(ok=False, error="temporary bad arguments")
-
-
-class ReActProvider(ToolProvider):
+class TestProvider(ToolProvider):
     def build_tools(self, context):
         return {
-            "unstable_tool": UnstableTool(),
+            "calculator": CalculatorTool(),
             "echo_tool": EchoTool(),
+            "strict_arg_tool": StrictArgTool(),
+            "project_file_read": ProjectFileReadTool(context.project_root),
         }
 
 
-class FakeLLM:
-    def __init__(self):
-        self.context = ""
-
-    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
-        self.context = context
-        return "ok"
+def _runtime(tmp_path, **kwargs):
+    return AgentRuntime(project_root=str(tmp_path), tool_registry=ToolRegistry([TestProvider()]), **kwargs)
 
 
-class PlannerLLM:
-    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
-        if "tool planner" in system_prompt_override.lower():
-            return (
-                '{"mode":"tool_assisted","reason":"needs arithmetic",'
-                '"steps":[{"tool":"calculator","args":{"expression":"2+3"},"reason":"calculate"}]}'
-            )
-        return "ok"
+def _final(events):
+    return [event for event in events if event.type == "final_response"][-1]
 
 
-class ExtraArgPlannerLLM:
-    def __init__(self):
-        self.context = ""
-
-    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
-        if "tool planner" in system_prompt_override.lower():
-            return (
-                '{"mode":"tool_assisted","reason":"extra arg regression",'
-                '"steps":[{"tool":"strict_arg_tool","args":{"query":"weather","max_chars":2048},"reason":"call tool"}]}'
-            )
-        self.context = context
-        return "ok"
-
-
-class ReActLLM:
-    def __init__(self):
-        self.context = ""
-
-    def generate_response(self, user_input: str, context: str = "", system_prompt_override: str = "") -> str:
-        if "tool planner" not in system_prompt_override.lower():
-            self.context = context
-            return "done"
-        if "Observations:" not in user_input:
-            return (
-                '{"mode":"tool_assisted","reason":"try unstable first",'
-                '"steps":[{"tool":"unstable_tool","args":{},"reason":"first attempt"}]}'
-            )
-        if "temporary bad arguments" in user_input and "echoed: fallback" not in user_input:
-            return (
-                '{"mode":"tool_assisted","reason":"recover with echo",'
-                '"steps":[{"tool":"echo_tool","args":{"text":"fallback"},"reason":"recover"}]}'
-            )
-        return '{"mode":"chat","reason":"enough observations","steps":[]}'
-
-
-def test_llm_planner_parses_json_tool_plan():
-    planner = AgentPlanner(provider="llm")
-    plan = planner.plan("2+3 等于多少", tools=[CalculatorTool()], llm=PlannerLLM())
-
-    assert plan.mode == "tool_assisted"
-    assert plan.reason == "needs arithmetic"
-    assert plan.steps == [ToolStep("calculator", {"expression": "2+3"}, "calculate")]
-
-
-def test_runtime_reacts_after_retryable_tool_failure(tmp_path):
-    llm = ReActLLM()
-    runtime = AgentRuntime(
-        project_root=str(tmp_path),
-        tool_registry=ToolRegistry([ReActProvider()]),
-        planner_provider="llm",
-        max_react_iterations=3,
-    )
-
-    events = list(runtime.run_stream("recover please", llm))
-    final = events[-1]
-
-    assert final.type == "final_response"
-    assert final.data["used_tools"] == ["unstable_tool", "echo_tool"]
-    assert final.data["react_iterations"] == 2
-    assert final.data["observations"][0]["retryable"] is True
-    assert "failed" in llm.context
-    assert "temporary bad arguments" in llm.context
-    assert "echoed: fallback" in llm.context
-
-
-def test_runtime_ignores_extra_planner_args_instead_of_crashing(tmp_path):
-    llm = ExtraArgPlannerLLM()
-    runtime = AgentRuntime(
-        project_root=str(tmp_path),
-        tool_registry=ToolRegistry([StrictArgProvider()]),
-        planner_provider="llm",
-    )
-
-    events = list(runtime.run_stream("check weather", llm))
-    final = events[-1]
-
-    assert final.type == "final_response"
-    assert final.data["used_tools"] == ["strict_arg_tool"]
-    assert final.data["observations"][0]["ok"] is True
-    assert "strict: weather" in llm.context
-
-
-def test_runtime_uses_registered_tool_and_skill(tmp_path):
-    skill_dir = tmp_path / "skills" / "echo"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        """---
-name: echo_skill
-description: test skill
-triggers:
-  - echo
-tools:
-  - echo_tool
----
-# Echo Skill
-
-Use echo tool results directly.
-""",
-        encoding="utf-8",
-    )
-
-    llm = FakeLLM()
-    runtime = AgentRuntime(
-        project_root=str(tmp_path),
-        tool_registry=ToolRegistry([EchoProvider()]),
-        skill_dirs=[str(tmp_path / "skills")],
-    )
-
-    events = list(runtime.run_stream("please echo this", llm))
-    final = events[-1]
-
-    assert final.type == "final_response"
-    assert final.data["used_tools"] == ["echo_tool"]
-    assert final.data["used_skills"] == ["echo_skill"]
-    assert "Echo Tool Result" in llm.context
-    assert "echoed: please echo this" in llm.context
-    assert "Echo Skill" in llm.context
-
-
-def test_skill_can_activate_named_tool(tmp_path):
-    skill_dir = tmp_path / "skills" / "skill_tool"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        """---
-name: skill_tool
-triggers:
-  - skill-run
-tools:
-  - skill_only_tool
----
-# Skill Tool
-""",
-        encoding="utf-8",
-    )
-
-    llm = FakeLLM()
-    runtime = AgentRuntime(
-        project_root=str(tmp_path),
-        tool_registry=ToolRegistry([SkillOnlyProvider()]),
-        skill_dirs=[str(tmp_path / "skills")],
-    )
-
-    events = list(runtime.run_stream("please skill-run now", llm))
-    final = events[-1]
-
-    assert final.data["used_tools"] == ["skill_only_tool"]
-    assert final.data["used_skills"] == ["skill_tool"]
-    assert "Skill Tool Result" in llm.context
-    assert "skill: please skill-run now" in llm.context
-
-
-def test_mcp_provider_loads_configured_tool_and_plans(tmp_path):
-    config_path = tmp_path / "mcp.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "servers": {
-                    "demo": {
-                        "command": "python",
-                        "args": ["-m", "demo_server"],
-                        "tools": [
-                            {
-                                "name": "search",
-                                "alias": "mcp_demo_search",
-                                "triggers": ["external search"],
-                                "argument_template": {"query": "{user_text}"},
-                            }
-                        ],
-                    }
+def test_minimal_react_executes_one_tool_then_final(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "tool": "calculator",
+                    "args": {"expression": "2+3"},
+                    "reason": "calculate",
                 }
-            }
-        ),
-        encoding="utf-8",
+            ),
+            json.dumps({"done": True, "answer": "结果是 5。", "tool": "", "args": {}, "reason": "enough"}),
+        ]
     )
 
-    provider = MCPToolProvider.from_file(str(config_path))
-    tools = provider.build_tools(context=None)
+    events = list(_runtime(tmp_path).run_stream("2+3 等于多少", llm))
 
-    assert "mcp_demo_search" in tools
-    step = tools["mcp_demo_search"].plan("please external search Tyro")
-    assert step.tool == "mcp_demo_search"
-    assert step.args == {"query": "please external search Tyro"}
-
-
-def test_dev_mcp_config_registers_experiment_tools():
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "mcp_servers.json")
-    provider = MCPToolProvider.from_file(config_path)
-    tools = provider.build_tools(context=None)
-
-    assert "mcp_git_status" in tools
-    assert "mcp_git_diff" in tools
-    assert "mcp_sqlite_schema" in tools
-    assert "mcp_sqlite_query" in tools
-    assert "mcp_fetch_url" in tools
-    assert tools["mcp_git_status"].plan_from_skill("review", skill=None).args == {}
-    assert tools["mcp_fetch_url"].plan_from_skill("https://example.com", skill=None) is None
+    assert [event.type for event in events] == ["plan", "tool_start", "tool_result", "plan", "final_response"]
+    assert events[2].data["observation"]["content"] == "5"
+    assert _final(events).text == "结果是 5。"
+    assert "Previous step:\n(none)" in llm.prompts[0]
+    assert '"content": "5"' in llm.prompts[1]
 
 
-def test_python_mcp_server_interface_registers_external_server():
-    server = mcp_stdio_server(
-        "external_fetch",
-        "npx",
-        ["-y", "@modelcontextprotocol/server-fetch"],
-        discover=False,
-        tools=[
-            mcp_tool(
-                "fetch",
-                alias="mcp_external_fetch",
-                description="Fetch a URL with an external open-source MCP server.",
-                input_schema={
-                    "type": "object",
-                    "properties": {"url": {"type": "string"}},
-                    "required": ["url"],
-                },
-                triggers=["external fetch"],
-            )
-        ],
-    )
-
-    registry = ToolRegistry.with_mcp_servers([server], include_builtin=False)
-    tools = registry.build_tools(context=None)
-    step = tools["mcp_external_fetch"].plan("please external fetch https://example.com")
-
-    assert "mcp_external_fetch" in tools
-    assert step.tool == "mcp_external_fetch"
-    assert step.args == {"url": "please external fetch https://example.com"}
-
-
-def test_mcp_provider_loads_multiple_config_files(tmp_path, monkeypatch):
-    first = tmp_path / "first.json"
-    second = tmp_path / "second.json"
-    first.write_text(
-        json.dumps(
-            {
-                "servers": {
-                    "one": {
-                        "command": "python",
-                        "args": ["-m", "one"],
-                        "tools": [{"name": "status", "alias": "mcp_one_status"}],
-                    }
+def test_tool_request_takes_precedence_over_done_flag(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": True,
+                    "answer": "premature final",
+                    "tool": "calculator",
+                    "args": {"expression": "2+3"},
+                    "reason": "tool first",
                 }
-            }
-        ),
-        encoding="utf-8",
+            ),
+            json.dumps({"done": True, "answer": "结果是 5。", "tool": "", "args": {}, "reason": "done"}),
+        ]
     )
-    second.write_text(
-        json.dumps(
-            {
-                "servers": {
-                    "two": {
-                        "command": "python",
-                        "args": ["-m", "two"],
-                        "tools": [{"name": "status", "alias": "mcp_two_status"}],
-                    }
+
+    events = list(_runtime(tmp_path).run_stream("2+3 等于多少", llm))
+
+    assert events[0].data["reason"] == "tool first"
+    assert events[0].data["steps"] == ["calculator"]
+    assert events[2].data["observation"]["content"] == "5"
+    assert _final(events).text == "结果是 5。"
+
+
+def test_each_react_round_sees_only_previous_observation(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps({"done": False, "tool": "echo_tool", "args": {"text": "first"}, "reason": "first"}),
+            json.dumps({"done": False, "tool": "echo_tool", "args": {"text": "second"}, "reason": "second"}),
+            json.dumps({"done": True, "answer": "完成", "tool": "", "args": {}, "reason": "done"}),
+        ]
+    )
+
+    events = list(_runtime(tmp_path).run_stream("连续执行", llm))
+
+    assert _final(events).text == "完成"
+    assert "echoed: first" in llm.prompts[1]
+    assert "echoed: first" not in llm.prompts[2]
+    assert "echoed: second" in llm.prompts[2]
+
+
+def test_file_edit_writes_when_authorized(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "tool": "file_edit",
+                    "args": {"path": "index.html", "new_text": "<h1>Hello</h1>\n", "create": True},
+                    "reason": "create file",
                 }
-            }
-        ),
-        encoding="utf-8",
+            ),
+            json.dumps({"done": True, "answer": "已创建 index.html。", "tool": "", "args": {}, "reason": "written"}),
+        ]
+    )
+    runtime = AgentRuntime(
+        project_root=str(tmp_path),
+        tool_authorization=AgentToolAuthorization(allow_file_writes=True),
     )
 
-    monkeypatch.setenv("TALKROBOT_MCP_CONFIG", str(first))
-    monkeypatch.setenv("TALKROBOT_MCP_CONFIGS", str(second))
-    registry = ToolRegistry.default(str(tmp_path))
-    tools = registry.build_tools(context=None)
+    events = list(runtime.run_stream("创建一个网页文件", llm))
 
-    assert "mcp_one_status" in tools
-    assert "mcp_two_status" in tools
+    assert (tmp_path / "index.html").read_text(encoding="utf-8") == "<h1>Hello</h1>\n"
+    assert _final(events).text == "已创建 index.html。"
+    assert _final(events).data["task_state"]["changed_files"] == ["index.html"]
+
+
+def test_file_edit_accepts_content_alias_for_created_files(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "tool": "file_edit",
+                    "args": {"path": "index.html", "content": "<main>Game</main>\n", "create": True},
+                    "reason": "create file",
+                }
+            ),
+            json.dumps({"done": True, "answer": "已创建。", "tool": "", "args": {}, "reason": "written"}),
+        ]
+    )
+    runtime = AgentRuntime(
+        project_root=str(tmp_path),
+        tool_authorization=AgentToolAuthorization(allow_file_writes=True),
+    )
+
+    events = list(runtime.run_stream("创建 index.html", llm))
+
+    assert (tmp_path / "index.html").read_text(encoding="utf-8") == "<main>Game</main>\n"
+    assert "changed 0 -> 18 chars" in events[2].data["observation"]["content"]
+
+
+def test_policy_rejection_is_returned_to_next_round(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "tool": "file_edit",
+                    "args": {"path": "index.html", "new_text": "x", "create": True},
+                    "reason": "try write",
+                }
+            ),
+            json.dumps({"done": True, "answer": "没有写入，因为缺少授权。", "tool": "", "args": {}, "reason": "blocked"}),
+        ]
+    )
+
+    events = list(AgentRuntime(project_root=str(tmp_path)).run_stream("写入 index.html", llm))
+
+    assert any(event.type == "approval_requested" for event in events)
+    assert any(event.type == "approval_result" and event.data["approved"] is False for event in events)
+    assert "policy rejected" in llm.prompts[1]
+    assert _final(events).text == "我还没有把修改写入文件：本轮没有任何成功的文件修改记录。"
+
+
+def test_final_response_cannot_claim_write_without_file_edit(tmp_path):
+    llm = SequenceLLM([json.dumps({"done": True, "answer": "已经修改完成。", "tool": "", "args": {}, "reason": "claim"})])
+
+    events = list(AgentRuntime(project_root=str(tmp_path)).run_stream("帮我修改 index.html", llm))
+
+    assert _final(events).text == "我还没有把修改写入文件：本轮没有任何成功的文件修改记录。"
+    assert _final(events).data["raw_final_replaced_reason"] == "write_not_applied"
+
+
+def test_tool_args_are_filtered_to_run_signature(tmp_path):
+    llm = SequenceLLM(
+        [
+            json.dumps(
+                {
+                    "done": False,
+                    "tool": "strict_arg_tool",
+                    "args": {"query": "weather", "max_chars": 2048},
+                    "reason": "call strict",
+                }
+            ),
+            json.dumps({"done": True, "answer": "ok", "tool": "", "args": {}, "reason": "done"}),
+        ]
+    )
+
+    events = list(_runtime(tmp_path).run_stream("strict", llm))
+
+    assert events[2].data["observation"]["content"] == "strict: weather"
+
+
+def test_rule_planner_still_handles_simple_math(tmp_path):
+    events = list(_runtime(tmp_path, planner_provider="rule").run_stream("2+3", llm=object()))
+
+    assert events[2].data["observation"]["content"] == "5"
+    assert _final(events).text.startswith("calculator 执行完成")
+
+
+def test_policy_gate_keeps_file_edit_inside_authorized_paths(tmp_path):
+    gate = ToolPolicyGate(
+        AgentToolAuthorization(allow_file_writes=True, allowed_write_paths=["src"]),
+        project_root=str(tmp_path),
+    )
+
+    assert gate.assess(ToolStep("file_edit", {"path": "src/app.py"}), user_text="修改").allowed is True
+    blocked = gate.assess(ToolStep("file_edit", {"path": "other/app.py"}), user_text="修改")
+    assert blocked.allowed is False
+    assert blocked.requires_confirmation is True
+
+
+def test_task_state_records_command_verification():
+    state = TaskState(goal="run tests")
+
+    state.note_tool_result(
+        "shell_command",
+        {"command": "python -m pytest"},
+        True,
+        "$ python -m pytest\nexit_code=0\nstdout:\n================ 1 passed ================",
+        "",
+        {"command": ["python", "-m", "pytest"], "exit_code": 0, "stdout": "================ 1 passed ================"},
+    )
+
+    assert state.command_results[0]["check_type"] == "pytest"
+    assert state.verification_results

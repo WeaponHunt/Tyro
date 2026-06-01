@@ -1,21 +1,24 @@
-"""Event-driven first-version agent runtime."""
+"""Small event-driven ReAct runtime."""
 from __future__ import annotations
 
-import os
-import json
 import inspect
+import json
+import os
+import re
 import time
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Dict, Iterable, Iterator, Optional
 
 from talkrobot.agent.events import AgentEvent
-from talkrobot.agent.planner import AgentPlanner
+from talkrobot.agent.planner import AgentPlanner, ReactDecision, ToolStep
+from talkrobot.agent.policy import AgentToolAuthorization, ToolApprovalRequest, ToolPolicyGate
 from talkrobot.agent.skills import SkillRegistry
+from talkrobot.agent.state import TaskState
 from talkrobot.agent.tools import RuntimeToolContext, ToolRegistry, ToolResult
 from talkrobot.config import Config
 
 
 class AgentRuntime:
-    """Plans low-risk tool calls, executes them, then asks the LLM to respond."""
+    """Runs one simple ReAct loop for a user turn."""
 
     def __init__(
         self,
@@ -25,6 +28,7 @@ class AgentRuntime:
         skill_dirs: Optional[Iterable[str]] = None,
         planner_provider: Optional[str] = None,
         max_react_iterations: Optional[int] = None,
+        tool_authorization: Optional[AgentToolAuthorization] = None,
     ):
         self.project_root = os.path.abspath(project_root or os.getcwd())
         self.language = (language or "zh").strip().lower()
@@ -32,6 +36,8 @@ class AgentRuntime:
         self.tool_registry = tool_registry or ToolRegistry.default(self.project_root)
         self.skills = SkillRegistry(self._resolve_skill_dirs(skill_dirs))
         self.max_react_iterations = max(1, int(max_react_iterations or Config.AGENT_REACT_MAX_ITERATIONS))
+        self.tool_authorization = tool_authorization or AgentToolAuthorization()
+        self.policy_gate = ToolPolicyGate(self.tool_authorization, project_root=self.project_root)
 
     @classmethod
     def with_mcp_servers(
@@ -40,13 +46,8 @@ class AgentRuntime:
         project_root: Optional[str] = None,
         **kwargs,
     ) -> "AgentRuntime":
-        """Build an AgentRuntime with built-ins plus explicit MCP servers."""
         root = os.path.abspath(project_root or os.getcwd())
-        return cls(
-            project_root=root,
-            tool_registry=ToolRegistry.with_mcp_servers(mcp_servers),
-            **kwargs,
-        )
+        return cls(project_root=root, tool_registry=ToolRegistry.with_mcp_servers(mcp_servers), **kwargs)
 
     @property
     def _is_english(self) -> bool:
@@ -54,6 +55,15 @@ class AgentRuntime:
 
     def _msg(self, zh: str, en: str) -> str:
         return en if self._is_english else zh
+
+    def _tool_context(self, memory_module=None, long_term_memory: bool = False) -> RuntimeToolContext:
+        return RuntimeToolContext(
+            project_root=self.project_root,
+            memory_module=memory_module,
+            long_term_memory=long_term_memory,
+            language=self.language,
+            tool_authorization=self.tool_authorization,
+        )
 
     def run_stream(
         self,
@@ -65,227 +75,365 @@ class AgentRuntime:
         switch_notice: str = "",
         system_prompt_override: str = "",
         streaming: bool = False,
+        approval_callback: Optional[Callable[[ToolApprovalRequest], bool]] = None,
     ) -> Iterator[AgentEvent]:
+        del sliding_window_context, switch_notice, system_prompt_override, streaming
         turn_start = time.perf_counter()
-        tools = self.tool_registry.build_tools(
-            RuntimeToolContext(
-                project_root=self.project_root,
-                memory_module=memory_module,
-                long_term_memory=long_term_memory,
-                language=self.language,
-            )
-        )
-        tool_context_parts = []
-        matched_skills = []
-        matched_skill_names = set()
-        tool_results = []
+        tools = self.tool_registry.build_tools(self._tool_context(memory_module, long_term_memory))
+        task_state = TaskState(goal=user_text, mode="react")
         observations = []
-        completed_step_signatures = set()
-        react_iterations = self.max_react_iterations if self.planner.provider == "llm" else 1
+        tool_results = []
+        previous_observation = None
 
-        for iteration in range(1, react_iterations + 1):
-            plan = self.planner.plan(
+        for iteration in range(1, self.max_react_iterations + 1):
+            decision = self.planner.decide(
                 user_text,
-                use_memory=long_term_memory and memory_module is not None,
                 tools=tools.values(),
                 llm=llm,
-                observations=self._format_observations(observations),
-                completed_steps=sorted(completed_step_signatures),
-            )
-            planned_tools = [step.tool for step in plan.steps]
-            new_skills = [
-                skill
-                for skill in self.skills.match(user_text, planned_tools)
-                if skill.name not in matched_skill_names
-            ]
-            if new_skills:
-                matched_skills.extend(new_skills)
-                matched_skill_names.update(skill.name for skill in new_skills)
-
-            skill_steps = self.planner.plan_skill_tools(
-                user_text,
-                tools.values(),
-                new_skills,
-                planned_tools + list(completed_step_signatures),
-            )
-            if skill_steps:
-                plan.steps.extend(skill_steps)
-                planned_tools = [step.tool for step in plan.steps]
-                plan.mode = "tool_assisted"
-
-            executable_steps = [
-                step
-                for step in plan.steps
-                if step.tool in tools and self._step_signature(step) not in completed_step_signatures
-            ]
-            yield AgentEvent(
-                type="plan",
-                text=self._msg("我先规划一下。", "I'll plan this out first."),
-                speakable=False,
-                data={
-                    "mode": plan.mode,
-                    "planner": self.planner.provider,
-                    "reason": plan.reason,
-                    "iteration": iteration,
-                    "steps": [step.tool for step in executable_steps],
-                    "skills": [skill.name for skill in matched_skills],
-                    "observations": len(observations),
-                },
+                previous_observation=previous_observation,
+                authorization_context=self._authorization_context_text(),
             )
 
-            if new_skills:
-                skill_context = "\n\n".join(skill.to_context() for skill in new_skills)
-                tool_context_parts.append(f"已加载技能说明:\n{skill_context}")
-                yield AgentEvent(
-                    type="skill_loaded",
-                    text=self._msg("我加载了相关技能。", "I loaded a relevant skill."),
-                    speakable=False,
-                    data={"skills": [skill.name for skill in new_skills]},
+            step = decision.step
+            yield self._plan_event(iteration, decision)
+
+            if decision.done or step is None:
+                text = decision.answer or self._msg("我没有更多需要执行的操作。", "I have no more actions to run.")
+                yield self._final_event(text, task_state, observations, tool_results, turn_start, decision.reason)
+                return
+
+            if step.tool not in tools:
+                previous_observation = self._record_observation(
+                    observations,
+                    tool_results,
+                    task_state,
+                    step,
+                    ToolResult(ok=False, error=f"unknown tool: {step.tool}"),
+                    iteration,
+                    elapsed_ms=0,
+                    retryable=False,
                 )
-
-            if not executable_steps:
-                break
-
-            any_retryable_failure = False
-            for step in executable_steps:
-                signature = self._step_signature(step)
-                completed_step_signatures.add(signature)
-                tool = tools.get(step.tool)
-                if tool is None:
-                    continue
-
-                yield AgentEvent(
-                    type="tool_start",
-                    text=tool.speakable_start,
-                    speakable=step.tool != "memory_search",
-                    data={"tool": step.tool, "reason": step.reason, "iteration": iteration},
+                yield AgentEvent.error(
+                    self._msg("模型选择了不存在的工具。", "The model selected an unknown tool."),
+                    stage=step.tool,
+                    error=previous_observation["error"],
+                    elapsed_ms=0,
+                    retryable=False,
                 )
-                started = time.perf_counter()
-                result = self._run_tool(tool, step.args)
-                elapsed_ms = round((time.perf_counter() - started) * 1000)
-                retryable = (not result.ok) and self._is_retryable_tool_error(result.error)
-                any_retryable_failure = any_retryable_failure or retryable
-                observation = {
-                    "iteration": iteration,
-                    "tool": step.tool,
-                    "args": step.args,
-                    "ok": result.ok,
-                    "content": result.content,
-                    "error": result.error,
-                    "retryable": retryable,
-                }
-                observations.append(observation)
-                tool_results.append(
-                    {
-                        "tool": step.tool,
-                        "ok": result.ok,
-                        "elapsed_ms": elapsed_ms,
-                        "error": result.error,
-                        "retryable": retryable,
-                    }
-                )
+                continue
 
-                if result.ok and result.content:
-                    label = self._tool_label(step.tool, tool)
-                    tool_context_parts.append(f"{label}:\n{result.content}")
-                elif not result.ok:
-                    yield AgentEvent.error(
-                        self._msg("有个工具执行失败了，我会先用已有信息继续。", "A tool failed, I'll continue with what I have."),
-                        stage=step.tool,
-                        error=result.error,
-                        elapsed_ms=elapsed_ms,
-                        retryable=retryable,
-                    )
-
-                yield AgentEvent(
-                    type="tool_result",
-                    text=self._tool_result_text(step.tool, result.ok, result.content),
-                    speakable=False,
-                    data={
-                        "tool": step.tool,
-                        "ok": result.ok,
-                        "elapsed_ms": elapsed_ms,
-                        "iteration": iteration,
-                        "retryable": retryable,
-                    },
-                )
-
-            if self.planner.provider != "llm":
-                break
-            if iteration >= react_iterations:
-                break
-            if plan.mode == "chat":
-                break
-            if not any_retryable_failure and self._all_recent_steps_empty_or_terminal(executable_steps, observations):
-                break
-
-        if observations:
-            tool_context_parts.append(
-                "工具执行观察:\n" + self._format_observations(observations, include_content=True)
+            previous_observation = yield from self._execute_one_step(
+                step,
+                tools[step.tool],
+                task_state,
+                observations,
+                tool_results,
+                user_text=user_text,
+                iteration=iteration,
+                approval_callback=approval_callback,
             )
 
-        context = self._merge_context(switch_notice, tool_context_parts, sliding_window_context)
-        yield AgentEvent(
-            type="llm_start",
-            text=self._msg("我开始整理回复。", "I'll compose the reply now."),
-            speakable=False,
-            data={"context_chars": len(context)},
+        yield self._final_event(
+            self._msg(
+                "我已达到本轮最大 ReAct 迭代次数，先停止以避免无限循环。当前任务还没有可靠完成。",
+                "I reached the maximum ReAct iterations and stopped to avoid an infinite loop. The task is not reliably complete yet.",
+            ),
+            task_state,
+            observations,
+            tool_results,
+            turn_start,
+            reason="max_iterations",
         )
 
-        llm_start = time.perf_counter()
-        if streaming and hasattr(llm, "generate_response_stream"):
-            parts = []
-            for chunk in llm.generate_response_stream(
-                user_text,
-                context,
-                system_prompt_override=system_prompt_override,
-            ):
-                parts.append(chunk)
-                yield AgentEvent(type="llm_chunk", text=chunk, speakable=False)
-            raw_response = "".join(parts)
-        else:
-            raw_response = llm.generate_response(
-                user_text,
-                context,
-                system_prompt_override=system_prompt_override,
-            )
+    def _execute_one_step(
+        self,
+        step: ToolStep,
+        tool,
+        task_state: TaskState,
+        observations,
+        tool_results,
+        *,
+        user_text: str,
+        iteration: int,
+        approval_callback: Optional[Callable[[ToolApprovalRequest], bool]],
+    ) -> Iterator[AgentEvent]:
+        policy = self.policy_gate.assess(step, user_text=user_text, risk_level="low")
+        if not policy.allowed:
+            approved_by_user = False
+            if policy.requires_confirmation:
+                request = ToolApprovalRequest(
+                    tool=step.tool,
+                    args=step.args if isinstance(step.args, dict) else {},
+                    reason=step.reason,
+                    policy_reason=policy.reason,
+                    risk_level="low",
+                )
+                yield AgentEvent(
+                    type="approval_requested",
+                    text=self._msg("这个操作需要你的确认。", "This operation needs your approval."),
+                    speakable=True,
+                    data=request.to_dict(),
+                )
+                approved_by_user = self._resolve_approval(approval_callback, request)
+                yield AgentEvent(
+                    type="approval_result",
+                    text=self._msg("已批准。", "Approved.") if approved_by_user else self._msg("未批准。", "Not approved."),
+                    speakable=False,
+                    data={**request.to_dict(), "approved": approved_by_user},
+                )
+
+            if not approved_by_user:
+                result = ToolResult(ok=False, error=f"policy rejected: {policy.reason}")
+                observation = self._record_observation(
+                    observations,
+                    tool_results,
+                    task_state,
+                    step,
+                    result,
+                    iteration,
+                    elapsed_ms=0,
+                    retryable=False,
+                )
+                yield AgentEvent.error(
+                    self._msg("这个工具调用被安全策略拦截了。", "The tool call was blocked by policy."),
+                    stage=step.tool,
+                    error=result.error,
+                    elapsed_ms=0,
+                    retryable=False,
+                )
+                yield self._tool_result_event(step.tool, result, iteration, 0, False, observation, policy_rejected=True)
+                return observation
 
         yield AgentEvent(
-            type="final_response",
-            text=raw_response,
-            speakable=True,
+            type="tool_start",
+            text=getattr(tool, "speakable_start", ""),
+            speakable=step.tool != "memory_search",
+            data={"tool": step.tool, "reason": step.reason, "iteration": iteration},
+        )
+        started = time.perf_counter()
+        result = self._run_tool(tool, step.args)
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        retryable = (not result.ok) and self._is_retryable_tool_error(result.error)
+        observation = self._record_observation(
+            observations,
+            tool_results,
+            task_state,
+            step,
+            result,
+            iteration,
+            elapsed_ms=elapsed_ms,
+            retryable=retryable,
+        )
+
+        if not result.ok:
+            yield AgentEvent.error(
+                self._msg("工具执行失败。", "Tool execution failed."),
+                stage=step.tool,
+                error=result.error,
+                elapsed_ms=elapsed_ms,
+                retryable=retryable,
+            )
+        yield self._tool_result_event(step.tool, result, iteration, elapsed_ms, retryable, observation)
+        return observation
+
+    def _record_observation(
+        self,
+        observations,
+        tool_results,
+        task_state: TaskState,
+        step: ToolStep,
+        result: ToolResult,
+        iteration: int,
+        *,
+        elapsed_ms: int,
+        retryable: bool,
+    ) -> dict:
+        observation = {
+            "iteration": iteration,
+            "tool": step.tool,
+            "args": step.args,
+            "ok": result.ok,
+            "content": result.content,
+            "error": result.error,
+            "data": result.data,
+            "retryable": retryable,
+        }
+        observations.append(observation)
+        tool_results.append(
+            {
+                "tool": step.tool,
+                "ok": result.ok,
+                "elapsed_ms": elapsed_ms,
+                "error": result.error,
+                "retryable": retryable,
+            }
+        )
+        task_state.note_tool_result(step.tool, step.args, result.ok, result.content, result.error, result.data)
+        return observation
+
+    def _plan_event(self, iteration: int, decision: ReactDecision) -> AgentEvent:
+        step = decision.step
+        return AgentEvent(
+            type="plan",
+            text=self._msg("我判断下一步。", "I'll choose the next step."),
+            speakable=False,
             data={
-                "context": context,
-                "tool_results": tool_results,
-                "observations": observations,
-                "react_iterations": len({item["iteration"] for item in observations}),
-                "llm_elapsed_ms": round((time.perf_counter() - llm_start) * 1000),
-                "total_elapsed_ms": round((time.perf_counter() - turn_start) * 1000),
-                "used_memory": any(r["tool"] == "memory_search" and r["ok"] for r in tool_results),
-                "used_tools": [r["tool"] for r in tool_results if r["tool"] != "memory_search"],
-                "used_skills": [skill.name for skill in matched_skills],
+                "mode": "final" if decision.done or step is None else "tool_assisted",
+                "planner": self.planner.provider,
+                "reason": decision.reason,
+                "iteration": iteration,
+                "steps": [step.tool] if step is not None else [],
             },
         )
 
-    def _merge_context(
+    def _tool_result_event(
         self,
-        switch_notice: str,
-        tool_context_parts: Iterable[str],
-        sliding_window_context: str,
-    ) -> str:
-        sections = []
-        if switch_notice:
-            sections.append(switch_notice)
-        sections.extend(part for part in tool_context_parts if part)
-        if sliding_window_context:
-            sections.append(sliding_window_context)
-        return "\n\n".join(sections)
+        tool_name: str,
+        result: ToolResult,
+        iteration: int,
+        elapsed_ms: int,
+        retryable: bool,
+        observation: dict,
+        *,
+        policy_rejected: bool = False,
+    ) -> AgentEvent:
+        data = {
+            "tool": tool_name,
+            "ok": result.ok,
+            "elapsed_ms": elapsed_ms,
+            "iteration": iteration,
+            "retryable": retryable,
+            "observation": observation,
+        }
+        if policy_rejected:
+            data["policy_rejected"] = True
+        return AgentEvent(
+            type="tool_result",
+            text=self._tool_result_text(tool_name, result.ok, result.content),
+            speakable=False,
+            data=data,
+        )
 
-    def _tool_label(self, tool_name: str, tool=None) -> str:
-        context_label = getattr(tool, "context_label", "")
-        if context_label:
-            return context_label
-        return f"工具结果 {tool_name}"
+    def _final_event(
+        self,
+        text: str,
+        task_state: TaskState,
+        observations,
+        tool_results,
+        turn_start: float,
+        reason: str = "",
+    ) -> AgentEvent:
+        raw_text = str(text or "")
+        replacement_reason = self._final_replacement_reason(raw_text, task_state)
+        final_text = self._final_text_or_incomplete(raw_text, task_state)
+        return AgentEvent(
+            type="final_response",
+            text=final_text,
+            speakable=True,
+            data={
+                "observations": observations,
+                "tool_results": tool_results,
+                "react_iterations": len({item["iteration"] for item in observations}),
+                "llm_elapsed_ms": 0,
+                "total_elapsed_ms": round((time.perf_counter() - turn_start) * 1000),
+                "used_memory": any(r["tool"] == "memory_search" and r["ok"] for r in tool_results),
+                "used_tools": [r["tool"] for r in tool_results if r["tool"] != "memory_search"],
+                "mode": "react",
+                "risk_level": "low",
+                "reason": reason,
+                "raw_final_was_tool_directive": replacement_reason == "tool_directive",
+                "raw_final_replaced_reason": replacement_reason,
+                "task_state": self._task_state_payload(task_state),
+            },
+        )
+
+    def _final_text_or_incomplete(self, text: str, task_state: Optional[TaskState] = None) -> str:
+        reason = self._final_replacement_reason(text, task_state)
+        if reason == "tool_directive":
+            return self._msg(
+                "我还没有完成这次任务：模型在最终回复里又请求调用工具，已停止以避免误报。",
+                "I have not completed this task: the model requested another tool call in the final reply, so I stopped instead of reporting success.",
+            )
+        if reason == "write_not_applied":
+            return self._msg(
+                "我还没有把修改写入文件：本轮没有任何成功的文件修改记录。",
+                "I have not written changes to disk: this turn has no successful file-edit record.",
+            )
+        return text
+
+    def _final_replacement_reason(self, text: str, task_state: Optional[TaskState] = None) -> str:
+        if self._looks_like_tool_directive(text):
+            return "tool_directive"
+        if self._write_requested_without_changes(task_state):
+            return "write_not_applied"
+        return ""
+
+    @staticmethod
+    def _write_requested_without_changes(task_state: Optional[TaskState]) -> bool:
+        if task_state is None or task_state.changed_files:
+            return False
+        goal = str(task_state.goal or "").casefold()
+        markers = (
+            "帮我修复",
+            "修复这个",
+            "修复bug",
+            "修复 bug",
+            "修改",
+            "改一下",
+            "替换",
+            "写入",
+            "写到文件",
+            "fix this",
+            "fix the",
+            "fix bug",
+            "modify",
+            "update",
+            "patch",
+            "write",
+            "replace",
+        )
+        return any(marker in goal for marker in markers)
+
+    @staticmethod
+    def _looks_like_tool_directive(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        if re.search(r"<\s*/?\s*tool(?:_use)?\s*>", stripped, flags=re.IGNORECASE):
+            return True
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s*\n\s*\{[\s\S]*\}\s*", stripped))
+
+    @staticmethod
+    def _task_state_payload(task_state: TaskState) -> dict:
+        return {
+            "goal": task_state.goal,
+            "mode": task_state.mode,
+            "facts": task_state.facts,
+            "attempted_actions": task_state.attempted_actions,
+            "failed_attempts": task_state.failed_attempts,
+            "changed_files": task_state.changed_files,
+            "verification_results": task_state.verification_results,
+            "repo_summary": task_state.repo_summary,
+            "test_commands": task_state.test_commands,
+            "command_results": task_state.command_results,
+        }
+
+    def _authorization_payload(self) -> dict:
+        return {
+            "allow_shell_commands": self.tool_authorization.allow_shell_commands,
+            "allowed_command_prefixes": self.tool_authorization.command_prefixes(),
+            "allow_file_writes": self.tool_authorization.allow_file_writes,
+            "allowed_write_paths": self.tool_authorization.allowed_write_paths,
+        }
+
+    def _authorization_context_text(self) -> str:
+        payload = self._authorization_payload()
+        return (
+            f"shell_command authorized: {payload['allow_shell_commands']}; "
+            f"allowed command prefixes: {payload['allowed_command_prefixes']}; "
+            f"file_edit authorized: {payload['allow_file_writes']}; "
+            f"allowed write paths: {payload['allowed_write_paths']}"
+        )
 
     def _tool_result_text(self, tool_name: str, ok: bool, content: str) -> str:
         if not ok:
@@ -295,15 +443,6 @@ class AgentRuntime:
         if content:
             return self._msg("工具执行完成。", "Tool execution finished.")
         return self._msg("工具没有返回额外内容。", "Tool returned no extra content.")
-
-    @staticmethod
-    def _step_signature(step) -> str:
-        return json.dumps(
-            {"tool": step.tool, "args": step.args},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
 
     def _run_tool(self, tool, args) -> ToolResult:
         try:
@@ -333,6 +472,18 @@ class AgentRuntime:
         return {key: value for key, value in args.items() if key in allowed}
 
     @staticmethod
+    def _resolve_approval(
+        approval_callback: Optional[Callable[[ToolApprovalRequest], bool]],
+        request: ToolApprovalRequest,
+    ) -> bool:
+        if approval_callback is None:
+            return False
+        try:
+            return bool(approval_callback(request))
+        except Exception:
+            return False
+
+    @staticmethod
     def _is_retryable_tool_error(error: str) -> bool:
         text = (error or "").casefold()
         if not text:
@@ -347,29 +498,6 @@ class AgentRuntime:
             "empty memory",
         )
         return not any(marker in text for marker in non_retryable)
-
-    @staticmethod
-    def _format_observations(observations, include_content: bool = False) -> str:
-        lines = []
-        for index, item in enumerate(observations, start=1):
-            status = "ok" if item.get("ok") else "failed"
-            line = f"{index}. [{status}] {item.get('tool')} args={item.get('args')}"
-            if item.get("error"):
-                line += f" error={item.get('error')}"
-            if include_content and item.get("content"):
-                content = str(item.get("content"))
-                if len(content) > 1200:
-                    content = content[:1200].rstrip() + "\n..."
-                line += f"\n{content}"
-            lines.append(line)
-        return "\n".join(lines)
-
-    @staticmethod
-    def _all_recent_steps_empty_or_terminal(steps, observations) -> bool:
-        recent = observations[-len(steps):] if steps else []
-        if not recent:
-            return True
-        return all((item.get("ok") and not item.get("content")) or (not item.get("ok") and not item.get("retryable")) for item in recent)
 
     def _resolve_skill_dirs(self, skill_dirs: Optional[Iterable[str]]) -> Iterable[str]:
         dirs = list(skill_dirs or [])
