@@ -55,6 +55,7 @@ class AgentPlanner:
         tools: Iterable[object] = (),
         llm=None,
         previous_observation: Optional[Dict[str, Any]] = None,
+        observation_history: Iterable[Dict[str, Any]] = (),
         authorization_context: str = "",
     ) -> ReactDecision:
         tools = list(tools or ())
@@ -66,6 +67,7 @@ class AgentPlanner:
             tools=tools,
             llm=llm,
             previous_observation=previous_observation,
+            observation_history=observation_history,
             authorization_context=authorization_context,
         )
         if decision is not None:
@@ -100,6 +102,7 @@ class AgentPlanner:
         tools: Iterable[object],
         llm,
         previous_observation: Optional[Dict[str, Any]],
+        observation_history: Iterable[Dict[str, Any]] = (),
         authorization_context: str = "",
     ) -> ReactDecision | None:
         if llm is None or not hasattr(llm, "generate_response"):
@@ -108,7 +111,13 @@ class AgentPlanner:
         tool_map = {getattr(tool, "name", ""): tool for tool in tools if getattr(tool, "name", "")}
         try:
             raw = llm.generate_response(
-                self._build_react_prompt(user_text, tool_map.values(), previous_observation, authorization_context),
+                self._build_react_prompt(
+                    user_text,
+                    tool_map.values(),
+                    previous_observation,
+                    authorization_context,
+                    observation_history=observation_history,
+                ),
                 context="",
                 system_prompt_override=self._react_system_prompt(),
             )
@@ -218,6 +227,8 @@ class AgentPlanner:
             "Schema: {\"done\":true|false,\"answer\":\"...\",\"tool\":\"tool_name_or_empty\",\"args\":{},\"reason\":\"...\"}.\n"
             "If the task is complete, set done=true and put the user-facing reply in answer.\n"
             "If more work is needed, set done=false and choose exactly one tool from the list.\n"
+            "Tool definitions are MCP-style JSON objects with inputSchema. "
+            "When calling a tool, args must match that tool's inputSchema exactly; do not add properties not listed there. "
             "Use the same language as the user for answer. Do not invent tools."
         )
 
@@ -227,19 +238,31 @@ class AgentPlanner:
         tools: Iterable[object],
         previous_observation: Optional[Dict[str, Any]],
         authorization_context: str = "",
+        observation_history: Iterable[Dict[str, Any]] = (),
     ) -> str:
-        tool_lines = []
+        tool_specs = []
         for tool in tools:
             name = getattr(tool, "name", "")
             if not name:
                 continue
-            description = getattr(tool, "description", "") or ""
-            tool_lines.append(f"- {name}: {description}")
+            to_mcp_tool = getattr(tool, "to_mcp_tool", None)
+            if callable(to_mcp_tool):
+                tool_specs.append(to_mcp_tool())
+            else:
+                tool_specs.append(
+                    {
+                        "name": name,
+                        "description": getattr(tool, "description", "") or "",
+                        "inputSchema": getattr(tool, "input_schema", {}) or {"type": "object", "properties": {}},
+                    }
+                )
 
         prompt = [
             f"User task:\n{user_text}",
             "Previous step:\n" + _format_previous_observation(previous_observation),
-            "Available tools:\n" + "\n".join(tool_lines),
+            "Recent steps:\n" + _format_observation_history(observation_history),
+            "Available tools (MCP JSON; use each tool's inputSchema for args):\n"
+            + json.dumps(tool_specs, ensure_ascii=False, indent=2, default=str),
         ]
         if authorization_context:
             prompt.append("Tool authorization:\n" + authorization_context)
@@ -256,7 +279,7 @@ def _format_previous_observation(previous_observation: Optional[Dict[str, Any]])
     return json.dumps(
         {
             "tool": previous_observation.get("tool"),
-            "args": previous_observation.get("args"),
+            "args": _compact_args(previous_observation.get("args")),
             "ok": previous_observation.get("ok"),
             "content": content,
             "error": error,
@@ -264,6 +287,45 @@ def _format_previous_observation(previous_observation: Optional[Dict[str, Any]])
         ensure_ascii=False,
         default=str,
     )
+
+
+def _format_observation_history(observation_history: Iterable[Dict[str, Any]], limit: int = 5) -> str:
+    items = list(observation_history or [])[-limit:]
+    if not items:
+        return "(none)"
+    compacted = []
+    for item in items:
+        content = str(item.get("content") or "")
+        error = str(item.get("error") or "")
+        if len(content) > 800:
+            content = content[:800].rstrip() + "\n..."
+        if len(error) > 800:
+            error = error[:800].rstrip() + "\n..."
+        compacted.append(
+            {
+                "iteration": item.get("iteration"),
+                "tool": item.get("tool"),
+                "args": _compact_args(item.get("args")),
+                "ok": item.get("ok"),
+                "content": content,
+                "error": error,
+                "retryable": item.get("retryable"),
+            }
+        )
+    return json.dumps(compacted, ensure_ascii=False, default=str)
+
+
+def _compact_args(args) -> Dict[str, Any]:
+    if not isinstance(args, dict):
+        return {}
+    compacted: Dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > 240:
+            compacted[f"{key}_chars"] = len(value)
+            compacted[f"{key}_preview"] = value[:120].rstrip() + "..."
+        else:
+            compacted[key] = value
+    return compacted
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:

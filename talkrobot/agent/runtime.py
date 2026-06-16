@@ -75,9 +75,10 @@ class AgentRuntime:
         switch_notice: str = "",
         system_prompt_override: str = "",
         streaming: bool = False,
+        progress_events: bool = False,
         approval_callback: Optional[Callable[[ToolApprovalRequest], bool]] = None,
     ) -> Iterator[AgentEvent]:
-        del sliding_window_context, switch_notice, system_prompt_override, streaming
+        del sliding_window_context, switch_notice, system_prompt_override
         turn_start = time.perf_counter()
         tools = self.tool_registry.build_tools(self._tool_context(memory_module, long_term_memory))
         task_state = TaskState(goal=user_text, mode="react")
@@ -86,11 +87,18 @@ class AgentRuntime:
         previous_observation = None
 
         for iteration in range(1, self.max_react_iterations + 1):
+            if progress_events:
+                yield self._llm_start_event(
+                    stage="react_planner",
+                    iteration=iteration,
+                    context_chars=len(str(previous_observation or "")),
+                )
             decision = self.planner.decide(
                 user_text,
                 tools=tools.values(),
                 llm=llm,
                 previous_observation=previous_observation,
+                observation_history=observations,
                 authorization_context=self._authorization_context_text(),
             )
 
@@ -99,7 +107,17 @@ class AgentRuntime:
 
             if decision.done or step is None:
                 text = decision.answer or self._msg("我没有更多需要执行的操作。", "I have no more actions to run.")
-                yield self._final_event(text, task_state, observations, tool_results, turn_start, decision.reason)
+                yield from self._final_events(
+                    text,
+                    task_state,
+                    observations,
+                    tool_results,
+                    turn_start,
+                    decision.reason,
+                    llm=llm,
+                    streaming=streaming,
+                    progress_events=progress_events,
+                )
                 return
 
             if step.tool not in tools:
@@ -133,7 +151,7 @@ class AgentRuntime:
                 approval_callback=approval_callback,
             )
 
-        yield self._final_event(
+        yield from self._final_events(
             self._msg(
                 "我已达到本轮最大 ReAct 迭代次数，先停止以避免无限循环。当前任务还没有可靠完成。",
                 "I reached the maximum ReAct iterations and stopped to avoid an infinite loop. The task is not reliably complete yet.",
@@ -143,6 +161,17 @@ class AgentRuntime:
             tool_results,
             turn_start,
             reason="max_iterations",
+            llm=llm,
+            streaming=streaming,
+            progress_events=progress_events,
+        )
+
+    def _llm_start_event(self, *, stage: str, iteration: int, context_chars: int = 0) -> AgentEvent:
+        return AgentEvent(
+            type="llm_start",
+            text=self._msg("我在整理下一步。", "I am working out the next step."),
+            speakable=False,
+            data={"stage": stage, "iteration": iteration, "context_chars": context_chars},
         )
 
     def _execute_one_step(
@@ -347,6 +376,80 @@ class AgentRuntime:
             },
         )
 
+    def _final_events(
+        self,
+        text: str,
+        task_state: TaskState,
+        observations,
+        tool_results,
+        turn_start: float,
+        reason: str = "",
+        *,
+        llm=None,
+        streaming: bool = False,
+        progress_events: bool = False,
+    ) -> Iterator[AgentEvent]:
+        final_text = self._final_text_or_incomplete(str(text or ""), task_state)
+        can_stream = (
+            bool(streaming)
+            and hasattr(llm, "generate_response_stream")
+            and not self._final_replacement_reason(str(text or ""), task_state)
+        )
+        if can_stream:
+            if progress_events:
+                yield self._llm_start_event(
+                    stage="final_response",
+                    iteration=len({item["iteration"] for item in observations}) + 1,
+                    context_chars=len(json.dumps(observations, ensure_ascii=False, default=str)),
+                )
+            chunks = []
+            try:
+                for chunk in llm.generate_response_stream(
+                    self._final_stream_user_prompt(task_state.goal),
+                    context=self._final_stream_context(text, observations, tool_results, task_state),
+                    system_prompt_override=self._final_stream_system_prompt(),
+                ):
+                    if not chunk:
+                        continue
+                    chunks.append(str(chunk))
+                    yield AgentEvent(
+                        type="final_response_delta",
+                        text=str(chunk),
+                        speakable=True,
+                        data={"stage": "final_response"},
+                    )
+            except Exception:
+                chunks = []
+            streamed_text = "".join(chunks).strip()
+            if streamed_text:
+                final_text = streamed_text
+        yield self._final_event(final_text, task_state, observations, tool_results, turn_start, reason)
+
+    def _final_stream_context(self, planner_answer: str, observations, tool_results, task_state: TaskState) -> str:
+        payload = {
+            "planner_answer": planner_answer,
+            "observations": observations,
+            "tool_results": tool_results,
+            "changed_files": task_state.changed_files,
+            "failed_attempts": task_state.failed_attempts,
+        }
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _final_stream_user_prompt(self, goal: str) -> str:
+        return self._msg(
+            f"请基于已完成的操作，给用户一个简洁的最终回复。\n用户任务：{goal}",
+            f"Based on the completed actions, give the user a concise final reply.\nUser task: {goal}",
+        )
+
+    @staticmethod
+    def _final_stream_system_prompt() -> str:
+        return (
+            "You are Tyro composing the final user-facing answer for an agent run. "
+            "Use only the provided context and do not reveal hidden chain-of-thought. "
+            "Mention important completed actions, changed files, failures, or verification results. "
+            "Keep it concise and use the user's language."
+        )
+
     def _final_text_or_incomplete(self, text: str, task_state: Optional[TaskState] = None) -> str:
         reason = self._final_replacement_reason(text, task_state)
         if reason == "tool_directive":
@@ -469,6 +572,9 @@ class AgentRuntime:
             for name, param in signature.parameters.items()
             if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         }
+        unknown = sorted(str(key) for key in args if key not in allowed)
+        if unknown:
+            raise ValueError(f"unknown tool argument(s): {', '.join(unknown)}")
         return {key: value for key, value in args.items() if key in allowed}
 
     @staticmethod

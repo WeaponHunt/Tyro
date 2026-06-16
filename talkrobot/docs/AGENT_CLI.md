@@ -66,6 +66,7 @@ python -m talkrobot.agent_cli mcp --json
 --planner llm|rule
 --show-events
 --json
+--no-stream-output
 --project-root /path/to/project
 --mcp-config /path/to/mcp.json
 --mcp-configs "/path/one.json:/path/two.json"
@@ -97,6 +98,20 @@ python -m talkrobot.agent_cli ask "帮我 review 当前改动" --show-events
 [tool:start] mcp_git_status reason=...
 [tool:result] mcp_git_status ok=True elapsed_ms=120
 [llm] context_chars=2300
+```
+
+`chat` 模式默认会启用可见进度和最终回复流式输出。等待模型判断下一步时会先显示一条运行中状态，工具调用会显示“决策 / 执行 / 观察”，最终回复会边生成边打印。
+
+如果只想保留最终整段回复，可以关闭流式最终输出：
+
+```bash
+python -m talkrobot.agent_cli chat --no-stream-output
+```
+
+如果不想显示进度块，可以显式关闭 step trace：
+
+```bash
+python -m talkrobot.agent_cli chat --step-trace off
 ```
 
 ## 代理环境

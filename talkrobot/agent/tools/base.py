@@ -1,4 +1,7 @@
 """Tool interfaces for the lightweight agent runtime."""
+from __future__ import annotations
+
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -14,6 +17,7 @@ class ToolResult:
 class BaseTool:
     name = ""
     description = ""
+    input_schema: Dict[str, Any] = {"type": "object", "properties": {}}
     speakable_start = ""
     context_label = ""
     keywords = ()
@@ -33,6 +37,14 @@ class BaseTool:
     def plan_from_skill(self, user_text: str, skill=None):
         """Optionally build a ToolStep when a matched skill names this tool."""
         return self.plan(user_text)
+
+    def to_mcp_tool(self) -> Dict[str, Any]:
+        """Return an MCP-style tool definition for prompts and clients."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": copy.deepcopy(getattr(self, "input_schema", {}) or {"type": "object", "properties": {}}),
+        }
 
 
 @dataclass

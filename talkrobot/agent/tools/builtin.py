@@ -45,6 +45,15 @@ def _resolve_project_path(
 class MemorySearchTool(BaseTool):
     name = "memory_search"
     description = "Searches the user's long-term memory."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+            "limit": {"type": "integer", "description": "Maximum number of memory items.", "default": 3, "minimum": 1},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
     speakable_start = "我查一下相关记忆。"
     context_label = "检索到的相关记忆"
 
@@ -65,6 +74,14 @@ class MemorySearchTool(BaseTool):
 class MemoryWriteTool(BaseTool):
     name = "memory_write"
     description = "Writes explicit stable user memory."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Stable user memory to save."},
+        },
+        "required": ["content"],
+        "additionalProperties": False,
+    }
     speakable_start = "我帮你记下来。"
     context_label = "记忆写入工具结果"
 
@@ -94,6 +111,7 @@ class MemoryWriteTool(BaseTool):
 class CurrentTimeTool(BaseTool):
     name = "current_time"
     description = "Returns current date and time."
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
     speakable_start = "我看一下当前时间。"
     context_label = "当前时间工具结果"
 
@@ -115,6 +133,14 @@ class CurrentTimeTool(BaseTool):
 class CalculatorTool(BaseTool):
     name = "calculator"
     description = "Evaluates a simple arithmetic expression."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "expression": {"type": "string", "description": "Arithmetic expression to evaluate."},
+        },
+        "required": ["expression"],
+        "additionalProperties": False,
+    }
     speakable_start = "我算一下。"
     context_label = "计算工具结果"
 
@@ -151,6 +177,14 @@ class CalculatorTool(BaseTool):
 class ProjectFileSearchTool(BaseTool):
     name = "project_file_search"
     description = "Searches project files by keyword."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Keyword or text to search for inside project files."},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
     speakable_start = "我在项目里找一下。"
     context_label = "项目文件搜索结果"
 
@@ -201,6 +235,13 @@ class ProjectFileSearchTool(BaseTool):
 class ProjectFileListTool(BaseTool):
     name = "project_file_list"
     description = "Lists project files under a directory."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Directory path relative to the project root.", "default": "."},
+        },
+        "additionalProperties": False,
+    }
     speakable_start = "我列一下项目文件。"
     context_label = "项目文件列表"
 
@@ -236,6 +277,14 @@ class ProjectFileListTool(BaseTool):
 class ProjectFileReadTool(BaseTool):
     name = "project_file_read"
     description = "Reads a small project text file."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path relative to the project root."},
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
     speakable_start = "我打开文件看一下。"
     context_label = "项目文件内容"
 
@@ -259,6 +308,7 @@ class ProjectFileReadTool(BaseTool):
 class RepoBootstrapTool(BaseTool):
     name = "repo_bootstrap"
     description = "Summarizes repository structure, config files, and likely test commands."
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
     speakable_start = "我先读取仓库结构。"
     context_label = "仓库启动信息"
 
@@ -337,6 +387,22 @@ class RepoBootstrapTool(BaseTool):
 class ShellCommandTool(BaseTool):
     name = "shell_command"
     description = "Runs an authorized safe command from inside the project root."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                ],
+                "description": "Command to run. It must pass policy authorization.",
+            },
+            "cwd": {"type": "string", "description": "Working directory relative to project root.", "default": "."},
+            "timeout": {"type": "integer", "description": "Timeout in seconds.", "default": 30, "minimum": 1, "maximum": 120},
+        },
+        "required": ["command"],
+        "additionalProperties": False,
+    }
     speakable_start = "我运行一个检查命令。"
     context_label = "命令执行结果"
 
@@ -396,7 +462,42 @@ class ShellCommandTool(BaseTool):
 
 class FileEditTool(BaseTool):
     name = "file_edit"
-    description = "Creates or edits a text file inside the project root using old_text/new_text; content is accepted as a new_text alias; set create=true for new files."
+    description = "Creates or edits a text file inside the project root. Use old_text/new_text for exact replacements, create=true for new files, or overwrite=true/replace_all=true to replace an existing file's full content. content is accepted as a new_text alias."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path relative to the project root."},
+            "old_text": {
+                "type": "string",
+                "description": "Exact text to replace in an existing file. Required when editing an existing file.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text or full file content for a new file.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Alias for new_text when creating or replacing content.",
+            },
+            "create": {
+                "type": "boolean",
+                "description": "Set true to create a new file if it does not exist.",
+                "default": False,
+            },
+            "overwrite": {
+                "type": "boolean",
+                "description": "Set true to replace the entire file content when the file already exists.",
+                "default": False,
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": "Alias for overwrite; set true to replace the entire file content.",
+                "default": False,
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    }
     speakable_start = "我修改文件。"
     context_label = "文件修改结果"
 
@@ -410,6 +511,8 @@ class FileEditTool(BaseTool):
         new_text: str = "",
         create: bool = False,
         content: str = "",
+        overwrite: bool = False,
+        replace_all: bool = False,
     ) -> ToolResult:
         resolved = _resolve_project_path(self.project_root, path, require_file=False)
         if resolved is None:
@@ -436,10 +539,12 @@ class FileEditTool(BaseTool):
                 if count != 1:
                     return ToolResult(ok=False, error=f"old_text matched {count} times; expected exactly 1")
                 updated = original.replace(old_text, new_text, 1)
+            elif exists and (overwrite or replace_all):
+                updated = new_text
             elif create and not exists:
                 updated = new_text
             else:
-                return ToolResult(ok=False, error="old_text is required for existing files")
+                return ToolResult(ok=False, error="old_text is required for existing files unless overwrite=true")
 
             os.makedirs(os.path.dirname(resolved), exist_ok=True)
             with open(resolved, "w", encoding="utf-8") as f:
@@ -482,6 +587,15 @@ class _TextHTMLParser(HTMLParser):
 class WebFetchTool(BaseTool):
     name = "web_fetch"
     description = "Fetches text from a public http/https URL."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "HTTP or HTTPS URL to fetch."},
+            "max_chars": {"type": "integer", "description": "Maximum returned characters.", "minimum": 1000, "maximum": 20000},
+        },
+        "required": ["url"],
+        "additionalProperties": False,
+    }
     speakable_start = "我打开网页看一下。"
     context_label = "网页读取结果"
 

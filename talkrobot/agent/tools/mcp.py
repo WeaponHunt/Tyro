@@ -202,6 +202,15 @@ class MCPTool(BaseTool):
         except Exception as exc:
             return ToolResult(ok=False, error=str(exc))
 
+    def to_mcp_tool(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "remoteName": self.remote_name,
+            "server": self.server.name,
+            "description": self.description,
+            "inputSchema": self.input_schema or {"type": "object", "properties": {}},
+        }
+
     def _matches(self, user_text: str) -> bool:
         text = (user_text or "").casefold()
         return any(keyword.casefold() in text for keyword in self.keywords if keyword)

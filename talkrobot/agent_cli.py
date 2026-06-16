@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="流式显示可见执行过程；clear 会在每步结束后清空终端中的过程块",
     )
+    common.add_argument("--no-stream-output", action="store_true", default=False, help="chat 模式关闭最终回复流式输出")
     common.add_argument("--json", action="store_true", default=False, help="输出 JSON")
 
     parser = argparse.ArgumentParser(description="TalkRobot Agent CLI")
@@ -95,6 +96,8 @@ def command_chat(args) -> int:
     runtime = build_runtime(args)
     history = SlidingWindowDialogueHistory(args.history_rounds)
     print("Tyro Agent CLI. 输入 q / quit / exit 退出。", file=sys.stderr if args.json else sys.stdout)
+    if not args.json and getattr(args, "step_trace", "off") == "off":
+        args.step_trace = "live"
     while True:
         try:
             prompt = "" if args.json else chat_prompt_label(getattr(args, "language", "auto"))
@@ -127,6 +130,8 @@ def command_tools(args) -> int:
         {
             "name": name,
             "description": getattr(tool, "description", ""),
+            "input_schema": getattr(tool, "input_schema", {}) or {},
+            "mcp": tool.to_mcp_tool() if hasattr(tool, "to_mcp_tool") else {},
             "context_label": getattr(tool, "context_label", ""),
             "type": tool.__class__.__name__,
         }
@@ -208,10 +213,12 @@ def run_agent_turn(
     final_data: Dict[str, Any] = {}
     events = []
     step_trace = StepTracePrinter(
-        getattr(args, "step_trace", "off"),
+        effective_step_trace_mode(args),
         language=effective_language,
         debug=debug_enabled(args),
     )
+    stream_output = should_stream_output(args)
+    streamed_reply = False
     try:
         for event in runtime.run_stream(
             user_text=question,
@@ -219,22 +226,31 @@ def run_agent_turn(
             memory_module=memory,
             long_term_memory=memory is not None,
             sliding_window_context=sliding_window_context,
-            streaming=False,
+            streaming=stream_output,
+            progress_events=step_trace.mode != "off" or bool(getattr(args, "show_events", False)),
             approval_callback=build_approval_callback(args),
         ):
             step_trace.handle(event)
             if args.show_events:
-                print(format_event(event, debug=debug_enabled(args), language=effective_language), file=sys.stderr if args.json else sys.stdout)
+                formatted = format_event(event, debug=debug_enabled(args), language=effective_language)
+                if formatted:
+                    print(formatted, file=sys.stderr if args.json else sys.stdout)
             events.append(event_to_dict(event))
+            if event.type == "final_response_delta" and stream_output:
+                print(event.text, end="", flush=True)
+                streamed_reply = True
             if event.type == "final_response":
                 final_text = event.text
                 final_data = event.data or {}
+                if streamed_reply:
+                    print()
     finally:
         if owns_memory:
             shutdown_memory(memory)
 
     return {
         "reply": final_text,
+        "_reply_streamed": streamed_reply,
         "events": events,
         **final_data,
     }
@@ -271,6 +287,21 @@ def build_tool_authorization(args) -> AgentToolAuthorization:
 
 def debug_enabled(args) -> bool:
     return bool(getattr(args, "debug", False) or Config.DEBUG)
+
+
+def effective_step_trace_mode(args) -> str:
+    mode = getattr(args, "step_trace", "off")
+    if getattr(args, "command", "") == "chat" and not getattr(args, "json", False) and mode == "off":
+        return "live"
+    return mode
+
+
+def should_stream_output(args) -> bool:
+    return (
+        getattr(args, "command", "") == "chat"
+        and not getattr(args, "json", False)
+        and not getattr(args, "no_stream_output", False)
+    )
 
 
 def resolve_turn_language(user_text: str, requested_language: str = "auto") -> str:
@@ -387,8 +418,11 @@ def format_step_trace_event(event: AgentEvent, language: str = "en", debug: bool
     if event.type == "error":
         return f"[error] {data.get('stage')} {public_detail(data.get('error'), debug)}"
     if event.type == "llm_start":
-        label = "整理回复" if zh else "compose"
-        return f"[{label}] context_chars={data.get('context_chars')}"
+        stage = data.get("stage")
+        label = ("整理回复" if zh else "compose") if stage == "final_response" else ("思考" if zh else "thinking")
+        return f"[{label}] stage={stage or 'llm'} context_chars={data.get('context_chars')}"
+    if event.type == "final_response_delta":
+        return ""
     return ""
 
 
@@ -460,7 +494,10 @@ def shutdown_memory(memory) -> None:
 
 def emit_answer(result: Dict[str, Any], json_mode: bool = False) -> None:
     if json_mode:
-        print(json.dumps(result, ensure_ascii=False, default=str))
+        payload = {key: value for key, value in result.items() if not str(key).startswith("_")}
+        print(json.dumps(payload, ensure_ascii=False, default=str))
+        return
+    if result.get("_reply_streamed"):
         return
     print(result.get("reply", ""))
 
@@ -499,7 +536,9 @@ def format_event(event: AgentEvent, debug: bool = False, language: str = "zh") -
     if event.type == "error":
         return f"[error] stage={data.get('stage')} error={data.get('error')}"
     if event.type == "llm_start":
-        return f"[llm] context_chars={data.get('context_chars')}"
+        return f"[llm] stage={data.get('stage')} context_chars={data.get('context_chars')}"
+    if event.type == "final_response_delta":
+        return ""
     return f"[{event.type}] {event.text}"
 
 

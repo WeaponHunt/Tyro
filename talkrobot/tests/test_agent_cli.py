@@ -17,6 +17,10 @@ class FakeLLM:
         self.context = context
         return "fake reply"
 
+    def generate_response_stream(self, user_input: str, context: str = "", system_prompt_override: str = ""):
+        yield "fake"
+        yield " stream"
+
 
 def _json_output(capsys):
     captured = capsys.readouterr()
@@ -57,6 +61,9 @@ def test_cli_lists_builtin_tools(tmp_path, capsys):
     assert "repo_bootstrap" in names
     assert "shell_command" in names
     assert "file_edit" in names
+    file_edit = next(item for item in payload if item["name"] == "file_edit")
+    assert "inputSchema" in file_edit["mcp"]
+    assert "new_text" in file_edit["mcp"]["inputSchema"]["properties"]
 
 
 def test_cli_builds_tool_authorization_from_flags(tmp_path):
@@ -114,6 +121,40 @@ def test_cli_step_trace_argument_and_formatting():
     assert "next=file_edit" in agent_cli.format_step_trace_event(
         AgentEvent(type="plan", data={"reason": "apply fix", "steps": ["file_edit"]})
     )
+
+
+def test_chat_defaults_to_live_progress_and_streaming():
+    parser = agent_cli.build_parser()
+    args = parser.parse_args(["chat"])
+
+    assert agent_cli.effective_step_trace_mode(args) == "live"
+    assert agent_cli.should_stream_output(args) is True
+
+    args.step_trace = "clear"
+    assert agent_cli.effective_step_trace_mode(args) == "clear"
+
+
+def test_final_response_delta_is_printed_without_duplicate(tmp_path, monkeypatch, capsys):
+    class FinalRuntime:
+        language = "zh"
+
+        def run_stream(self, **kwargs):
+            assert kwargs["streaming"] is True
+            assert kwargs["progress_events"] is True
+            yield AgentEvent(type="final_response_delta", text="你好")
+            yield AgentEvent(type="final_response_delta", text="呀")
+            yield AgentEvent(type="final_response", text="你好呀", data={})
+
+    parser = agent_cli.build_parser()
+    args = parser.parse_args(["chat", "--project-root", str(tmp_path)])
+    monkeypatch.setattr(agent_cli, "build_llm", lambda language: FakeLLM())
+
+    result = agent_cli.run_agent_turn("测试", args, runtime=FinalRuntime(), memory=None)
+
+    captured = capsys.readouterr()
+    assert captured.out == "你好呀\n"
+    assert result["reply"] == "你好呀"
+    assert result["_reply_streamed"] is True
 
 
 def test_cli_step_trace_redacts_internal_prompt_unless_debug():

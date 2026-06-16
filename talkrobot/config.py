@@ -85,7 +85,7 @@ class Config:
 
     # Agent planner: "llm" uses the chat model to choose tools; "rule" uses deterministic heuristics.
     AGENT_PLANNER_PROVIDER = os.getenv("TALKROBOT_AGENT_PLANNER", "llm").strip().lower()
-    AGENT_REACT_MAX_ITERATIONS = _env_int("TALKROBOT_AGENT_REACT_MAX_ITERATIONS", 4)
+    AGENT_REACT_MAX_ITERATIONS = _env_int("TALKROBOT_AGENT_REACT_MAX_ITERATIONS", 100)
     
     # 表情服务器配置
     EXPRESSION_SERVER_URL = os.getenv("TALKROBOT_EXPRESSION_SERVER_URL", "http://localhost:8001")
