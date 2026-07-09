@@ -11,6 +11,9 @@
 - 💾 **长期记忆**: 自动记录对话历史并智能检索
 - 🪟 **滑动窗口记忆**: 可配置最近 n 轮对话上下文，与检索记忆一起提供给大模型
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
+- 📝 **手动记忆**: 支持手动为指定用户或全部用户（含未知用户）添加记忆
+- 📚 **基础记忆**: 新增 `base_memory`（仅手动录入），所有用户检索时会并行检索该记忆
+- 📚 **基础记忆**: `add-base-memory` 采用原文直存（`infer=False`），避免被事实抽取阶段过滤
 - 👥 **多用户隔离**: 不同用户的记忆数据独立存储
 - 🧑‍🤝‍🧑 **人脸驱动交互对象**: 可按当前识别人脸自动切换交互用户
 
@@ -99,16 +102,45 @@ python -m talkrobot.main chat --enable-face --face-camera-index 0
 # 在 continuous 非响应阶段，见到熟人主动问好
 python -m talkrobot.main chat --enable-face  --listen-mode continuous 
 
+#监控模式
+source /opt/ros/jazzy/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+python3 /home/acir/Tyro_nodes/remote_monitor_server.py --enable-web
+
+
 ```
 
 ### 2. 手动添加记忆
 
 ```bash
 # 单条添加
-python -m talkrobot.main add-memory --user ljc --content "我喜欢吃苹果"
+python -m talkrobot.main add-memory --user ljc --content "情感与认知智能机器人实验室，成立于2017年（原名：情感智能机器人实验室）。"
 
 # 交互式批量添加（不传 --content 进入交互模式，输入 q 退出）
 python -m talkrobot.main add-memory --user ljc
+
+# 给全部用户添加（包含未知用户 guest）
+python -m talkrobot.main add-memory --all-users --content "情感与认知智能机器人实验室，成立于2017年（原名：情感智能机器人实验室）"
+
+# 交互式给全部用户添加
+python -m talkrobot.main add-memory --all-users
+
+# 添加基础共享记忆（仅手动录入，所有用户可检索）
+# 提示：会按句号/问号/感叹号/分号/换行自动切分为多条记忆后再写入
+python -m talkrobot.main add-base-memory --content "情感与认知智能机器人实验室(Lab for Affective and Cognitive Intelligent Robotics，ACIR)，成立于2017年（原名：情感智能机器人实验室），以赋予机器人真正的智能、认知与情感能力，主任为北京大学计算机学院王韬研究员。ACIR实验室以所提出的情感与认知模型及算法为理论核心，依托先进的自研表情、注意、生理指标、信息理解、情知大模型等技术，已经使机器人拥有情绪状态识别、注意认知评估、身心健康监护等能力，并正在优化智能机器人对人类进行个人性格分析、决策风格推演等任务。其自研的具身智能实体机器人，能够完成生活管家、工作助理、情感伙伴等角色的任务。ACIR实验室的模型、技术及原型产品，可以应用在养老陪护、金融、安全等重要领域。ACIR实验室（包括实验室前身）已培养出站博士后1名（现在清华大学任职），毕业博士2名、硕士15名，部分毕业生选择前往世界知名学府继续深造，另有学生毕业后加入华为、阿里巴巴、英特尔等计算机、互联网企业，在各行各业取得了优异的成绩（例如英特尔中国年度最佳员工奖等）。ACIR实验室还与国家地方共建具身智能机器人创新中心合作建立“北大-国地共建具身智能机器人创新中心情感智能应用联合实验室”，主要研发、探索、实践以及展示承载情感智能技术在人形机器人上的应用。联合实验室的成立，将ACIR实验室在情感智能领域的先进算法与国家地方共建具身智能机器人创新中心在机器人硬件方面的优势结合起来，实现情感化、智能化、个性化的具身智能机器人情感智能应用，使机器人能够更好地为人类服务。ACIR实验室开设北京大学本科生专业限选课“智能机器人系统导论”、北京大学全校公选课“Introduction to Affective Intelligent Robotics ”（面向国际学生，英文授课），曾开设“智能机器人概论”、“操作系统A（实验班）”、“可重构系统基础”等课程；同时还承担北京计算机学会机器人情感计算专业委员会、智能机器人青少年培养基地等社会学术服务工作。ACIR实验室发表国际优秀论文80余篇，其中多篇论文在AAAI、IROS、ACM MM、ICAI、ECCV等国际一流会议及国际一流期刊IEEE TC、IEEE TMC、IEEE TWC、IEEE TCAD上发表；一篇论文在移动计算与无线网络领域排名第一的国际顶级学术会议Mobicom’17上获得最佳学术社区论文奖（Best Community Paper Award，表彰在该领域的学术社区做出了突出贡献），多篇论文获得国际学术会议最佳论文奖；已获授权24项发明专利、7项外观设计专利、4项实用新型专利。
+ACIR实验室在情感与认知智能系统及机器人研发初见成效，取得业界较大关注，代表北京大学在各类汇报、会议、展览中进行展示；积极推进科研成果有效落地：与多家企业共建联合实验室；助力“渔省心”项目荣获浙江省数字化改革第一批“最佳应用”；模型及算法已被产业头部机构应用；获得多封感谢信。长期目标：使机器人能够像人一样理解与表现、真正帮助到人。追赶科幻电影里的机器人，像家人、战友、老师、同事、私人保健/心理医生...建设使命：建设世界领先水平的智能机器人实验室，创造有实际价值的一流科技成果培养具有创新精神和创新能力的一流人才,鼓励自我价值的实现与持续发展"
+
+# 交互式添加基础共享记忆
+python -m talkrobot.main add-base-memory
+
+# 只测试用户记忆检索（不写入）
+python -m talkrobot.main query-memory --user ljc --query "实验室成立时间" --limit 5
+
+# 并行测试“用户记忆 + 基础共享记忆”检索（不写入）
+python -m talkrobot.main query-memory --user guest --query "情感与认知智能机器人实验室是几几年成立的" --include-base --limit 5
+
+# 交互式检索测试模式
+python -m talkrobot.main query-memory --user guest --include-base
 ```
 
 ### 3. 测试单个模块
@@ -142,6 +174,9 @@ python -m talkrobot.tests.test_memory
 - `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
 - `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous" / "intercom")
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
+- `MEMORY_SEARCH_LIMIT`: 记忆检索返回上限（默认 8，建议先调大提升召回）
+- `MEMORY_SEARCH_MIN_SCORE`: 最低相似度阈值（默认 None，不过滤；调高会更严格）
+- `MEMORY_SEARCH_MAX_DISTANCE`: 最大距离阈值（默认 None，不过滤；调低会更严格）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
 - `VAD_SILENCE_DURATION`: 静默多久判定说话结束（秒）
 - `VAD_MIN_SPEECH_DURATION`: 最短语音时长，过短的丢弃（秒）
@@ -241,6 +276,41 @@ python -m talkrobot.main chat --disable-persona-auto-update
 3. 系统基于输入文本生成回复（可选TTS播放）
 4. 输入 `q` / `quit` / `exit` 退出程序
 
+### 多脚本模式
+
+脚本文件放在项目根目录的 `script/` 下，在 `talkrobot/config.py` 的 `Config.SCRIPT_CONFIGS` 中配置多个脚本。每个脚本可以绑定自己的关键词和可选按键；没有设置 `key` 的脚本只能通过关键词触发。
+
+```python
+SCRIPT_CONFIGS = [
+    {
+        "name": "lab_intro",
+        "file": "acir.json",
+        "key": "i",
+        "keywords": {
+            "zh": ["介绍实验室", "开始介绍"],
+            "en": ["introduce the lab", "start the introduction"],
+        },
+    },
+    {
+        "name": "music_demo",
+        "file": "music.json",
+        "key": "m",
+        "keywords": {"zh": ["音乐演示"], "en": ["music demo"]},
+    },
+    {
+        "name": "greeting_loop",
+        "file": "greet_loop.json",
+        "key": None,
+        "keywords": {"zh": ["循环问候"], "en": ["greeting loop"]},
+    },
+]
+```
+
+- `file`: 脚本 JSON 文件路径；相对路径按 `SCRIPT_DIR` 查找。
+- `keywords`: 命中任意关键词即进入对应脚本。
+- `key`: 可选按键，例如 `"i"`、`"m"`、`"space"`、`"enter"`；为空时禁用按键触发。
+- `MODE_SWITCH_SCRIPT_DISABLE_VOICE_WORDS`: 全局退出脚本关键词，例如“别介绍了”“停止介绍”。
+
 ## 模块说明
 
 ### ASRModule (语音识别)
@@ -264,6 +334,7 @@ python -m talkrobot.main chat --disable-persona-auto-update
 - 使用 Mem0 向量数据库
 - 自动存储对话历史
 - 智能检索相关记忆
+- 对话时并行检索“用户长期记忆 + base_memory 基础共享记忆”
 - 支持手动添加记忆（单条 / 交互式批量）
 - 多用户独立数据库，路径: `mem_db/<用户名>/`
 

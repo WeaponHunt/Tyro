@@ -9,7 +9,10 @@ import subprocess
 import atexit
 import argparse
 import re
+import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional, Dict, Tuple
 from loguru import logger
 
@@ -48,6 +51,8 @@ class FaceIdentityResolver:
         self._track_thread = None
         self._current_user = self.unknown_user
         self._current_is_familiar = False
+        self._current_has_face = False
+        self._latest_frame = None
 
         if not enabled:
             return
@@ -81,46 +86,50 @@ class FaceIdentityResolver:
         clean = re.sub(r"[^0-9a-zA-Z_\-\u4e00-\u9fff]", "_", clean)
         return clean or Config.DEFAULT_USER
 
-    def _detect_user_once(self) -> Tuple[str, bool]:
-        """执行单次人脸检测并返回 (用户, 是否熟人)。"""
+    def _detect_user_once(self) -> Tuple[str, bool, bool]:
+        """执行单次人脸检测并返回 (用户, 是否熟人, 是否有人脸)。"""
         if not self.enabled or self._cap is None or self._module is None:
-            return self.default_user, False
+            return self.default_user, False, False
 
         ok, frame = self._cap.read()
         if not ok:
             logger.debug("读取摄像头帧失败，回退陌生人用户")
-            return self.unknown_user, False
+            return self.unknown_user, False, False
+        with self._state_lock:
+            self._latest_frame = frame.copy()
 
         try:
             result = self._module.process_frame(frame)
             label = str(result.get("label", "")).strip()
+            has_face = label != "无人脸" and bool(result.get("tracked", False))
         except Exception as e:
             logger.warning(f"人脸识别处理失败，回退陌生人用户: {e}")
-            return self.unknown_user, False
+            return self.unknown_user, False, False
 
         if label in self._NON_TARGET_LABELS:
-            return self.unknown_user, False
+            return self.unknown_user, False, has_face
         if label == "陌生人":
-            return self.unknown_user, False
-        return self._sanitize_user_name(label), True
+            return self.unknown_user, False, True
+        return self._sanitize_user_name(label), True, True
 
     def _tracking_loop(self) -> None:
         """后台持续人脸追踪，检测到对象变化时触发回调。"""
         while not self._stop_event.is_set():
-            user, is_familiar = self._detect_user_once()
+            user, is_familiar, has_face = self._detect_user_once()
             changed = False
             with self._state_lock:
-                if user != self._current_user:
+                if user != self._current_user or has_face != self._current_has_face:
                     self._current_user = user
                     self._current_is_familiar = is_familiar
+                    self._current_has_face = has_face
                     changed = True
 
             if changed:
-                logger.info(f"人脸交互对象变化: {user}")
+                logger.info(f"人脸交互对象变化: {user}, has_face={has_face}")
                 callback = self._on_user_change
                 if callback is not None:
                     try:
-                        callback(user, is_familiar)
+                        callback(user, is_familiar, has_face)
                     except Exception as e:
                         logger.warning(f"人脸用户切换回调异常: {e}")
 
@@ -144,6 +153,20 @@ class FaceIdentityResolver:
         with self._state_lock:
             return self._current_is_familiar
 
+    def has_current_face(self) -> bool:
+        """返回当前视野中是否有人脸。"""
+        if not self.enabled:
+            return False
+        with self._state_lock:
+            return self._current_has_face
+
+    def get_latest_frame(self):
+        """返回人脸识别摄像头最新帧副本，用于复用同一路摄像头录像。"""
+        with self._state_lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
     def shutdown(self) -> None:
         self._stop_event.set()
         if self._track_thread is not None and self._track_thread.is_alive():
@@ -165,12 +188,42 @@ class UserMemoryRouter:
     def __init__(self):
         self._cache: Dict[str, Tuple[Optional[MemoryModule], bool]] = {}
 
+    @staticmethod
+    def _is_known_face_user(user: str) -> bool:
+        """判断用户是否来自 known_faces 人脸图库。"""
+        user_key = (user or "").strip()
+        if not user_key or user_key == Config.FACE_UNKNOWN_USER:
+            return False
+
+        known_dir = Path(Config.FACE_KNOWN_FACES_DIR)
+        if not known_dir.is_dir():
+            return False
+
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        try:
+            for file_path in known_dir.iterdir():
+                if file_path.suffix.lower() not in image_exts:
+                    continue
+                raw_name = file_path.stem.strip()
+                if not raw_name:
+                    continue
+                if raw_name == user_key or FaceIdentityResolver._sanitize_user_name(raw_name) == user_key:
+                    return True
+        except Exception as e:
+            logger.warning(f"读取人脸图库失败，无法判断是否为已登记用户: {e}")
+        return False
+
     def get_memory_for_user(self, user: str) -> Tuple[Optional[MemoryModule], bool]:
         user = (user or Config.DEFAULT_USER).strip()
         if user in self._cache:
             return self._cache[user]
 
         has_persistent = Config.has_persistent_memory(user)
+        # 人脸图库中的已登记用户，即使当前无历史记忆文件，也启用长期记忆并创建新库。
+        if not has_persistent and self._is_known_face_user(user):
+            has_persistent = True
+            logger.info(f"用户[{user}]命中人脸图库，启用长期记忆并自动创建用户记忆库")
+
         if not has_persistent:
             logger.info(f"用户[{user}]不存在长期记忆，使用短期记忆模式")
             self._cache[user] = (None, False)
@@ -255,12 +308,15 @@ def run_chat(args):
 
     user = args.user
     memory_module = None
+    base_memory_module = None
     memory_router = None
     persona_manager = None
     persona_update_agent = None
     face_resolver = None
     tts_module = None
     audio_recorder = None
+    ros2_bridge = None
+    video_recorder = None
     conversation_manager = None
 
     try:
@@ -441,6 +497,12 @@ def run_chat(args):
                 user_id=Config.get_user_id(user)
             )
 
+        # 基础共享记忆：所有用户仅参与检索，不参与日常自动写入。
+        base_memory_module = MemoryModule(
+            config=Config.get_memory_config(Config.BASE_MEMORY_USER),
+            user_id=Config.get_user_id(Config.BASE_MEMORY_USER)
+        )
+
         # 2. 创建对话管理器
         tts_enabled = not args.no_tts
         listen_mode = getattr(args, 'listen_mode', None) or Config.DEFAULT_LISTEN_MODE
@@ -474,11 +536,29 @@ def run_chat(args):
         else:
             audio_recorder = None
 
+        ros2_voice_enabled = bool(getattr(args, "ros2_voice", Config.ROS2_VOICE_BRIDGE_ENABLED))
+        if ros2_voice_enabled:
+            from talkrobot.modules.ros2.ros2_bridge import Ros2VoiceBridge
+            ros2_bridge = Ros2VoiceBridge(
+                tts_module=tts_module,
+                audio_recorder=audio_recorder,
+                node_name=getattr(args, "ros2_voice_node_name", Config.ROS2_VOICE_NODE_NAME),
+                asr_text_topic=getattr(args, "ros2_asr_topic", Config.ROS2_ASR_TEXT_TOPIC),
+                tts_text_topic=getattr(args, "ros2_tts_topic", Config.ROS2_TTS_TEXT_TOPIC),
+                chat_text_topic=getattr(args, "ros2_chat_topic", Config.ROS2_CHAT_TEXT_TOPIC),
+                assistant_text_topic=getattr(args, "ros2_assistant_topic", Config.ROS2_ASSISTANT_TEXT_TOPIC),
+                queue_size=getattr(args, "ros2_voice_queue_size", Config.ROS2_VOICE_QUEUE_SIZE),
+            )
+            ros2_bridge.start()
+        else:
+            logger.info("ROS2 语音 bridge 已关闭")
+
         conversation_manager = ConversationManager(
             asr_module=asr_module,
             tts_module=tts_module,
             llm_module=llm_module,
             memory_module=memory_module,
+            base_memory_module=base_memory_module,
             tts_enabled=tts_enabled,
             streaming=getattr(args, 'streaming', False),
             expression_module=expression_module,
@@ -498,6 +578,9 @@ def run_chat(args):
             greeting_cooldown_seconds=getattr(args, 'hallo_cooldown_seconds', 600.0),
             sleep_toggle_key=Config.MODE_SWITCH_SLEEP_KEY,
             script_toggle_key=Config.MODE_SWITCH_SCRIPT_KEY,
+            script_dir=Config.SCRIPT_DIR,
+            script_file=Config.SCRIPT_FILE,
+            script_configs=Config.SCRIPT_CONFIGS,
             script_pause_resume_key=Config.SCRIPT_PAUSE_RESUME_KEY,
             tts_interrupt_key=Config.TTS_INTERRUPT_KEY,
             sleep_enable_voice_words=Config.MODE_SWITCH_SLEEP_ENABLE_VOICE_WORDS.get(
@@ -533,14 +616,44 @@ def run_chat(args):
             script_image_target_height=Config.SCRIPT_IMAGE_TARGET_HEIGHT,
             script_image_force_window_size=Config.SCRIPT_IMAGE_FORCE_WINDOW_SIZE,
             script_image_force_resize_image=Config.SCRIPT_IMAGE_FORCE_RESIZE_IMAGE,
+            no_face_response_timeout_seconds=Config.FACE_NO_RESPONSE_TIMEOUT_SECONDS,
+            ros2_bridge=ros2_bridge,
         )
+        if ros2_bridge is not None:
+            ros2_bridge.set_chat_text_callback(conversation_manager.process_text)
 
         if face_resolver is not None and face_resolver.enabled:
             face_resolver.set_on_user_change(conversation_manager.on_face_user_change)
             conversation_manager.on_face_user_change(
                 face_resolver.resolve_user(),
                 face_resolver.is_current_user_familiar(),
+                face_resolver.has_current_face(),
             )
+
+        def _on_video_recording_changed(recording: bool) -> None:
+            if expression_module is not None and expression_module.is_available:
+                expression_module.set_recording(recording)
+
+        video_frame_getter = None
+        video_camera_index = Config.VIDEO_RECORD_CAMERA_INDEX
+        if face_resolver is not None and face_resolver.enabled:
+            if int(video_camera_index) == int(getattr(args, "face_camera_index", Config.FACE_CAMERA_INDEX)):
+                video_frame_getter = face_resolver.get_latest_frame
+                logger.info("视频录制将复用人脸识别摄像头帧")
+
+        from talkrobot.core.video_recorder import VideoRecorder
+        video_recorder = VideoRecorder(
+            camera_index=video_camera_index,
+            output_dir=Config.VIDEO_RECORD_DIR,
+            toggle_key=Config.VIDEO_RECORD_TOGGLE_KEY,
+            fps=Config.VIDEO_RECORD_FPS,
+            audio_enabled=Config.VIDEO_RECORD_AUDIO_ENABLED,
+            audio_sample_rate=Config.SAMPLE_RATE,
+            audio_channels=Config.CHANNELS,
+            frame_getter=video_frame_getter,
+            on_recording_changed=_on_video_recording_changed,
+        )
+        video_recorder.start()
 
         logger.info("所有模块初始化完成!")
         logger.info("="*50)
@@ -598,6 +711,12 @@ def run_chat(args):
         print(f"\n❌ 程序出错: {e}")
     finally:
         # 统一收尾：先停播放，再停录音，再等待处理线程，最后关闭外部资源
+        if ros2_bridge is not None:
+            try:
+                ros2_bridge.stop()
+            except Exception as e:
+                logger.warning(f"停止 ROS2 语音 bridge 异常: {e}")
+
         if tts_module is not None:
             try:
                 tts_module.stop()
@@ -609,6 +728,12 @@ def run_chat(args):
                 audio_recorder.stop()
             except Exception as e:
                 logger.warning(f"停止录音器异常: {e}")
+
+        if video_recorder is not None:
+            try:
+                video_recorder.stop()
+            except Exception as e:
+                logger.warning(f"停止视频录制器异常: {e}")
 
         if conversation_manager is not None:
             try:
@@ -627,6 +752,12 @@ def run_chat(args):
             except Exception as e:
                 logger.warning(f"关闭记忆模块异常: {e}")
 
+        if base_memory_module is not None:
+            try:
+                base_memory_module.shutdown()
+            except Exception as e:
+                logger.warning(f"关闭基础记忆模块异常: {e}")
+
         if face_resolver is not None:
             try:
                 face_resolver.shutdown()
@@ -640,24 +771,44 @@ def run_add_memory(args):
     """手动添加记忆"""
     _setup_logger()
 
-    user = args.user
+    user = (args.user or Config.DEFAULT_USER).strip()
     content = args.content
+    all_users_mode = bool(getattr(args, "all_users", False))
 
-    logger.info(f"正在为用户 [{user}] 添加记忆...")
+    if all_users_mode:
+        users = _collect_all_memory_users()
+        logger.info(f"正在为全部用户添加记忆，共 {len(users)} 人: {users}")
+    else:
+        users = [user]
+        logger.info(f"正在为用户 [{user}] 添加记忆...")
 
-    memory_module = MemoryModule(
-        config=Config.get_memory_config(user),
-        user_id=Config.get_user_id(user)
-    )
+    memory_modules = {}
+    for target_user in users:
+        memory_modules[target_user] = MemoryModule(
+            config=Config.get_memory_config(target_user),
+            user_id=Config.get_user_id(target_user)
+        )
+
+    def _add_to_targets(text: str) -> None:
+        for target_user in users:
+            memory_modules[target_user].add_memory(text, async_mode=False)
+            if all_users_mode:
+                print(f"  ✅ 已为用户 [{target_user}] 添加记忆")
 
     try:
         if content:
             # 直接通过命令行参数添加
-            memory_module.add_memory(content, async_mode=False)
-            print(f"✅ 已为用户 [{user}] 添加记忆: {content}")
+            _add_to_targets(content)
+            if all_users_mode:
+                print(f"✅ 已为全部用户添加记忆: {content}")
+            else:
+                print(f"✅ 已为用户 [{user}] 添加记忆: {content}")
         else:
             # 交互式添加模式
-            print(f"📝 进入交互式记忆添加模式 (用户: {user})")
+            if all_users_mode:
+                print(f"📝 进入交互式记忆添加模式 (全部用户，共 {len(users)} 人)")
+            else:
+                print(f"📝 进入交互式记忆添加模式 (用户: {user})")
             print("   输入记忆内容后回车添加，输入 q 或 quit 退出\n")
             while True:
                 try:
@@ -668,11 +819,197 @@ def run_add_memory(args):
                     continue
                 if text.lower() in ("q", "quit", "exit"):
                     break
-                memory_module.add_memory(text, async_mode=False)
+                _add_to_targets(text)
                 print(f"  ✅ 已添加: {text}\n")
     finally:
-        memory_module.shutdown()
+        for memory_module in memory_modules.values():
+            memory_module.shutdown()
         print("👋 记忆模块已关闭")
+
+
+def run_add_base_memory(args):
+    """手动添加基础共享记忆（仅手动录入）。"""
+    _setup_logger()
+
+    def _split_base_memory_sentences(text: str) -> list:
+        """按句子切分基础共享记忆，避免整段长文只存成一条。"""
+        pieces = re.split(r"[。！？!?；;\n]+", str(text or ""))
+        sentences = []
+        for piece in pieces:
+            sentence = piece.strip(" \t\r,，。！？!?；;")
+            if sentence:
+                sentences.append(sentence)
+        return sentences
+
+    def _add_base_sentences(raw_text: str) -> int:
+        sentences = _split_base_memory_sentences(raw_text)
+        for sentence in sentences:
+            base_memory.add_memory(sentence, async_mode=False, infer=False)
+        return len(sentences)
+
+    content = args.content
+    base_memory = MemoryModule(
+        config=Config.get_memory_config(Config.BASE_MEMORY_USER),
+        user_id=Config.get_user_id(Config.BASE_MEMORY_USER)
+    )
+
+    logger.info(f"正在向基础记忆[{Config.BASE_MEMORY_USER}]添加内容...")
+    try:
+        if content:
+            count = _add_base_sentences(content)
+            print(f"✅ 已按句切分并添加基础记忆 {count} 条")
+        else:
+            print(f"📝 进入基础记忆交互式添加模式 ({Config.BASE_MEMORY_USER})")
+            print("   输入记忆内容后回车添加，输入 q 或 quit 退出\n")
+            while True:
+                try:
+                    text = input("请输入基础记忆内容: ").strip()
+                except EOFError:
+                    break
+                if not text:
+                    continue
+                if text.lower() in ("q", "quit", "exit"):
+                    break
+                count = _add_base_sentences(text)
+                print(f"  ✅ 已按句切分并添加基础记忆 {count} 条\n")
+    finally:
+        base_memory.shutdown()
+        print("👋 基础记忆模块已关闭")
+
+
+def run_query_memory(args):
+    """手动检索记忆（只读，不写入），用于快速验证记忆是否已存储。"""
+    _setup_logger()
+
+    user = (args.user or Config.DEFAULT_USER).strip()
+    query = args.query
+    limit = max(1, int(args.limit))
+    include_base = bool(getattr(args, "include_base", False))
+
+    user_memory = MemoryModule(
+        config=Config.get_memory_config(user),
+        user_id=Config.get_user_id(user),
+    )
+    base_memory = None
+    if include_base:
+        base_memory = MemoryModule(
+            config=Config.get_memory_config(Config.BASE_MEMORY_USER),
+            user_id=Config.get_user_id(Config.BASE_MEMORY_USER),
+        )
+
+    def _run_query_once(text: str) -> None:
+        q = (text or "").strip()
+        if not q:
+            print("⚠️ 查询内容为空，已跳过")
+            return
+
+        user_context = ""
+        base_context = ""
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                "user": executor.submit(
+                    user_memory.search_memory,
+                    q,
+                    limit,
+                    Config.MEMORY_SEARCH_MIN_SCORE,
+                    Config.MEMORY_SEARCH_MAX_DISTANCE,
+                )
+            }
+            if base_memory is not None:
+                futures["base"] = executor.submit(
+                    base_memory.search_memory,
+                    q,
+                    limit,
+                    Config.MEMORY_SEARCH_MIN_SCORE,
+                    Config.MEMORY_SEARCH_MAX_DISTANCE,
+                )
+
+            for name, future in futures.items():
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.warning(f"{name}记忆检索失败: {e}")
+                    result = ""
+                if name == "user":
+                    user_context = result or ""
+                else:
+                    base_context = result or ""
+
+        print("\n" + "=" * 56)
+        print(f"🔎 查询: {q}")
+        print(f"👤 用户记忆 [{user}] 命中:")
+        print(user_context if user_context else "(无命中)")
+
+        if base_memory is not None:
+            print(f"\n📚 基础记忆 [{Config.BASE_MEMORY_USER}] 命中:")
+            print(base_context if base_context else "(无命中)")
+
+        merged_parts = []
+        if user_context:
+            merged_parts.append(f"用户长期记忆:\n{user_context}")
+        if base_context:
+            merged_parts.append(f"基础共享记忆:\n{base_context}")
+        merged = "\n\n".join(merged_parts)
+        print("\n🧠 合并结果:")
+        print(merged if merged else "(无命中)")
+        print("=" * 56 + "\n")
+
+    try:
+        if query:
+            _run_query_once(query)
+        else:
+            print(f"🧪 进入记忆检索测试模式 (user={user}, include_base={include_base}, limit={limit})")
+            print("   输入查询内容后回车检索，输入 q 或 quit 退出\n")
+            while True:
+                try:
+                    text = input("请输入检索查询: ").strip()
+                except EOFError:
+                    break
+                if not text:
+                    continue
+                if text.lower() in ("q", "quit", "exit"):
+                    break
+                _run_query_once(text)
+    finally:
+        user_memory.shutdown()
+        if base_memory is not None:
+            base_memory.shutdown()
+        print("👋 记忆检索测试已结束")
+
+
+def _collect_all_memory_users() -> list:
+    """收集可写入记忆的全部用户（包含陌生人用户）。"""
+    users = set()
+
+    # 已有人格配置中的用户
+    profile_path = Config.PERSONA_PROFILE_PATH
+    if profile_path and os.path.exists(profile_path):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                profiles = raw.get("users") if isinstance(raw.get("users"), dict) else raw
+                for key in profiles.keys():
+                    if isinstance(key, str) and key.strip():
+                        users.add(key.strip())
+        except Exception as e:
+            logger.warning(f"读取人格配置失败，跳过该来源: {e}")
+
+    # 已有持久化记忆目录中的用户
+    db_base = Config.MEMORY_DB_BASE_PATH
+    if db_base and os.path.isdir(db_base):
+        try:
+            for name in os.listdir(db_base):
+                path = os.path.join(db_base, name)
+                if os.path.isdir(path) and name.strip() and name.strip() != Config.BASE_MEMORY_USER:
+                    users.add(name.strip())
+        except Exception as e:
+            logger.warning(f"读取记忆目录失败，跳过该来源: {e}")
+
+    users.add(Config.DEFAULT_USER)
+    users.add(Config.FACE_UNKNOWN_USER)
+    return sorted(users)
 
 
 def run_vad_debug(args):
@@ -778,16 +1115,75 @@ def main():
         "--disable-persona-auto-update", action="store_true", default=False,
         help="关闭后台人格自动更新（LangGraph Agent）"
     )
+    chat_parser.add_argument(
+        "--no-ros2-voice", action="store_false", dest="ros2_voice",
+        default=Config.ROS2_VOICE_BRIDGE_ENABLED,
+        help="关闭 ROS2 语音 bridge"
+    )
+    chat_parser.add_argument(
+        "--ros2-asr-topic", type=str, default=Config.ROS2_ASR_TEXT_TOPIC,
+        help=f"ASR 文本发布 topic (默认: {Config.ROS2_ASR_TEXT_TOPIC})"
+    )
+    chat_parser.add_argument(
+        "--ros2-tts-topic", type=str, default=Config.ROS2_TTS_TEXT_TOPIC,
+        help=f"TTS 文本订阅 topic (默认: {Config.ROS2_TTS_TEXT_TOPIC})"
+    )
+    chat_parser.add_argument(
+        "--ros2-chat-topic", type=str, default=Config.ROS2_CHAT_TEXT_TOPIC,
+        help=f"远程文本聊天订阅 topic (默认: {Config.ROS2_CHAT_TEXT_TOPIC})"
+    )
+    chat_parser.add_argument(
+        "--ros2-assistant-topic", type=str, default=Config.ROS2_ASSISTANT_TEXT_TOPIC,
+        help=f"机器人回复文本发布 topic (默认: {Config.ROS2_ASSISTANT_TEXT_TOPIC})"
+    )
+    chat_parser.add_argument(
+        "--ros2-voice-node-name", type=str, default=Config.ROS2_VOICE_NODE_NAME,
+        help=f"ROS2 语音 bridge 节点名 (默认: {Config.ROS2_VOICE_NODE_NAME})"
+    )
+    chat_parser.add_argument(
+        "--ros2-voice-queue-size", type=int, default=Config.ROS2_VOICE_QUEUE_SIZE,
+        help=f"ROS2 语音 bridge topic 队列大小 (默认: {Config.ROS2_VOICE_QUEUE_SIZE})"
+    )
 
     # 子命令: add-memory
-    mem_parser = subparsers.add_parser("add-memory", help="手动为指定用户添加记忆")
+    mem_parser = subparsers.add_parser("add-memory", help="手动为指定用户或全部用户添加记忆")
     mem_parser.add_argument(
-        "--user", type=str, required=True,
-        help="用户名称"
+        "--user", type=str, default=Config.DEFAULT_USER,
+        help=f"用户名称 (默认: {Config.DEFAULT_USER})"
+    )
+    mem_parser.add_argument(
+        "--all-users", action="store_true", default=False,
+        help=f"为全部用户添加记忆（包含未知用户: {Config.FACE_UNKNOWN_USER}）"
     )
     mem_parser.add_argument(
         "--content", type=str, default=None,
         help="要添加的记忆内容 (不提供则进入交互式添加模式)"
+    )
+
+    # 子命令: add-base-memory
+    base_mem_parser = subparsers.add_parser("add-base-memory", help="手动添加基础共享记忆（所有用户可检索）")
+    base_mem_parser.add_argument(
+        "--content", type=str, default=None,
+        help="要添加到基础记忆的内容 (不提供则进入交互式添加模式)"
+    )
+
+    # 子命令: query-memory
+    query_mem_parser = subparsers.add_parser("query-memory", help="手动测试记忆检索（只读，不写入）")
+    query_mem_parser.add_argument(
+        "--user", type=str, default=Config.DEFAULT_USER,
+        help=f"要检索的用户记忆 (默认: {Config.DEFAULT_USER})"
+    )
+    query_mem_parser.add_argument(
+        "--query", type=str, default=None,
+        help="检索查询文本 (不提供则进入交互式检索模式)"
+    )
+    query_mem_parser.add_argument(
+        "--limit", type=int, default=Config.MEMORY_SEARCH_LIMIT,
+        help=f"每个记忆库返回条数上限 (默认: {Config.MEMORY_SEARCH_LIMIT})"
+    )
+    query_mem_parser.add_argument(
+        "--include-base", action="store_true", default=False,
+        help=f"并行检索基础共享记忆 [{Config.BASE_MEMORY_USER}]"
     )
 
     # 子命令: vad-debug
@@ -861,6 +1257,35 @@ def main():
         "--disable-persona-auto-update", action="store_true", default=False,
         help="(兼容旧版) 关闭后台人格自动更新（LangGraph Agent）"
     )
+    parser.add_argument(
+        "--no-ros2-voice", action="store_false", dest="ros2_voice",
+        default=Config.ROS2_VOICE_BRIDGE_ENABLED,
+        help="(兼容旧版) 关闭 ROS2 语音 bridge"
+    )
+    parser.add_argument(
+        "--ros2-asr-topic", type=str, default=Config.ROS2_ASR_TEXT_TOPIC,
+        help="(兼容旧版) ASR 文本发布 topic"
+    )
+    parser.add_argument(
+        "--ros2-tts-topic", type=str, default=Config.ROS2_TTS_TEXT_TOPIC,
+        help="(兼容旧版) TTS 文本订阅 topic"
+    )
+    parser.add_argument(
+        "--ros2-chat-topic", type=str, default=Config.ROS2_CHAT_TEXT_TOPIC,
+        help="(兼容旧版) 远程文本聊天订阅 topic"
+    )
+    parser.add_argument(
+        "--ros2-assistant-topic", type=str, default=Config.ROS2_ASSISTANT_TEXT_TOPIC,
+        help="(兼容旧版) 机器人回复文本发布 topic"
+    )
+    parser.add_argument(
+        "--ros2-voice-node-name", type=str, default=Config.ROS2_VOICE_NODE_NAME,
+        help="(兼容旧版) ROS2 语音 bridge 节点名"
+    )
+    parser.add_argument(
+        "--ros2-voice-queue-size", type=int, default=Config.ROS2_VOICE_QUEUE_SIZE,
+        help="(兼容旧版) ROS2 语音 bridge topic 队列大小"
+    )
 
     args = parser.parse_args()
     
@@ -869,6 +1294,10 @@ def main():
 
     if args.command == "add-memory":
         run_add_memory(args)
+    elif args.command == "add-base-memory":
+        run_add_base_memory(args)
+    elif args.command == "query-memory":
+        run_query_memory(args)
     elif args.command == "vad-debug":
         run_vad_debug(args)
     elif args.command == "chat":

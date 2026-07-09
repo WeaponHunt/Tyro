@@ -48,6 +48,7 @@ class _DummyASR:
 class _DummyTTS:
     def __init__(self):
         self.stop_calls = 0
+        self._interrupted = threading.Event()
 
     def synthesize(self, _text, play_audio=True):
         return []
@@ -75,7 +76,14 @@ class _DummyMemory:
         return ""
 
 
-def _build_manager(monkeypatch):
+class _DummyAudioRecorder:
+    listen_mode = "continuous"
+
+    def __init__(self):
+        self.is_tts_playing = False
+
+
+def _build_manager(monkeypatch, **kwargs):
     monkeypatch.setattr(cm_module.keyboard, "Listener", _DummyListener)
     return ConversationManager(
         asr_module=_DummyASR(),
@@ -84,6 +92,7 @@ def _build_manager(monkeypatch):
         memory_module=_DummyMemory(),
         tts_enabled=True,
         script_pause_resume_key="p",
+        **kwargs,
     )
 
 
@@ -127,4 +136,56 @@ def test_script_pause_resume_replays_current_substep(monkeypatch):
 
     # 第一个小step被暂停后，恢复会从同一个小step重新开始
     assert played_segments == ["第一句，", "第一句，", "第二句。"]
-    assert manager.tts.stop_calls >= 1
+
+
+def test_resolve_script_path_uses_configured_file(tmp_path, monkeypatch):
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "a.json").write_text('{"name": "a", "steps": []}', encoding="utf-8")
+    (script_dir / "target.json").write_text('{"name": "target", "steps": []}', encoding="utf-8")
+
+    manager = _build_manager(
+        monkeypatch,
+        script_dir=str(script_dir),
+        script_file="target.json",
+    )
+
+    assert manager._resolve_script_path() == str(script_dir / "target.json")
+
+
+def test_no_face_timeout_exits_continuous_response_mode(monkeypatch):
+    manager = _build_manager(
+        monkeypatch,
+        audio_recorder=_DummyAudioRecorder(),
+        no_face_response_timeout_seconds=0.05,
+    )
+    manager._response_enabled = True
+
+    manager.on_face_user_change("guest", is_familiar=False, has_face=False)
+    time.sleep(0.12)
+
+    assert manager._response_enabled is False
+    manager.shutdown(timeout=0.1)
+
+
+def test_no_face_timeout_starts_after_tts_finishes(monkeypatch):
+    audio_recorder = _DummyAudioRecorder()
+    manager = _build_manager(
+        monkeypatch,
+        audio_recorder=audio_recorder,
+        no_face_response_timeout_seconds=0.05,
+    )
+    manager._response_enabled = True
+    audio_recorder.is_tts_playing = True
+
+    manager.on_face_user_change("guest", is_familiar=False, has_face=False)
+    time.sleep(0.08)
+
+    assert manager._response_enabled is True
+
+    audio_recorder.is_tts_playing = False
+    manager._mark_waiting_for_user_response()
+    time.sleep(0.08)
+
+    assert manager._response_enabled is False
+    manager.shutdown(timeout=0.1)

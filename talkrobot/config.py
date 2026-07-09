@@ -3,6 +3,8 @@
 集中管理所有组件的配置参数
 """
 import os
+import re
+import hashlib
 
 class Config:
     """全局配置类"""
@@ -21,9 +23,16 @@ class Config:
     # 支持单字符（如 "w"/"c"/"p"/"s"）以及特殊键名（"enter"/"space"）
     MODE_SWITCH_SLEEP_KEY = "w"      # 不说话模式切换
     MODE_SWITCH_SCRIPT_KEY = "i"     # 脚本模式（介绍实验室）切换
+    # 脚本文件配置：优先按指定文件名加载；为空时可回退到目录扫描
+    SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "script"))
+    SCRIPT_FILE = "acir.json"
     SCRIPT_PAUSE_RESUME_KEY = "enter"    # 脚本模式下TTS暂停/恢复（可改为 "space"）
     TTS_INTERRUPT_KEY = "s"          # TTS 播放打断
     INTERCOM_PTT_TOGGLE_KEY = "p"    # 对讲机模式下手动切换 PTT 按下/松开
+    VIDEO_RECORD_TOGGLE_KEY = "r"    # 视频录制开始/结束
+    VIDEO_RECORD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "video"))
+    VIDEO_RECORD_FPS = 25.0
+    VIDEO_RECORD_AUDIO_ENABLED = True
 
     # 脚本图片窗口显示位置配置
     # 优先级：SCRIPT_IMAGE_WINDOW_X/Y > SCRIPT_IMAGE_SCREEN_INDEX
@@ -64,6 +73,38 @@ class Config:
         "en": ["stop introduce", "stop the introduction", "别介绍了"],
     }
 
+    # 多脚本配置。每个脚本可配置独立触发词和可选按键；key 为空/None 时只能通过关键词触发。
+    # file 支持相对 SCRIPT_DIR 的路径，也支持绝对路径。
+    SCRIPT_CONFIGS = [
+        {
+            "name": "lab_intro",
+            "file": SCRIPT_FILE,
+            "key": MODE_SWITCH_SCRIPT_KEY,
+            "keywords": {
+                "zh": MODE_SWITCH_SCRIPT_ENABLE_VOICE_WORDS["zh"],
+                "en": MODE_SWITCH_SCRIPT_ENABLE_VOICE_WORDS["en"],
+            },
+        },
+        {
+            "name": "music_demo",
+            "file": "music.json",
+            "key": None,
+            "keywords": {"zh": ["音乐演示"], "en": ["music demo"]},
+        },
+        {
+            "name": "sing_lzlh",
+            "file": "lzlh.json",
+            "key": None,
+            "keywords": {"zh": ["唱首歌"], "en": ["sing a song"]},
+        },
+        {
+            "name": "bjea_intro",
+            "file": "bjea.json",
+            "key": None,
+            "keywords": {"zh": ["介绍亦庄实验中学"], "en": ["introduce bj ea middle school"]},
+        },
+    ]
+
     # 可视化界面开关语音词与 topic（命中任一词即触发）
     VISUALIZER_ENABLE_TOPIC = "/face/visualizer/enabled"
     VISUALIZER_ENABLE_VOICE_WORDS = {
@@ -74,6 +115,15 @@ class Config:
         "zh": ["关闭可视化", "关掉可视化", "关闭吧"],
         "en": ["close the window", "don't show it anymore", "hide visualizer","关闭可视化", "关掉可视化", "隐藏可视化"],
     }
+
+    # ROS2 语音桥接配置
+    ROS2_VOICE_BRIDGE_ENABLED = True
+    ROS2_VOICE_NODE_NAME = "talkrobot_voice_bridge"
+    ROS2_ASR_TEXT_TOPIC = "/asr/text"
+    ROS2_TTS_TEXT_TOPIC = "/tts/text"
+    ROS2_CHAT_TEXT_TOPIC = "/chat/text"
+    ROS2_ASSISTANT_TEXT_TOPIC = "/assistant/text"
+    ROS2_VOICE_QUEUE_SIZE = 10
     
     # 持续监听模式 VAD 配置 (Silero VAD)
     VAD_CHECK_INTERVAL = 0.5        # VAD 检测间隔（秒），每隔此时间检测一次语音
@@ -97,7 +147,7 @@ class Config:
     
     # TTS 配置
     TTS_PROVIDER = "easy_tts_server"  # 可选: kokoro / easy_tts_server
-    LANGUAGE = "zh"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
+    LANGUAGE = "en"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
     TTS_LANG_CODE = 'e'  # 英文
     TTS_VOICE = 'zf_xiaoyi'
     TTS_SPEED = 1
@@ -105,7 +155,7 @@ class Config:
     TTS_SAMPLE_RATE = 24000
     
     # LLM 配置
-    LLM_API_KEY = "api-key = sk-bc83d29be1ed418abaa1fb78768acb3a"
+    LLM_API_KEY = "api-key = sk-d52f47086a8547f3948305790c408beb"
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_MODEL = "qwen-flash"#"qwen-plus"
     
@@ -121,6 +171,8 @@ class Config:
     FACE_USE_GPU = True
     FACE_MODEL_NAME = "buffalo_s"
     FACE_RECOGNITION_THRESHOLD = 0.3
+    # continuous 响应模式下，视野无人脸且机器人说完后多久未收到 ASR 就退出响应模式；<=0 表示禁用
+    FACE_NO_RESPONSE_TIMEOUT_SECONDS = 0
     FACE_UNKNOWN_USER = "guest"
     FACE_KNOWN_FACES_DIR = os.path.join(
         os.path.dirname(__file__),
@@ -129,11 +181,25 @@ class Config:
         "known_faces",
     )
 
+    # 视频录制默认复用人脸识别摄像头索引；如需分离，可在此单独改成其他摄像头。
+    VIDEO_RECORD_CAMERA_INDEX = FACE_CAMERA_INDEX
+
     # Memory 基础数据库路径
     MEMORY_DB_BASE_PATH = os.path.join(os.path.dirname(__file__), "mem_db")
+
+    # 记忆检索参数
+    # MEMORY_SEARCH_LIMIT: 每个记忆库检索返回上限（值越大，召回越多）
+    MEMORY_SEARCH_LIMIT = 8
+    # MEMORY_SEARCH_MIN_SCORE: 最低相似度分数阈值（None 表示不按分数过滤）
+    MEMORY_SEARCH_MIN_SCORE = None
+    # MEMORY_SEARCH_MAX_DISTANCE: 最大距离阈值（None 表示不按距离过滤）
+    MEMORY_SEARCH_MAX_DISTANCE = None
     
     # 默认用户
     DEFAULT_USER = "default"
+
+    # 基础共享记忆用户（仅通过手动命令录入）
+    BASE_MEMORY_USER = "base_memory"
 
     # 人格配置文件路径
     PERSONA_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "persona_profiles.json")
@@ -189,6 +255,42 @@ class Config:
         return f"user_{user}"
     
     @classmethod
+    def get_memory_collection_name(cls, user: str) -> str:
+        """生成合法的 Chroma collection_name（兼容中文用户名）。"""
+        raw_name = f"talkrobot_memories_{(user or '').strip()}"
+        # 保持兼容：历史上已合法的名称不变，避免已有英文用户集合被迁移。
+        if re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9._-]{1,510}[a-zA-Z0-9])?", raw_name):
+            return raw_name
+
+        user_text = (user or "unknown").strip() or "unknown"
+        safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", user_text)
+        safe = re.sub(r"^[^a-zA-Z0-9]+", "", safe)
+        safe = re.sub(r"[^a-zA-Z0-9]+$", "", safe)
+        if not safe:
+            safe = "user"
+
+        suffix = hashlib.md5(user_text.encode("utf-8")).hexdigest()[:8]
+        name = f"talkrobot_memories_{safe}_{suffix}"
+
+        # 双端必须为字母数字。
+        if not name[0].isalnum():
+            name = f"m{name}"
+        if not name[-1].isalnum():
+            name = f"{name}0"
+
+        # Chroma 要求长度 3-512。
+        if len(name) < 3:
+            name = "mem"
+        if len(name) > 512:
+            name = name[:512]
+            while name and not name[-1].isalnum():
+                name = name[:-1]
+            if not name:
+                name = "mem"
+
+        return name
+
+    @classmethod
     def get_memory_db_path(cls, user: str) -> str:
         """根据用户名生成独立的记忆数据库路径"""
         return os.path.join(cls.MEMORY_DB_BASE_PATH, user)
@@ -212,7 +314,7 @@ class Config:
             "vector_store": {
                 "provider": "chroma",
                 "config": {
-                    "collection_name": f"talkrobot_memories_{user}",
+                    "collection_name": cls.get_memory_collection_name(user),
                     "path": cls.get_memory_db_path(user)
                 }
             },

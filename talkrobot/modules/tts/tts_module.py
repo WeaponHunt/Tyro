@@ -43,7 +43,8 @@ class TTSModule:
         self.voice = voice
         self.speed = speed
         self.playback_speed = self._normalize_playback_speed(playback_speed)
-        self.pipeline = None
+        self.pipeline_zh = None
+        self.pipeline_en = None
         self.easy_tts_engine = None
         self._state_lock = threading.Lock()
         self._paused = threading.Event()
@@ -59,8 +60,8 @@ class TTSModule:
         if self.provider == "kokoro":
             from kokoro import KPipeline
 
-            resolved_lang_code = self._resolve_kokoro_lang_code(self.language, lang_code)
-            self.pipeline = KPipeline(lang_code=resolved_lang_code)
+            self.pipeline_zh = KPipeline(lang_code='z')
+            self.pipeline_en = KPipeline(lang_code='a')
         elif self.provider == "easy_tts_server":
             try:
                 from easy_tts_server import create_tts_engine
@@ -99,21 +100,6 @@ class TTSModule:
             "e": "en",
         }
         return mapping.get(language, "zh")
-
-    @staticmethod
-    def _resolve_kokoro_lang_code(language: Optional[str], lang_code: str) -> str:
-        if language is not None:
-            return "z" if language == "zh" else "a"
-
-        if lang_code and str(lang_code).strip():
-            normalized = str(lang_code).strip().lower()
-            if normalized in {"zh", "z"}:
-                return "z"
-            if normalized in {"en", "a"}:
-                return "a"
-            return normalized
-
-        return "z"
 
     def _get_easy_sample_rate(self, default: int) -> int:
         for attr_name in ("sample_rate", "sampling_rate", "sr"):
@@ -253,6 +239,16 @@ class TTSModule:
         return unicodedata.category(ch).startswith("P")
 
     @classmethod
+    def _detect_segment_language(cls, text: str) -> str:
+        cjk_count = sum(1 for ch in text if cls._is_cjk_char(ch))
+        en_count = sum(1 for ch in text if cls._is_english_char(ch))
+
+        if cjk_count + en_count == 0:
+            return "zh"
+
+        return "zh" if cjk_count >= en_count else "en"
+
+    @classmethod
     def _sanitize_text(cls, text: str) -> str:
         """仅保留中文、英文、标点和空白，其它字符直接忽略。"""
         if not text:
@@ -311,7 +307,10 @@ class TTSModule:
         """合成单条文本，返回(音频列表, 是否被中断)。"""
         if self.provider == "kokoro":
             audio_chunks: List[np.ndarray] = []
-            generator = self.pipeline(text, voice=self.voice, speed=self.speed)
+            segment_lang = self._detect_segment_language(text)
+            pipeline = self.pipeline_zh if segment_lang == "zh" else self.pipeline_en
+            logger.debug(f"Kokoro segment language={segment_lang}, text={text[:50]}...")
+            generator = pipeline(text, voice=self.voice, speed=self.speed)
             interrupted = False
 
             try:
@@ -347,7 +346,8 @@ class TTSModule:
             if self._paused.is_set() or self._interrupted.is_set():
                 return [], True
 
-            language = self.language or "zh"
+            language = self._detect_segment_language(text)
+            logger.debug(f"easy_tts_server segment language={language}, text={text[:50]}...")
             audio = self.easy_tts_engine.tts(text, language=language, voice=self.voice)
             audio_array = np.asarray(audio)
             audio_chunks = [audio_array]

@@ -105,6 +105,86 @@ class ExpressionModule:
             logger.error(f"表情重置请求出错: {e}")
             return False
 
+    def set_recording(self, recording: bool) -> bool:
+        """
+        设置表情窗口的录像提示叠加层。
+
+        Args:
+            recording: True 显示 REC 提示，False 隐藏
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self._available:
+            return False
+        state = "true" if recording else "false"
+        try:
+            resp = requests.post(f"{self.server_url}/recording/{state}", timeout=3)
+            if resp.status_code == 200:
+                logger.info(f"表情录像提示已{'开启' if recording else '关闭'}")
+                return True
+            logger.warning(f"设置表情录像提示失败: recording={recording}, status={resp.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"设置表情录像提示请求出错: {e}")
+            return False
+
+    def set_status(self, status: str, visible: bool = True) -> bool:
+        """
+        设置表情窗口的机器人状态文字叠加层。
+
+        Args:
+            status: 要显示的状态文字
+            visible: 是否显示状态文字
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self._available:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.server_url}/status",
+                json={"status": str(status or ""), "visible": bool(visible)},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                logger.debug(f"表情状态文字已更新: {status}")
+                return True
+            logger.warning(f"设置表情状态文字失败: status={status}, http_status={resp.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"设置表情状态文字请求出错: {e}")
+            return False
+
+    def set_heard_text(self, text: str, visible: bool = True) -> bool:
+        """
+        设置表情窗口底部的 ASR 识别文本叠加层。
+
+        Args:
+            text: 要显示的识别文本
+            visible: 是否显示识别文本
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self._available:
+            return False
+        try:
+            resp = requests.post(
+                f"{self.server_url}/heard",
+                json={"text": str(text or ""), "visible": bool(visible)},
+                timeout=3,
+            )
+            if resp.status_code == 200:
+                logger.debug(f"表情识别文本已更新: {text}")
+                return True
+            logger.warning(f"设置表情识别文本失败: text={text}, http_status={resp.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"设置表情识别文本请求出错: {e}")
+            return False
+
     @staticmethod
     def parse_expression_from_response(response: str) -> Tuple[str, Optional[str]]:
         """

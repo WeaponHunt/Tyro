@@ -1,5 +1,6 @@
 {
   "name": "demo",
+  "audio": "assets/intro_bgm.mp3",
   "steps": [
     {
       "text": "Hi, I’m Little Suansuan, let me introduce the Lab for Affective and Cognitive Intelligent Robotics.",

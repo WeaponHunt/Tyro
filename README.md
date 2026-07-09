@@ -13,7 +13,7 @@
 - 📝 **手动记忆**: 支持手动为指定用户添加记忆
 - 👥 **多用户隔离**: 不同用户的记忆数据独立存储
 - 🧑‍🤝‍🧑 **人脸驱动交互对象**: 可按当前识别人脸自动切换交互用户
-- 🎬 **脚本模式**: 按 C 键播放预设脚本（可指定表情、图片与间隔）
+- 🎬 **脚本模式**: 支持多个预设脚本，每个脚本可绑定独立关键词和可选按键
 - 😴 **睡眠模式**: 按 W 键进入/退出睡眠（睡眠中忽略外部输入）
 
 ## 项目结构
@@ -210,7 +210,7 @@ python -m talkrobot.main chat --disable-persona-auto-update
 ### 快捷键
 
 - `W`: 进入/退出睡眠模式（睡眠中忽略外部输入）
-- `C`: 进入/退出脚本模式（按顺序播放脚本）
+- `I`: 默认进入/退出 `lab_intro` 脚本模式（具体按键可在 `Config.SCRIPT_CONFIGS` 中为每个脚本单独配置）
 
 ### 持续监听模式 (`--listen-mode continuous`)
 
@@ -234,14 +234,16 @@ python -m talkrobot.main chat --disable-persona-auto-update
 ### 脚本模式
 
 1. 将脚本文件放入 [script](script) 目录（JSON 格式，示例见 `example_script.json`）
-2. 运行程序后按 `C` 进入脚本模式（再次按 `C` 退出）
-3. 脚本播放结束后会自动回到交互模式
+2. 在 `talkrobot/config.py` 的 `SCRIPT_CONFIGS` 中配置每个脚本对应的文件、关键词和可选按键
+3. 运行程序后，说出脚本关键词即可进入对应脚本；配置了 `key` 的脚本也可以按对应按键进入，再按该按键退出
+4. 脚本播放结束后会自动回到交互模式
 
 脚本格式（JSON）：
 
 ```json
 {
     "name": "demo",
+    "audio": "assets/intro_bgm.mp3",
     "steps": [
         {"text": "欢迎来到演示。", "expression": "happy", "image": "assets/sample.ppm", "delay": 1.5},
         {"text": "这里可以展示图片。", "expression": "neutral", "delay": 1.0},
@@ -256,6 +258,49 @@ python -m talkrobot.main chat --disable-persona-auto-update
 - `expression`: 要切换的表情名称
 - `image`: 要展示的图片路径（相对 `script/` 目录）
 - `delay`: 当前句结束后等待的秒数
+- `audio`: 脚本全程循环播放的音频路径（相对 `script/` 目录，未指定则默认不播放）
+
+多脚本触发配置示例（写在 `talkrobot/config.py` 的 `Config` 类中）：
+
+```python
+SCRIPT_CONFIGS = [
+    {
+        "name": "lab_intro",
+        "file": "acir.json",
+        "key": "i",
+        "keywords": {
+            "zh": ["介绍实验室", "开始介绍"],
+            "en": ["introduce the lab", "start the introduction"],
+        },
+    },
+    {
+        "name": "music_demo",
+        "file": "music.json",
+        "key": "m",
+        "keywords": {
+            "zh": ["播放音乐脚本", "音乐演示"],
+            "en": ["music demo"],
+        },
+    },
+    {
+        "name": "greeting_loop",
+        "file": "greet_loop.json",
+        "key": None,
+        "keywords": {
+            "zh": ["循环问候"],
+            "en": ["greeting loop"],
+        },
+    },
+]
+```
+
+配置说明：
+
+- `name`: 脚本名称，用于日志和提示
+- `file`: 脚本 JSON 文件路径；相对路径会从 `SCRIPT_DIR`（默认 `script/`）下查找
+- `keywords`: 触发该脚本的关键词，可按语言分别配置；命中任意关键词就进入对应脚本
+- `key`: 可选按键映射；设置为 `"i"`、`"m"`、`"space"`、`"enter"` 等即可通过按键进入脚本；设为 `None` 或空字符串时只能通过关键词触发
+- `MODE_SWITCH_SCRIPT_DISABLE_VOICE_WORDS`: 全局退出脚本关键词，例如“别介绍了”“停止介绍”
 
 ## 模块说明
 

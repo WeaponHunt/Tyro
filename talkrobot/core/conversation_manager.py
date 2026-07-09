@@ -9,15 +9,18 @@ import os
 import json
 import copy
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 from typing import Optional, Callable, Tuple, List
 import threading
 from pynput import keyboard
+from talkrobot.config import Config
 
 class ConversationManager:
     """对话管理器"""
     
     def __init__(self, asr_module, tts_module, llm_module, memory_module,
+                 base_memory_module=None,
                  tts_enabled: bool = True, expression_module=None,
                  streaming: bool = False,
                  audio_recorder=None,
@@ -36,6 +39,9 @@ class ConversationManager:
                  greeting_cooldown_seconds: float = 600.0,
                  sleep_toggle_key: str = "w",
                  script_toggle_key: str = "c",
+                 script_dir: Optional[str] = None,
+                 script_file: Optional[str] = None,
+                 script_configs: Optional[List[dict]] = None,
                  script_pause_resume_key: str = "p",
                  tts_interrupt_key: str = "s",
                  sleep_enable_voice_words: Optional[List[str]] = None,
@@ -52,7 +58,9 @@ class ConversationManager:
                  script_image_target_width: Optional[int] = None,
                  script_image_target_height: Optional[int] = None,
                  script_image_force_window_size: bool = True,
-                 script_image_force_resize_image: bool = False):
+                 script_image_force_resize_image: bool = False,
+                 no_face_response_timeout_seconds: float = 10.0,
+                 ros2_bridge=None):
         """
         初始化对话管理器
         
@@ -61,6 +69,7 @@ class ConversationManager:
             tts_module: TTS模块实例
             llm_module: LLM模块实例
             memory_module: Memory模块实例
+            base_memory_module: 基础共享记忆模块实例（仅手动录入）
             tts_enabled: 是否启用TTS语音播放（默认True）
             expression_module: 表情模块实例（可选）
             streaming: 是否启用流式回复生成
@@ -78,6 +87,9 @@ class ConversationManager:
             say_hallo: 是否在非响应阶段见到熟人后主动问好
             sleep_toggle_key: 睡眠模式切换按键
             script_toggle_key: 脚本模式切换按键
+            script_dir: 脚本文件夹路径（可选，默认使用 Config.SCRIPT_DIR）
+            script_file: 脚本文件名或路径（可选，指定后按该文件执行）
+            script_configs: 多脚本配置列表，每项包含 file/name/keywords/key
             script_pause_resume_key: 脚本模式下TTS暂停/恢复按键
             tts_interrupt_key: TTS 打断按键
             sleep_enable_voice_words: 睡眠模式语音开启词列表（任一命中即开启睡眠）
@@ -87,14 +99,18 @@ class ConversationManager:
             visualizer_enable_topic: 可视化开关 topic
             visualizer_enable_voice_words: 可视化开启语音词（任一命中即发布 True）
             visualizer_disable_voice_words: 可视化关闭语音词（任一命中即发布 False）
+            ros2_bridge: 可选 ROS2 语音桥接器，用于发布 ASR 文本与订阅 TTS 文本
         """
         self.asr = asr_module
         self.tts = tts_module
         self.llm = llm_module
         self.memory = memory_module
+        self.base_memory = base_memory_module
         self.tts_enabled = tts_enabled
         self.streaming = streaming
         self.expression = expression_module
+        self.ros2_bridge = ros2_bridge
+        self._robot_status = None
         self.audio_recorder = audio_recorder
         self.audio_min_duration = audio_min_duration
         self.audio_min_rms = audio_min_rms
@@ -118,6 +134,7 @@ class ConversationManager:
         self._script_lock = threading.Lock()
         self._script_pause_lock = threading.Lock()
         self._script_image_lock = threading.Lock()
+        self._no_face_timeout_lock = threading.Lock()
         self._recent_dialogue_rounds_by_user = {}  # dict[user, list[(user_text, assistant_text)]]
         self._active_user = self.default_user
         self._active_user_has_long_term_memory = True
@@ -132,15 +149,35 @@ class ConversationManager:
         self._script_thread = None
         self._script_stop_event = threading.Event()
         self._script_context_snapshot = None
+        self._face_present = True
+        self._last_user_wait_start_ts = time.time()
+        self._awaiting_user_response = True
+        self._no_face_response_timeout_seconds = max(0.0, float(no_face_response_timeout_seconds))
+        self._no_face_response_timer = None
         self._script_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "script")
+            str(script_dir or getattr(Config, "SCRIPT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "script")))
         )
+        self._script_file = str(script_file or getattr(Config, "SCRIPT_FILE", "")).strip()
+        self.language = (language or "zh").strip().lower()
+        if self.language not in {"zh", "en"}:
+            self.language = "zh"
+        self._sleep_toggle_key = self._normalize_key_char(sleep_toggle_key, "w")
+        self._script_toggle_key = self._normalize_key_char(script_toggle_key, "c")
+        self._script_pause_resume_key = self._normalize_key_char(script_pause_resume_key, "p")
+        self._tts_interrupt_key = self._normalize_key_char(tts_interrupt_key, "s")
+        self._script_configs = self._normalize_script_configs(script_configs, script_file)
+        self._active_script_config = self._script_configs[0] if self._script_configs else None
         self._script_image_window = "ScriptImage"
         self._script_image_open = False
         self._script_image_thread = None
         self._script_image_stop_event = threading.Event()
         self._script_image_update_event = threading.Event()
         self._script_image_current_path = None
+        # 脚本音频播放相关
+        self._script_audio_process = None
+        self._script_audio_lock = threading.Lock()
+        self._script_audio_current_path = None
+        self._script_audio_source_path = None
         self._script_image_screen_index = int(script_image_screen_index)
         self._script_image_window_x = script_image_window_x
         self._script_image_window_y = script_image_window_y
@@ -155,17 +192,11 @@ class ConversationManager:
         self._script_image_force_resize_image = bool(script_image_force_resize_image)
         self._screen_geometries_cache = None
         self._script_face_tracking_disabled = False
-        self.language = (language or "zh").strip().lower()
-        if self.language not in {"zh", "en"}:
-            self.language = "zh"
-        self._sleep_toggle_key = self._normalize_key_char(sleep_toggle_key, "w")
-        self._script_toggle_key = self._normalize_key_char(script_toggle_key, "c")
-        self._script_pause_resume_key = self._normalize_key_char(script_pause_resume_key, "p")
-        self._tts_interrupt_key = self._normalize_key_char(tts_interrupt_key, "s")
         self._sleep_toggle_key_label = self._format_key_label(self._sleep_toggle_key)
         self._script_toggle_key_label = self._format_key_label(self._script_toggle_key)
         self._script_pause_resume_key_label = self._format_key_label(self._script_pause_resume_key)
         self._tts_interrupt_key_label = self._format_key_label(self._tts_interrupt_key)
+        self._script_key_bindings = self._build_script_key_bindings()
 
         default_sleep_enable_words = ["quiet", "silent", "remain silent"] if self._is_english else ["别说话了"]
         default_sleep_disable_words = ["can speak", "speak now"] if self._is_english else ["可以说话了"]
@@ -179,7 +210,7 @@ class ConversationManager:
             sleep_disable_voice_words,
             default_sleep_disable_words,
         )
-        self._script_enable_voice_words = self._normalize_voice_toggle_words(
+        legacy_script_enable_words = self._normalize_voice_toggle_words(
             script_enable_voice_words,
             default_script_enable_words,
         )
@@ -205,12 +236,13 @@ class ConversationManager:
         self._pending_greeting_deadline: Optional[float] = None
         self._greeting_cooldown_seconds = float(greeting_cooldown_seconds)
         self._last_greet_ts_by_user = {}
-        self._script_triggers = ["介绍一下实验室"] if not self._is_english else ["introduce the lab"]
+        self._script_triggers = self._build_script_triggers(legacy_script_enable_words)
 
         if self._memory_provider is None:
             self._memory_provider = lambda _: (memory_module, True)
         self._switch_user_if_needed(self.default_user, silent=True)
         self._start_sleep_listener()
+        self._set_robot_status(self._current_idle_robot_status())
         
         expr_status = '开启' if (expression_module and expression_module.is_available) else '关闭'
         logger.info(
@@ -229,6 +261,74 @@ class ConversationManager:
 
     def _msg(self, zh: str, en: str) -> str:
         return en if self._is_english else zh
+
+    def _robot_status_text(self, status: str) -> str:
+        labels = {
+            "muted": ("闭嘴状态", "Muted"),
+            "script": ("脚本模式", "Script mode"),
+            "listening": ("正在听", "Listening"),
+            "speaking": ("正在说话", "Speaking"),
+            "thinking": ("正在思考", "Thinking"),
+        }
+        zh, en = labels.get(status, (status, status))
+        return self._msg(zh, en)
+
+    def _set_robot_status(self, status: str) -> None:
+        """更新表情窗口上的机器人状态文字。"""
+        if not status:
+            return
+        self._robot_status = status
+        if not self.expression or not self.expression.is_available:
+            return
+        set_status = getattr(self.expression, "set_status", None)
+        if not callable(set_status):
+            return
+        try:
+            set_status(self._robot_status_text(status))
+        except Exception as e:
+            logger.debug(f"更新机器人状态文字失败: {e}")
+
+    def _current_idle_robot_status(self) -> str:
+        if self._sleep_mode:
+            return "muted"
+        if self._script_mode:
+            return "script"
+        return "listening"
+
+    def _restore_idle_robot_status(self) -> None:
+        self._set_robot_status(self._current_idle_robot_status())
+
+    @staticmethod
+    def _clean_heard_text_for_display(text: str) -> str:
+        """清理 ASR 结果前置的控制标记、表情和符号，仅保留可读内容。"""
+        cleaned = str(text or "").strip()
+        cleaned = re.sub(r"<\|[^>]*\|>", "", cleaned)
+        cleaned = re.sub(r"^\s*(?:\[[^\]]{0,32}\]|\([^)]{0,32}\)|（[^）]{0,32}）|【[^】]{0,32}】)\s*", "", cleaned)
+        cleaned = re.sub(r"^[^\w\u4e00-\u9fff]+", "", cleaned, flags=re.UNICODE)
+        return cleaned.strip()
+
+    def _set_heard_text(self, text: str) -> None:
+        text = self._clean_heard_text_for_display(text)
+        if not self.expression or not self.expression.is_available:
+            return
+        set_heard_text = getattr(self.expression, "set_heard_text", None)
+        if not callable(set_heard_text):
+            return
+        try:
+            set_heard_text(text, visible=bool(str(text or "").strip()))
+        except Exception as e:
+            logger.debug(f"更新 ASR 识别文本失败: {e}")
+
+    def _clear_heard_text(self) -> None:
+        if not self.expression or not self.expression.is_available:
+            return
+        set_heard_text = getattr(self.expression, "set_heard_text", None)
+        if not callable(set_heard_text):
+            return
+        try:
+            set_heard_text("", visible=False)
+        except Exception as e:
+            logger.debug(f"清除 ASR 识别文本失败: {e}")
 
     @staticmethod
     def _normalize_key_char(key: Optional[str], fallback: str) -> str:
@@ -293,10 +393,108 @@ class ConversationManager:
                 normalized_words.append(normalized)
         return normalized_words
 
+    def _normalize_script_configs(self, script_configs: Optional[List[dict]], fallback_script_file: Optional[str]) -> List[dict]:
+        """标准化多脚本配置，兼容旧的 SCRIPT_FILE 单脚本配置。"""
+        raw_configs = script_configs
+        if raw_configs is None:
+            raw_configs = getattr(Config, "SCRIPT_CONFIGS", None)
+
+        normalized_configs = []
+        if isinstance(raw_configs, dict):
+            raw_configs = [raw_configs]
+
+        if isinstance(raw_configs, list):
+            for idx, raw in enumerate(raw_configs):
+                if not isinstance(raw, dict):
+                    continue
+                script_file = str(raw.get("file", raw.get("script_file", raw.get("path", ""))) or "").strip()
+                if not script_file:
+                    continue
+
+                name = str(raw.get("name", "") or "").strip() or os.path.splitext(os.path.basename(script_file))[0] or f"script_{idx + 1}"
+                key = raw.get("key", raw.get("hotkey", None))
+                key_value = self._normalize_key_char(key, "") if key else ""
+
+                keywords = raw.get("keywords", raw.get("triggers", raw.get("voice_words", [])))
+                if isinstance(keywords, dict):
+                    keywords = keywords.get(self.language) or keywords.get("zh") or keywords.get("en") or []
+                if isinstance(keywords, str):
+                    keywords = [keywords]
+                if not isinstance(keywords, list):
+                    keywords = []
+
+                normalized_keywords = []
+                for keyword in keywords:
+                    normalized = self._normalize_text(str(keyword or ""))
+                    if normalized:
+                        normalized_keywords.append(normalized)
+
+                normalized_configs.append({
+                    "name": name,
+                    "file": script_file,
+                    "key": key_value,
+                    "keywords": normalized_keywords,
+                })
+
+        if not normalized_configs:
+            fallback = str(fallback_script_file or getattr(Config, "SCRIPT_FILE", "") or "").strip()
+            if fallback:
+                normalized_configs.append({
+                    "name": os.path.splitext(os.path.basename(fallback))[0] or "default",
+                    "file": fallback,
+                    "key": self._script_toggle_key if hasattr(self, "_script_toggle_key") else "",
+                    "keywords": [],
+                })
+
+        return normalized_configs
+
+    def _build_script_key_bindings(self) -> dict:
+        bindings = {}
+        for config in self._script_configs:
+            key = str(config.get("key", "") or "").strip()
+            if not key:
+                continue
+            if key in bindings:
+                logger.warning(f"脚本按键重复，后者将被忽略: key={self._format_key_label(key)}, script={config.get('name')}")
+                continue
+            bindings[key] = config
+        return bindings
+
+    def _build_script_triggers(self, legacy_script_enable_words: List[str]) -> List[dict]:
+        triggers = []
+        for config in self._script_configs:
+            for keyword in config.get("keywords", []):
+                triggers.append({"keyword": keyword, "config": config})
+
+        # 兼容旧配置：旧的脚本开启词默认触发第一个脚本。
+        default_config = self._script_configs[0] if self._script_configs else None
+        if default_config is not None:
+            for keyword in legacy_script_enable_words:
+                triggers.append({"keyword": keyword, "config": default_config})
+
+        seen = set()
+        deduped = []
+        for item in triggers:
+            key = (item["keyword"], item["config"].get("name", ""))
+            if item["keyword"] and key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        return deduped
+
     def _contains_any_trigger(self, normalized_text: str, triggers: List[str]) -> bool:
         if not normalized_text or not triggers:
             return False
         return any(trigger in normalized_text for trigger in triggers)
+
+    def _match_script_trigger(self, user_text: str) -> Optional[dict]:
+        normalized_text = self._normalize_text(user_text)
+        if not normalized_text:
+            return None
+        for item in self._script_triggers:
+            keyword = item.get("keyword", "")
+            if keyword and keyword in normalized_text:
+                return item.get("config")
+        return None
 
     def _handle_mode_toggle_voice_command(self, user_text: str) -> bool:
         """处理通过语音关键词触发的模式开关。"""
@@ -314,14 +512,15 @@ class ConversationManager:
             self._set_sleep_mode(False)
             return True
 
-        if self._contains_any_trigger(normalized_text, self._script_enable_voice_words):
-            logger.info("命中语音指令：开启脚本模式")
-            self._set_script_mode(True)
-            return True
-
         if self._contains_any_trigger(normalized_text, self._script_disable_voice_words):
             logger.info("命中语音指令：关闭脚本模式")
             self._set_script_mode(False)
+            return True
+
+        script_config = self._match_script_trigger(user_text)
+        if script_config is not None:
+            logger.info(f"命中脚本触发词，开启脚本: {script_config.get('name')}")
+            self._set_script_mode(True, script_config=script_config)
             return True
 
         return False
@@ -388,18 +587,26 @@ class ConversationManager:
             try:
                 if self._is_key_pressed(key, self._sleep_toggle_key):
                     self._toggle_sleep_mode()
-                elif self._is_key_pressed(key, self._script_toggle_key):
-                    self._toggle_script_mode()
                 elif self._is_key_pressed(key, self._script_pause_resume_key):
                     self._toggle_script_pause_mode()
+                else:
+                    for script_key, script_config in self._script_key_bindings.items():
+                        if self._is_key_pressed(key, script_key):
+                            self._toggle_script_mode(script_config)
+                            break
             except Exception as e:
                 logger.debug(f"睡眠模式按键监听异常: {e}")
 
         self._sleep_listener = keyboard.Listener(on_press=_on_press_sleep, daemon=True)
         self._sleep_listener.start()
+        script_key_labels = [
+            f"{self._format_key_label(key)}:{config.get('name')}"
+            for key, config in self._script_key_bindings.items()
+        ]
+        script_key_text = ", ".join(script_key_labels) if script_key_labels else "无"
         logger.info(
             f"模式切换按键监听已启动 (按 {self._sleep_toggle_key_label} 切换睡眠，"
-            f"按 {self._script_toggle_key_label} 切换脚本，"
+            f"脚本按键: {script_key_text}，"
             f"按 {self._script_pause_resume_key_label} 暂停/恢复脚本播报)"
         )
 
@@ -419,6 +626,7 @@ class ConversationManager:
         if is_sleeping:
             if self._script_mode:
                 self._exit_script_mode()
+            self._set_robot_status("muted")
             if self.expression and self.expression.is_available:
                 self.expression.set_expression("sleep")
             logger.info("进入睡眠模式，暂停外部输入响应")
@@ -434,13 +642,14 @@ class ConversationManager:
             self._play_tts_notice(self._msg("我可以说话了。", "I can talk now."))
             if self.expression and self.expression.is_available:
                 self.expression.reset_expression()
+            self._restore_idle_robot_status()
         return True
 
-    def _toggle_script_mode(self) -> None:
+    def _toggle_script_mode(self, script_config: Optional[dict] = None) -> None:
         """切换脚本模式。"""
-        self._set_script_mode(not self._script_mode)
+        self._set_script_mode(not self._script_mode, script_config=script_config)
 
-    def _set_script_mode(self, enabled: bool) -> bool:
+    def _set_script_mode(self, enabled: bool, script_config: Optional[dict] = None) -> bool:
         """显式设置脚本模式状态，返回是否发生状态变化。"""
         enabled = bool(enabled)
 
@@ -456,7 +665,7 @@ class ConversationManager:
             return False
 
         if enabled:
-            self._enter_script_mode()
+            self._enter_script_mode(script_config)
         else:
             self._exit_script_mode()
         return True
@@ -505,6 +714,10 @@ class ConversationManager:
 
         if paused:
             self._interrupt_tts_playback()
+            try:
+                self._stop_script_audio_loop(preserve_source=True)
+            except Exception:
+                pass
             logger.info("脚本播报已暂停")
             print(self._msg(
                 f"⏸️ 脚本播报已暂停（按 {self._script_pause_resume_key_label} 恢复）",
@@ -512,13 +725,24 @@ class ConversationManager:
             ))
         else:
             logger.info("脚本播报已恢复")
+            if self._script_audio_source_path:
+                try:
+                    self._start_script_audio_loop(self._script_audio_source_path)
+                except Exception:
+                    pass
             print(self._msg("▶️ 脚本播报已恢复", "▶️ Script playback resumed"))
 
-    def _enter_script_mode(self) -> None:
+    def _enter_script_mode(self, script_config: Optional[dict] = None) -> None:
+        selected_script = script_config or self._active_script_config or (self._script_configs[0] if self._script_configs else None)
+        if selected_script is None:
+            logger.warning("未配置可执行脚本")
+            return
+
         with self._script_lock:
             if self._script_mode:
                 return
 
+            self._active_script_config = selected_script
             self._script_context_snapshot = {
                 "recent_dialogue_rounds_by_user": copy.deepcopy(self._recent_dialogue_rounds_by_user),
                 "pending_user_switch_notice": self._pending_user_switch_notice,
@@ -533,6 +757,7 @@ class ConversationManager:
             self._script_mode = True
             self._script_paused = False
             self._script_stop_event.clear()
+            self._set_robot_status("script")
             self._script_thread = threading.Thread(target=self._run_script_mode, daemon=True)
             self._script_thread.start()
 
@@ -544,10 +769,11 @@ class ConversationManager:
         if not disabled:
             logger.warning("进入脚本模式时未能关闭人脸追踪")
 
-        logger.info("进入脚本模式")
+        script_name = str(selected_script.get("name", "") or selected_script.get("file", "") or "script")
+        logger.info(f"进入脚本模式: {script_name}")
         print(self._msg(
-            f"🎬 已进入脚本模式（按 {self._script_toggle_key_label} 退出）",
-            f"🎬 Script mode enabled (press {self._script_toggle_key_label} to exit)",
+            f"🎬 已进入脚本模式：{script_name}",
+            f"🎬 Script mode enabled: {script_name}",
         ))
 
     def _exit_script_mode(self) -> None:
@@ -582,10 +808,28 @@ class ConversationManager:
         if self._script_face_tracking_disabled:
             self._set_face_tracking_enabled(True)
         self._script_face_tracking_disabled = False
+        self._restore_idle_robot_status()
         logger.info("退出脚本模式，恢复交互上下文")
         print(self._msg("✅ 已退出脚本模式", "✅ Script mode disabled"))
 
     def _resolve_script_path(self) -> Optional[str]:
+        active_config = self._active_script_config or (self._script_configs[0] if self._script_configs else None)
+        active_file = ""
+        if active_config:
+            active_file = str(active_config.get("file", "") or "").strip()
+        if not active_file:
+            active_file = self._script_file
+
+        if active_file:
+            candidate = active_file
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(self._script_dir, candidate)
+            candidate = os.path.abspath(candidate)
+            if os.path.isfile(candidate):
+                return candidate
+            logger.warning(f"脚本文件不存在: {candidate}")
+            return None
+
         if not os.path.isdir(self._script_dir):
             return None
 
@@ -615,6 +859,26 @@ class ConversationManager:
             logger.warning("脚本格式无效：steps 必须是列表")
             return []
         return steps
+
+    def _load_script_audio(self) -> str:
+        script_path = self._resolve_script_path()
+        if not script_path:
+            return ""
+
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            logger.warning(f"脚本文件读取失败: {e}")
+            return ""
+
+        if not isinstance(payload, dict):
+            return ""
+
+        return str(payload.get("audio", payload.get("audio_path", payload.get("background_audio", ""))) or "").strip()
+
+    def _load_script_config(self) -> Tuple[list, str]:
+        return self._load_script_steps(), self._load_script_audio()
 
     def _normalize_script_gesture(self, gesture: str) -> str:
         """标准化脚本动作字符串，统一为函数调用样式。"""
@@ -738,10 +1002,13 @@ class ConversationManager:
 
     def _run_script_mode(self) -> None:
         try:
-            steps = self._load_script_steps()
+            steps, script_audio = self._load_script_config()
             if not steps:
                 self._exit_script_mode()
                 return
+
+            if script_audio:
+                self._start_script_audio_loop(script_audio)
 
             for step in steps:
                 if self._script_stop_event.is_set() or not self._script_mode:
@@ -818,9 +1085,16 @@ class ConversationManager:
         except Exception as e:
             logger.warning(f"脚本模式运行异常: {e}")
         finally:
+            self._stop_script_audio_loop(preserve_source=False)
             if self.expression and self.expression.is_available:
                 self.expression.reset_expression()
             self._close_script_image_window()
+
+            # 停止任何正在播放的脚本音频
+            try:
+                self._stop_script_audio_loop(preserve_source=False)
+            except Exception:
+                pass
 
             if self._script_mode:
                 self._exit_script_mode()
@@ -837,6 +1111,83 @@ class ConversationManager:
             logger.warning(f"脚本图片不存在: {resolved_path}")
             return None
         return resolved_path
+
+    def _resolve_script_audio_path(self, audio_path: str) -> Optional[str]:
+        if not audio_path:
+            return None
+
+        resolved_path = audio_path
+        if not os.path.isabs(resolved_path):
+            resolved_path = os.path.join(self._script_dir, audio_path)
+
+        if not os.path.isfile(resolved_path):
+            logger.warning(f"脚本音频不存在: {resolved_path}")
+            return None
+        return resolved_path
+
+    def _start_script_audio_loop(self, audio_path: str) -> None:
+        """使用可用的外部播放器以循环方式播放音频文件（非阻塞）。"""
+        resolved = self._resolve_script_audio_path(audio_path)
+        if not resolved:
+            return
+
+        import shutil
+
+        # 选择可用播放器，优先 mpv, 其次 ffplay, 最后 aplay
+        player = None
+        # if shutil.which("mpv"):
+        #     player = "mpv"
+        #     args = ["mpv", "--no-video", "--really-quiet", "--loop=file", resolved]
+        if shutil.which("ffplay"):
+            player = "ffplay"
+            # 注意：不使用 -autoexit，因为它会在第一遍播放完后立即退出，导致循环不生效
+            args = ["ffplay", "-nodisp", "-hide_banner", "-loglevel", "quiet", "-loop", "0", resolved]
+            print(f"使用 ffplay 播放脚本音频: {resolved}")
+        elif shutil.which("aplay"):
+            # aplay 不支持循环参数统一，使用 shell loop
+            player = "aplay"
+            args = ["/bin/sh", "-c", f"while :; do aplay -q '{resolved}'; done"]
+        else:
+            logger.warning("未找到可用的外部播放器（mpv/ffplay/aplay），脚本音频播放被跳过")
+            return
+
+        with self._script_audio_lock:
+            self._script_audio_source_path = resolved
+            # 停掉已有的播放
+            try:
+                if self._script_audio_process is not None:
+                    self._stop_script_audio_loop(preserve_source=True)
+            except Exception:
+                pass
+
+            try:
+                #proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = subprocess.Popen(args, stdout=None, stderr=None)
+                self._script_audio_process = proc
+                self._script_audio_current_path = resolved
+                logger.info(f"开始脚本音频循环播放: {resolved} (player={player})")
+            except Exception as e:
+                logger.warning(f"启动脚本音频播放失败: {resolved}, err={e}")
+
+    def _stop_script_audio_loop(self, wait: float = 0.5, preserve_source: bool = True) -> None:
+        with self._script_audio_lock:
+            proc = self._script_audio_process
+            self._script_audio_process = None
+            if not preserve_source:
+                self._script_audio_current_path = None
+                self._script_audio_source_path = None
+
+        if proc is None:
+            return
+
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=max(0.1, float(wait)))
+            except Exception:
+                proc.kill()
+        except Exception as e:
+            logger.debug(f"停止脚本音频播放时发生错误: {e}")
 
     def _get_screen_geometries(self) -> List[Tuple[int, int, int, int]]:
         """获取屏幕几何信息列表，元素为 (x, y, width, height)。"""
@@ -1079,6 +1430,9 @@ class ConversationManager:
     def _play_tts_notice(self, text: str) -> None:
         if not text or not self.tts_enabled or self.tts is None:
             return
+        self._set_robot_status("speaking")
+        self._cancel_no_face_response_timeout()
+        self._publish_ros2_assistant_text(text)
         if self.audio_recorder:
             self.audio_recorder.is_tts_playing = True
         try:
@@ -1086,6 +1440,19 @@ class ConversationManager:
         finally:
             if self.audio_recorder:
                 self.audio_recorder.is_tts_playing = False
+            self._restore_idle_robot_status()
+            self._mark_waiting_for_user_response()
+
+    def _publish_ros2_assistant_text(self, text: str) -> None:
+        if not text or self.ros2_bridge is None:
+            return
+        publisher = getattr(self.ros2_bridge, "publish_assistant_text", None)
+        if not callable(publisher):
+            return
+        try:
+            publisher(text)
+        except Exception as e:
+            logger.debug(f"Publish assistant text to ROS2 failed: {e}")
 
     def _reset_context_on_wake(self) -> None:
         """从睡眠模式唤醒时重置对话上下文。"""
@@ -1095,7 +1462,110 @@ class ConversationManager:
         self._pending_greeting_deadline = None
         self._last_greet_ts_by_user = {}
         self._response_enabled = not self._is_continuous_mode
+        if not self._response_enabled:
+            self._cancel_no_face_response_timeout()
         logger.info("已重置滑动窗口、问好窗口与响应模式")
+
+    def _mark_asr_activity(self) -> None:
+        """记录最近一次收到有效 ASR 的时间。"""
+        with self._no_face_timeout_lock:
+            self._last_user_wait_start_ts = time.time()
+            self._awaiting_user_response = False
+        self._cancel_no_face_response_timeout()
+
+    def _mark_waiting_for_user_response(self) -> None:
+        """机器人完成回复后，从此刻开始等待用户回应。"""
+        with self._no_face_timeout_lock:
+            self._last_user_wait_start_ts = time.time()
+            self._awaiting_user_response = True
+        self._schedule_no_face_response_timeout_if_needed()
+
+    def _is_tts_currently_playing(self) -> bool:
+        return bool(self.audio_recorder and getattr(self.audio_recorder, "is_tts_playing", False))
+
+    def _cancel_no_face_response_timeout(self) -> None:
+        with self._no_face_timeout_lock:
+            timer = self._no_face_response_timer
+            self._no_face_response_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception as e:
+                logger.debug(f"取消无人脸响应超时定时器失败: {e}")
+
+    def _schedule_no_face_response_timeout_if_needed(self) -> None:
+        """无人脸且处于 continuous 响应模式时，安排空闲超时退出。"""
+        with self._no_face_timeout_lock:
+            if (
+                not self._is_continuous_mode
+                or self._face_present
+                or not self._response_enabled
+                or not self._awaiting_user_response
+                or self._sleep_mode
+                or self._script_mode
+                or self._is_tts_currently_playing()
+                or self._no_face_response_timeout_seconds <= 0
+            ):
+                timer = self._no_face_response_timer
+                self._no_face_response_timer = None
+                delay = None
+            else:
+                elapsed = time.time() - self._last_user_wait_start_ts
+                delay = max(0.01, self._no_face_response_timeout_seconds - elapsed)
+                timer = self._no_face_response_timer
+                self._no_face_response_timer = threading.Timer(
+                    delay,
+                    self._handle_no_face_response_timeout,
+                )
+                self._no_face_response_timer.daemon = True
+                self._no_face_response_timer.start()
+
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception as e:
+                logger.debug(f"重置无人脸响应超时定时器失败: {e}")
+
+    def _handle_no_face_response_timeout(self) -> None:
+        should_exit = False
+        with self._no_face_timeout_lock:
+            self._no_face_response_timer = None
+            if (
+                self._is_continuous_mode
+                and not self._face_present
+                and self._response_enabled
+                and self._awaiting_user_response
+                and not self._sleep_mode
+                and not self._script_mode
+                and not self._is_tts_currently_playing()
+            ):
+                elapsed = time.time() - self._last_user_wait_start_ts
+                if elapsed >= self._no_face_response_timeout_seconds:
+                    self._response_enabled = False
+                    self._pending_greeting_deadline = None
+                    should_exit = True
+
+        if should_exit:
+            self._clear_sliding_window(self._active_user)
+            self._restore_idle_robot_status()
+            logger.info(
+                f"视野中无人脸且 {self._no_face_response_timeout_seconds:.1f}s 未收到新 ASR，已退出响应模式"
+            )
+            print(self._msg(
+                "🛑 视野中无人脸且长时间未收到新语音，已退出响应模式",
+                "🛑 No face in view and no new speech for a while; response mode disabled",
+            ))
+            return
+
+        self._schedule_no_face_response_timeout_if_needed()
+
+    def _set_face_presence(self, has_face: bool) -> None:
+        with self._no_face_timeout_lock:
+            self._face_present = bool(has_face)
+        if has_face:
+            self._cancel_no_face_response_timeout()
+        else:
+            self._schedule_no_face_response_timeout_if_needed()
 
     def _switch_user_if_needed(self, user: str, silent: bool = False) -> None:
         """当用户变化时切换记忆模块与会话上下文。"""
@@ -1181,8 +1651,9 @@ class ConversationManager:
         """供外部线程调用的用户切换入口（如人脸追踪线程）。"""
         self._switch_user_if_needed(user)
 
-    def on_face_user_change(self, user: str, is_familiar: bool = False) -> None:
+    def on_face_user_change(self, user: str, is_familiar: bool = False, has_face: bool = True) -> None:
         """人脸追踪回调入口：切换对象，并在条件满足时主动问好。"""
+        self._set_face_presence(has_face)
         if self._sleep_mode or self._script_mode:
             logger.debug("睡眠模式中，忽略人脸用户变更")
             return
@@ -1304,13 +1775,7 @@ class ConversationManager:
             self._pending_greeting_deadline = time.time() + self._greeting_response_window_seconds
 
             if self.tts_enabled and self.tts is not None:
-                if self.audio_recorder:
-                    self.audio_recorder.is_tts_playing = True
-                try:
-                    self.tts.synthesize(response, play_audio=True)
-                finally:
-                    if self.audio_recorder:
-                        self.audio_recorder.is_tts_playing = False
+                self._play_tts_notice(response)
 
             if expression_name and self.expression and self.expression.is_available:
                 self.expression.reset_expression()
@@ -1361,6 +1826,16 @@ class ConversationManager:
                 logger.info(f"已清空滑动窗口短期记忆: user={target_user}")
 
     @staticmethod
+    def _merge_memory_context(user_memory_context: str, base_memory_context: str) -> str:
+        """合并用户记忆与基础共享记忆。"""
+        sections = []
+        if user_memory_context:
+            sections.append(f"用户长期记忆:\n{user_memory_context}")
+        if base_memory_context:
+            sections.append(f"基础共享记忆:\n{base_memory_context}")
+        return "\n\n".join(sections)
+
+    @staticmethod
     def _merge_context(memory_context, sliding_window_context: str) -> str:
         """合并检索记忆与滑动窗口上下文。"""
         sections = []
@@ -1385,12 +1860,11 @@ class ConversationManager:
         if self._sleep_mode or self._script_mode:
             return False
 
-        normalized_text = self._normalize_text(user_text)
-        for trigger in self._script_triggers:
-            if trigger and trigger in normalized_text:
-                logger.info(f"命中脚本触发词: {trigger}")
-                self._enter_script_mode()
-                return True
+        script_config = self._match_script_trigger(user_text)
+        if script_config is not None:
+            logger.info(f"命中脚本触发词: {script_config.get('name')}")
+            self._enter_script_mode(script_config)
+            return True
         return False
 
     def _print_stage_timing(self, stage: str, elapsed: float) -> None:
@@ -1435,17 +1909,12 @@ class ConversationManager:
             print(f"🤖 {self._msg('机器人', 'Assistant')}: {farewell}")
             logger.info(self._msg("检测到“再见”，机器人主动告别", "Sleep word detected, assistant says goodbye"))
             if self.tts_enabled and self.tts is not None:
-                if self.audio_recorder:
-                    self.audio_recorder.is_tts_playing = True
-                try:
-                    self.tts.synthesize(farewell, play_audio=True)
-                finally:
-                    if self.audio_recorder:
-                        self.audio_recorder.is_tts_playing = False
+                self._play_tts_notice(farewell)
 
             self._clear_sliding_window(self._active_user)
             self._response_enabled = False
             self._pending_greeting_deadline = None
+            self._cancel_no_face_response_timeout()
             logger.info(self._msg("检测到“再见”，退出响应模式", "Sleep word detected, exit response mode"))
             print(self._msg("🛑 已退出响应模式（后续语音将忽略，说“你好”可重新唤醒）", "🛑 Response mode disabled (later speech will be ignored, say 'hello' to wake again)"))
             return False
@@ -1460,22 +1929,83 @@ class ConversationManager:
         if current_user != self._active_user or not self._active_user_initialized:
             self._switch_user_if_needed(current_user)
 
+        self._set_robot_status("thinking")
+
+        can_write_long_term = (
+            self._active_user_has_long_term_memory
+            and self.memory is not None
+            and self._active_user != Config.FACE_UNKNOWN_USER
+        )
+
         # 2. 异步存储用户输入到记忆 (不阻塞后续流程)
-        if self._active_user_has_long_term_memory and self.memory is not None:
+        if can_write_long_term:
             logger.debug("开始存储用户输入到记忆")
             self.memory.add_memory(f"用户说: {user_text}", async_mode=True)
         else:
-            logger.debug("当前对象无长期记忆，跳过用户输入写入")
+            if self._active_user == Config.FACE_UNKNOWN_USER:
+                logger.debug("当前对象为guest，跳过用户输入长期记忆写入")
+            else:
+                logger.debug("当前对象无长期记忆，跳过用户输入写入")
 
         # 3. 从记忆中检索相关上下文
         logger.debug("开始检索记忆")
         memory_start = time.perf_counter()
-        memory_context = ""
-        if self._active_user_has_long_term_memory and self.memory is not None:
+        user_memory_context = ""
+        base_memory_context = ""
+        has_user_memory = self._active_user_has_long_term_memory and self.memory is not None
+        has_base_memory = self.base_memory is not None
+
+        if has_user_memory or has_base_memory:
             print(self._msg("🔍 正在检索相关记忆...", "🔍 Retrieving relevant memory..."))
-            memory_context = self.memory.search_memory(user_text)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {}
+                if has_user_memory:
+                    futures["user"] = executor.submit(
+                        self.memory.search_memory,
+                        user_text,
+                        Config.MEMORY_SEARCH_LIMIT,
+                        Config.MEMORY_SEARCH_MIN_SCORE,
+                        Config.MEMORY_SEARCH_MAX_DISTANCE,
+                    )
+                if has_base_memory:
+                    futures["base"] = executor.submit(
+                        self.base_memory.search_memory,
+                        user_text,
+                        Config.MEMORY_SEARCH_LIMIT,
+                        Config.MEMORY_SEARCH_MIN_SCORE,
+                        Config.MEMORY_SEARCH_MAX_DISTANCE,
+                    )
+
+                for name, future in futures.items():
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        logger.warning(f"{name}记忆检索失败: {e}")
+                        result = ""
+                    if name == "user":
+                        user_memory_context = result or ""
+                    else:
+                        base_memory_context = result or ""
         else:
             print(self._msg("🧠 当前仅使用短期记忆（滑动窗口）...", "🧠 Using short-term memory only (sliding window)..."))
+
+        memory_context = self._merge_memory_context(user_memory_context, base_memory_context)
+        if has_user_memory:
+            if user_memory_context:
+                logger.debug(f"用户长期记忆命中:\n{user_memory_context}")
+            else:
+                logger.debug("用户长期记忆命中为空")
+        else:
+            logger.debug("用户长期记忆检索未启用")
+
+        if has_base_memory:
+            if base_memory_context:
+                logger.debug(f"基础共享记忆命中:\n{base_memory_context}")
+            else:
+                logger.debug("基础共享记忆命中为空")
+        else:
+            logger.debug("基础共享记忆检索未启用")
 
         sliding_window_context = self._build_sliding_window_context(self._active_user)
         context = self._merge_context(memory_context, sliding_window_context)
@@ -1603,6 +2133,7 @@ class ConversationManager:
                     self.audio_recorder.is_tts_playing = True
 
                 tts_start = time.perf_counter()
+                self._set_robot_status("speaking")
                 try:
                     self.tts.synthesize(_stream_with_capture(), play_audio=True)
                     tts_elapsed = time.perf_counter() - tts_start
@@ -1612,6 +2143,7 @@ class ConversationManager:
                     if self.audio_recorder:
                         logger.debug("设置 is_tts_playing = False")
                         self.audio_recorder.is_tts_playing = False
+                    self._restore_idle_robot_status()
                     logger.debug("流式TTS播放流程已结束")
             else:
                 for _ in _stream_with_capture():
@@ -1639,6 +2171,8 @@ class ConversationManager:
         else:
             response = raw_response
 
+        self._publish_ros2_assistant_text(response)
+
         if not self.streaming:
             print(f"🤖 {self._msg('机器人', 'Assistant')}: {response}")
         if expression_name:
@@ -1650,11 +2184,14 @@ class ConversationManager:
             self.expression.set_expression(expression_name)
 
         # 5. 异步存储机器人回复到记忆 (不阻塞后续流程)
-        if self._active_user_has_long_term_memory and self.memory is not None:
+        if can_write_long_term:
             logger.debug("开始存储机器人回复到记忆")
             self.memory.add_memory(f"机器人回复: {response}", async_mode=True)
         else:
-            logger.debug("当前对象无长期记忆，跳过机器人回复写入")
+            if self._active_user == Config.FACE_UNKNOWN_USER:
+                logger.debug("当前对象为guest，跳过机器人回复长期记忆写入")
+            else:
+                logger.debug("当前对象无长期记忆，跳过机器人回复写入")
 
         # 5.1 更新滑动窗口
         self._append_dialogue_round(self._active_user, user_text, response)
@@ -1687,6 +2224,7 @@ class ConversationManager:
                 logger.debug("设置 is_tts_playing = True")
                 self.audio_recorder.is_tts_playing = True
             tts_start = time.perf_counter()
+            self._set_robot_status("speaking")
             try:
                 logger.debug("开始调用 tts.synthesize()")
                 self.tts.synthesize(response, play_audio=True)
@@ -1698,6 +2236,7 @@ class ConversationManager:
                 if self.audio_recorder:
                     logger.debug("设置 is_tts_playing = False")
                     self.audio_recorder.is_tts_playing = False
+                self._restore_idle_robot_status()
                 logger.debug("TTS播放流程已结束")
 
             if self.tts._interrupted.is_set():
@@ -1713,6 +2252,8 @@ class ConversationManager:
             logger.debug("重置表情为默认")
             self.expression.reset_expression()
 
+        self._mark_waiting_for_user_response()
+        self._restore_idle_robot_status()
         print("\n" + "-"*50)
         if self.audio_recorder and self.audio_recorder.listen_mode == "continuous":
             print(self._msg("✅ 对话完成，请继续说话", "✅ Done. Please continue speaking"))
@@ -1764,7 +2305,14 @@ class ConversationManager:
                 logger.debug("ASR识别为空")
                 return
             
+            self._mark_asr_activity()
             print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
+            self._set_heard_text(user_text)
+            if self.ros2_bridge is not None:
+                try:
+                    self.ros2_bridge.publish_asr_text(user_text)
+                except Exception as e:
+                    logger.debug(f"发布 ASR 文本到 ROS2 失败: {e}")
 
             if self._handle_visualizer_toggle_voice_command(user_text):
                 return
@@ -1788,9 +2336,11 @@ class ConversationManager:
             self._process_user_text(user_text)
             
         except Exception as e:
+            self._restore_idle_robot_status()
             logger.error(f"对话处理出错: {e}", exc_info=True)
             print(f"❌ 处理出错: {e}")
         finally:
+            self._clear_heard_text()
             # 通知录音器处理完成，可以采集下一段语音
             logger.debug("准备通知录音器处理完成")
             if self.audio_recorder:
@@ -1829,6 +2379,7 @@ class ConversationManager:
 
             self._process_user_text(user_text)
         except Exception as e:
+            self._restore_idle_robot_status()
             logger.error(f"文本对话处理出错: {e}", exc_info=True)
             print(f"❌ 处理出错: {e}")
     
@@ -1849,6 +2400,7 @@ class ConversationManager:
     def shutdown(self, timeout: float = 5.0):
         """等待后台音频处理线程退出。"""
         logger.info("正在关闭对话管理器...")
+        self._cancel_no_face_response_timeout()
         with self._worker_lock:
             threads = list(self._worker_threads)
             self._worker_threads = []
