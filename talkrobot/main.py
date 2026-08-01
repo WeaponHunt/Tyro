@@ -14,11 +14,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict, Tuple
+import numpy as np
 from loguru import logger
 
 from talkrobot.config import Config
-from talkrobot.modules.memory.memory_module import MemoryModule
-from talkrobot.core.persona_manager import PersonaManager
 
 # 全局变量：表情服务器子进程
 _expression_server_process = None
@@ -186,7 +185,7 @@ class UserMemoryRouter:
     """按用户动态提供记忆模块；无持久记忆时仅启用滑动窗口短期记忆。"""
 
     def __init__(self):
-        self._cache: Dict[str, Tuple[Optional[MemoryModule], bool]] = {}
+        self._cache: Dict[str, Tuple[Optional[object], bool]] = {}
 
     @staticmethod
     def _is_known_face_user(user: str) -> bool:
@@ -213,7 +212,7 @@ class UserMemoryRouter:
             logger.warning(f"读取人脸图库失败，无法判断是否为已登记用户: {e}")
         return False
 
-    def get_memory_for_user(self, user: str) -> Tuple[Optional[MemoryModule], bool]:
+    def get_memory_for_user(self, user: str) -> Tuple[Optional[object], bool]:
         user = (user or Config.DEFAULT_USER).strip()
         if user in self._cache:
             return self._cache[user]
@@ -228,6 +227,8 @@ class UserMemoryRouter:
             logger.info(f"用户[{user}]不存在长期记忆，使用短期记忆模式")
             self._cache[user] = (None, False)
             return self._cache[user]
+
+        from talkrobot.modules.memory.memory_module import MemoryModule
 
         module = MemoryModule(
             config=Config.get_memory_config(user),
@@ -287,6 +288,112 @@ def _stop_expression_server():
     _expression_server_process = None
 
 
+class DuplexVoiceRuntime:
+    """运行 duplex 语音循环，并在 TTS 播放期间捕获语音打断。"""
+
+    def __init__(self, audio_io, turn_detector, tts_module, turn_config, interruption_config):
+        self.audio_io = audio_io
+        self.turn_detector = turn_detector
+        self.tts = tts_module
+        self.turn_config = turn_config
+        self.interruption_config = interruption_config
+        self._pending_turn = None
+        self._pending_lock = threading.Lock()
+
+    def start(self) -> None:
+        self.audio_io.start()
+
+    def close(self) -> None:
+        self.audio_io.close()
+
+    def pop_pending_turn(self):
+        with self._pending_lock:
+            pending = self._pending_turn
+            self._pending_turn = None
+        return pending
+
+    def _set_pending_turn(self, turn) -> None:
+        with self._pending_lock:
+            self._pending_turn = turn
+
+    def play_text(self, text: str) -> None:
+        """Synthesize text, play through AEC far-end stream, and listen for interruption."""
+        if not text:
+            return
+
+        from talkrobot.core.duplex_turn_detector import InterruptionGate, TurnState
+
+        audio_chunks = self.tts.synthesize(text, play_audio=False)
+        if not audio_chunks:
+            return
+
+        self.audio_io.start_playback(audio_chunks, self.tts.sample_rate, discard_input=False)
+        interrupted = False
+        started_at = time.perf_counter()
+        interruption_gate = InterruptionGate(self.interruption_config, self.turn_config)
+
+        while self.audio_io.is_playing():
+            interrupted_flag = getattr(self.tts, "_interrupted", None)
+            if interrupted_flag is not None and interrupted_flag.is_set():
+                self.audio_io.stop_playback(drain_input=True)
+                return
+
+            chunk = self.audio_io.get_mic_chunk(timeout=0.05)
+            if chunk is None:
+                continue
+
+            confirmed_chunks = interruption_gate.process_chunk(chunk)
+            if confirmed_chunks is None:
+                continue
+
+            interrupted = True
+            self.audio_io.stop_playback(drain_input=False)
+            print("🎙️ 检测到用户语音打断，已停止当前播报")
+            turn = self.turn_detector.process_audio_chunks(confirmed_chunks, finalize_at_end=False)
+            if turn is not None:
+                self._set_pending_turn(turn)
+                return
+            break
+
+        if not interrupted:
+            self.audio_io.wait_for_playback(drain_input=True)
+            return
+
+        while time.perf_counter() - started_at < self.interruption_config.max_interruption_seconds:
+            chunk = self.audio_io.get_mic_chunk(timeout=0.1)
+            if chunk is None:
+                continue
+
+            turn = self.turn_detector.process_audio_chunks([chunk], finalize_at_end=False)
+            if turn is not None:
+                self._set_pending_turn(turn)
+                return
+
+            if self.turn_detector.state == TurnState.IDLE:
+                logger.info("duplex 语音打断被判定为误触发，已忽略")
+                return
+
+        logger.info("duplex 语音打断等待完整用户 turn 超时，已重置状态")
+        self.turn_detector.reset_turn()
+
+    def run_forever(self, conversation_manager) -> None:
+        print("\n🎧 duplex 模式已启动：AEC + VAD/EOT 结束判断 + 语音打断")
+        while True:
+            turn = self.pop_pending_turn()
+            while turn is None:
+                chunk = self.audio_io.get_mic_chunk(timeout=0.1)
+                if chunk is None:
+                    continue
+                turn = self.turn_detector.process_audio_chunks([chunk], finalize_at_end=False)
+
+            if turn.user_text:
+                logger.info(
+                    f"duplex turn complete: reason={turn.finish_reason}, "
+                    f"eot={turn.eot_probability:.3f}, text={turn.user_text}"
+                )
+                conversation_manager.process_recognized_text(turn.user_text)
+
+
 def _setup_logger():
     """配置日志"""
     level = "DEBUG" if Config.DEBUG else "INFO"
@@ -304,6 +411,8 @@ def run_chat(args):
     from talkrobot.modules.tts.tts_module import TTSModule
     from talkrobot.modules.llm.llm_module import LLMModule
     from talkrobot.modules.llm.persona_update_agent import PersonaUpdateAgent
+    from talkrobot.modules.memory.memory_module import MemoryModule
+    from talkrobot.core.persona_manager import PersonaManager
     from talkrobot.core.conversation_manager import ConversationManager
 
     user = args.user
@@ -315,6 +424,7 @@ def run_chat(args):
     face_resolver = None
     tts_module = None
     audio_recorder = None
+    duplex_runtime = None
     ros2_bridge = None
     video_recorder = None
     conversation_manager = None
@@ -514,9 +624,14 @@ def run_chat(args):
 
         if no_asr_mode and listen_mode != Config.DEFAULT_LISTEN_MODE:
             logger.warning("no-asr 模式下 listen-mode 参数无效，将使用终端文本输入")
+        if no_asr_mode and listen_mode == "duplex":
+            raise ValueError("duplex 模式依赖 ASR，不能与 --no-asr 同时使用")
+        if listen_mode == "duplex" and getattr(args, "streaming", False):
+            logger.warning("duplex 模式需要完整 TTS 音频作为 AEC far-end，已自动关闭 streaming")
+            args.streaming = False
 
         # 3. 创建音频录制器（no-asr 模式下跳过）
-        if not no_asr_mode:
+        if not no_asr_mode and listen_mode != "duplex":
             from talkrobot.core.audio_recorder import AudioRecorder
             audio_recorder = AudioRecorder(
                 sample_rate=Config.SAMPLE_RATE,
@@ -535,6 +650,58 @@ def run_chat(args):
             )
         else:
             audio_recorder = None
+
+        tts_playback_handler = None
+        if listen_mode == "duplex":
+            from talkrobot.core.duplex_audio_io import DuplexAudioIO
+            from talkrobot.core.duplex_turn_detector import (
+                DuplexTurnConfig,
+                DuplexTurnDetector,
+                InterruptionConfig,
+            )
+            from talkrobot.modules.eot.eot_module import EOTModule
+
+            turn_config = DuplexTurnConfig(
+                sample_rate=Config.SAMPLE_RATE,
+                vad_mode=Config.DUPLEX_WEBRTC_VAD_MODE,
+                vad_activation_threshold=Config.DUPLEX_VAD_ACTIVATION_THRESHOLD,
+                short_silence_seconds=Config.DUPLEX_SHORT_SILENCE_SECONDS,
+                extra_wait_seconds=Config.DUPLEX_EXTRA_WAIT_SECONDS,
+                pre_speech_padding_seconds=Config.DUPLEX_PRE_SPEECH_PADDING_SECONDS,
+                min_segment_seconds=Config.DUPLEX_MIN_SEGMENT_SECONDS,
+                verbose=Config.DEBUG,
+            )
+            interruption_config = InterruptionConfig(
+                vad_activation_threshold=Config.DUPLEX_INTERRUPT_VAD_THRESHOLD,
+                min_speech_seconds=Config.DUPLEX_INTERRUPT_MIN_SPEECH_SECONDS,
+                max_interruption_seconds=Config.DUPLEX_INTERRUPT_MAX_SECONDS,
+            )
+            duplex_audio_io = DuplexAudioIO(
+                sample_rate=Config.SAMPLE_RATE,
+                frame_ms=Config.DUPLEX_AEC_FRAME_MS,
+                stream_delay_ms=Config.DUPLEX_AEC_STREAM_DELAY_MS,
+                latency=Config.DUPLEX_AEC_LATENCY,
+                high_pass_filter=Config.DUPLEX_AEC_HIGH_PASS_FILTER,
+                noise_suppression=Config.DUPLEX_AEC_NOISE_SUPPRESSION,
+                auto_gain_control=Config.DUPLEX_AEC_AUTO_GAIN_CONTROL,
+            )
+            eot_module = EOTModule(
+                repo_id=Config.EOT_REPO_ID,
+                model_file=Config.EOT_MODEL_FILE,
+                tokenizer_name=Config.EOT_TOKENIZER,
+                threshold=Config.EOT_THRESHOLD,
+                max_length=Config.EOT_MAX_LENGTH,
+                allow_download=False,
+            )
+            duplex_turn_detector = DuplexTurnDetector(turn_config, asr_module, eot_module)
+            duplex_runtime = DuplexVoiceRuntime(
+                audio_io=duplex_audio_io,
+                turn_detector=duplex_turn_detector,
+                tts_module=tts_module,
+                turn_config=turn_config,
+                interruption_config=interruption_config,
+            )
+            tts_playback_handler = duplex_runtime.play_text
 
         ros2_voice_enabled = bool(getattr(args, "ros2_voice", Config.ROS2_VOICE_BRIDGE_ENABLED))
         if ros2_voice_enabled:
@@ -617,6 +784,7 @@ def run_chat(args):
             script_image_force_window_size=Config.SCRIPT_IMAGE_FORCE_WINDOW_SIZE,
             script_image_force_resize_image=Config.SCRIPT_IMAGE_FORCE_RESIZE_IMAGE,
             no_face_response_timeout_seconds=Config.FACE_NO_RESPONSE_TIMEOUT_SECONDS,
+            tts_playback_handler=tts_playback_handler,
             ros2_bridge=ros2_bridge,
         )
         if ros2_bridge is not None:
@@ -679,9 +847,13 @@ def run_chat(args):
 
                 conversation_manager.process_text(user_text)
         else:
-            audio_recorder.start(
-                on_audio_complete=conversation_manager.process_audio_async
-            )
+            if duplex_runtime is not None:
+                duplex_runtime.start()
+                duplex_runtime.run_forever(conversation_manager)
+            else:
+                audio_recorder.start(
+                    on_audio_complete=conversation_manager.process_audio_async
+                )
 
     except KeyboardInterrupt:
         if 'language' in locals() and language == "en":
@@ -729,6 +901,12 @@ def run_chat(args):
             except Exception as e:
                 logger.warning(f"停止录音器异常: {e}")
 
+        if duplex_runtime is not None:
+            try:
+                duplex_runtime.close()
+            except Exception as e:
+                logger.warning(f"停止 duplex 音频流异常: {e}")
+
         if video_recorder is not None:
             try:
                 video_recorder.stop()
@@ -770,6 +948,7 @@ def run_chat(args):
 def run_add_memory(args):
     """手动添加记忆"""
     _setup_logger()
+    from talkrobot.modules.memory.memory_module import MemoryModule
 
     user = (args.user or Config.DEFAULT_USER).strip()
     content = args.content
@@ -830,6 +1009,7 @@ def run_add_memory(args):
 def run_add_base_memory(args):
     """手动添加基础共享记忆（仅手动录入）。"""
     _setup_logger()
+    from talkrobot.modules.memory.memory_module import MemoryModule
 
     def _split_base_memory_sentences(text: str) -> list:
         """按句子切分基础共享记忆，避免整段长文只存成一条。"""
@@ -880,6 +1060,7 @@ def run_add_base_memory(args):
 def run_query_memory(args):
     """手动检索记忆（只读，不写入），用于快速验证记忆是否已存储。"""
     _setup_logger()
+    from talkrobot.modules.memory.memory_module import MemoryModule
 
     user = (args.user or Config.DEFAULT_USER).strip()
     query = args.query
@@ -1045,6 +1226,46 @@ def run_vad_debug(args):
     recorder.start(on_audio_complete=on_audio_complete)
 
 
+def run_setup_duplex(args):
+    """下载并检查 duplex 模式所需资源。"""
+    _setup_logger()
+    os.environ.pop("HF_HUB_OFFLINE", None)
+
+    from talkrobot.modules.eot.eot_module import EOTModule, download_eot_resources
+    from talkrobot.core.duplex_turn_detector import WebRTCSpeechVAD
+
+    print("🔧 正在准备 duplex 语音模式环境...")
+    download_eot_resources(
+        repo_id=args.eot_repo_id,
+        model_file=args.eot_model_file,
+        tokenizer_name=args.eot_tokenizer,
+    )
+
+    detector = EOTModule(
+        repo_id=args.eot_repo_id,
+        model_file=args.eot_model_file,
+        tokenizer_name=args.eot_tokenizer,
+        threshold=args.eot_threshold,
+        max_length=args.eot_max_length,
+        allow_download=True,
+    )
+    prediction = detector.predict(args.eot_test_text)
+    print(
+        f"✅ EOT smoke test: p={prediction.probability:.6f}, "
+        f"is_end={prediction.is_end}, text={args.eot_test_text}"
+    )
+
+    vad = WebRTCSpeechVAD(sample_rate=Config.SAMPLE_RATE, mode=Config.DUPLEX_WEBRTC_VAD_MODE)
+    silence_probability = vad(np.zeros(vad.window_size_samples, dtype=np.float32))
+    print(f"✅ WebRTC VAD smoke test: silence_probability={silence_probability:.6f}")
+
+    from livekit.rtc.apm import AudioProcessingModule
+
+    _ = AudioProcessingModule(echo_cancellation=True)
+    print("✅ LiveKit WebRTC APM smoke test: echo_cancellation module created")
+    print("✅ duplex 环境准备完成")
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="TalkRobot - 智能对话机器人")
@@ -1071,9 +1292,9 @@ def main():
         help=f"统一语言开关：TTS与LLM同时生效 (默认: {Config.LANGUAGE})"
     )
     chat_parser.add_argument(
-        "--listen-mode", type=str, choices=["push", "continuous", "intercom"],
+        "--listen-mode", type=str, choices=["push", "continuous", "intercom", "duplex"],
         default=Config.DEFAULT_LISTEN_MODE,
-        help="监听模式: push=按住Q键说话, continuous=持续监听, intercom=对讲机PTT触发 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
+        help="监听模式: push=按住Q键说话, continuous=持续监听, intercom=对讲机PTT触发, duplex=AEC+EOT+语音打断 (默认: {})".format(Config.DEFAULT_LISTEN_MODE)
     )
     chat_parser.add_argument(
         "--no-asr", action="store_true", default=False,
@@ -1197,6 +1418,14 @@ def main():
     vad_parser.add_argument("--vad-silence-duration", type=float, default=Config.VAD_SILENCE_DURATION, help=f"静默结束阈值秒 (默认: {Config.VAD_SILENCE_DURATION})")
     vad_parser.add_argument("--vad-min-speech-duration", type=float, default=Config.VAD_MIN_SPEECH_DURATION, help=f"最短语音秒 (默认: {Config.VAD_MIN_SPEECH_DURATION})")
 
+    setup_duplex_parser = subparsers.add_parser("setup-duplex", help="下载并检查 duplex 模式所需 EOT/VAD/AEC 资源")
+    setup_duplex_parser.add_argument("--eot-repo-id", default=Config.EOT_REPO_ID)
+    setup_duplex_parser.add_argument("--eot-model-file", default=Config.EOT_MODEL_FILE)
+    setup_duplex_parser.add_argument("--eot-tokenizer", default=Config.EOT_TOKENIZER)
+    setup_duplex_parser.add_argument("--eot-threshold", type=float, default=Config.EOT_THRESHOLD)
+    setup_duplex_parser.add_argument("--eot-max-length", type=int, default=Config.EOT_MAX_LENGTH)
+    setup_duplex_parser.add_argument("--eot-test-text", default="好的，那我们明天再聊")
+
     # 兼容旧版: python -m talkrobot.main --user xxx
     parser.add_argument(
         "--user", type=str, default=None,
@@ -1217,9 +1446,9 @@ def main():
         help="(兼容旧版) 统一语言开关：TTS与LLM同时生效"
     )
     parser.add_argument(
-        "--listen-mode", type=str, choices=["push", "continuous", "intercom"],
+        "--listen-mode", type=str, choices=["push", "continuous", "intercom", "duplex"],
         default=None,
-        help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听, intercom=对讲机PTT触发"
+        help="(兼容旧版) 监听模式: push=按住Q键, continuous=持续监听, intercom=对讲机PTT触发, duplex=AEC+EOT+语音打断"
     )
     parser.add_argument(
         "--no-asr", action="store_true", default=False,
@@ -1300,6 +1529,8 @@ def main():
         run_query_memory(args)
     elif args.command == "vad-debug":
         run_vad_debug(args)
+    elif args.command == "setup-duplex":
+        run_setup_duplex(args)
     elif args.command == "chat":
         run_chat(args)
     else:

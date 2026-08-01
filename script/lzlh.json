@@ -1,0 +1,90 @@
+{
+  "name": "两只老虎",
+  "audio": "lzlh/lzlh.mp3",
+  "steps": [
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "image": "lzlh/01.png",
+      "delay": 0
+    },                       
+    {
+      "text": " ",
+      "gesture": "surprise",
+      "image": "lzlh/01.png",
+      "delay": 3
+    },
+    {
+      "text": " ",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",
+      "image": "lzlh/01.png",
+      "delay": 10
+    },
+    {
+      "text": " ",
+      "expression": "surprise",
+      "gesture": "wave_right_hand()",
+      "image": "lzlh/01.png",
+      "delay": 3
+    },
+    {
+      "text": " ",
+      "expression": "neutral",
+      "gesture": "head_nod()",
+      "head_control_deg": {"x": 20, "y": 0},
+      "image": "lzlh/01.png",
+      "delay": 19
+    }
+  ]
+}

@@ -3,7 +3,6 @@ import time
 import threading
 import os
 import numpy as np
-from collections import deque
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -54,8 +53,6 @@ DEFAULT_EXPRESSION = os.getenv("EXPRESSION_DEFAULT", "neutral")
 #current_video = expressions[DEFAULT_EXPRESSION]
 current_expression = DEFAULT_EXPRESSION
 recording_overlay = False
-mouth_overlay_enabled = False
-mouth_overlay_started_at = 0.0
 status_overlay_text = ""
 status_overlay_visible = True
 heard_overlay_text = ""
@@ -64,7 +61,6 @@ status_font = None
 
 # 线程同步，通知播放线程切换视频
 stop_event = threading.Event()
-expression_queue = deque()
 state_lock = threading.Lock()
 
 # 实例化 FastAPI 应用
@@ -98,29 +94,38 @@ async def change_gazemode(if_gaze:str):
 @app.post("/expression/{expression}")
 async def change_expression(expression: str):
     """
-    将表情加入播放队列
+    设置指定表情
     """
-    global expression_queue, stop_event
+    #global current_video, stop_event
+    global current_expression, stop_event
 
     if expression not in expressions and expression not in UPLOADED_EXPRESSIONS:
         return JSONResponse(
             status_code=404, content={"message": f"Expression '{expression}' not found"}
         )
 
-    expression_queue.append(expression)
-    stop_event.set()
-    return {"message": f"Enqueued '{expression}' expression", "queue_length": len(expression_queue)}
+    # if current_video != expressions[expression]:
+    #     current_video = expressions[expression]
+    #     stop_event.set()  # 通知播放线程立即切换
+    #     return {"message": f"Switching to '{expression}' expression"}
+    if current_expression != expression:
+        current_expression = expression
+        stop_event.set()  # 通知播放线程立即切换
+        return {"message": f"Switching to '{expression}' expression"}
+    else:
+        return {"message": f"Expression '{expression}' is already playing"}
 
 
 @app.post("/reset")
 async def reset_expression():
     """
-    清空队列并重置为默认表情
+    重置为默认表情
     """
-    global current_expression, expression_queue, stop_event
-    expression_queue.clear()
+    #global current_video, stop_event
+    global current_expression,stop_event
+    #current_video = expressions[DEFAULT_EXPRESSION]
     current_expression = DEFAULT_EXPRESSION
-    stop_event.set()
+    stop_event.set()  # 通知播放线程切换到默认视频
     return {"message": f"Reset to default expression '{DEFAULT_EXPRESSION}'"}
 
 
@@ -134,20 +139,6 @@ async def set_recording_overlay(recording: str):
     with state_lock:
         recording_overlay = value
     return {"recording": recording_overlay}
-
-
-@app.post("/mouth/{speaking}")
-async def set_mouth_overlay(speaking: str):
-    """
-    设置说话嘴部动画叠加层，不切换表情视频。
-    """
-    global mouth_overlay_enabled, mouth_overlay_started_at
-    value = str(speaking).strip().lower() in {"1", "true", "yes", "on"}
-    with state_lock:
-        if value and not mouth_overlay_enabled:
-            mouth_overlay_started_at = time.monotonic()
-        mouth_overlay_enabled = value
-    return {"speaking": mouth_overlay_enabled}
 
 
 @app.post("/status")
@@ -178,118 +169,6 @@ async def set_heard_overlay(payload: dict = Body(default=None)):
         heard_overlay_text = text
         heard_overlay_visible = bool(visible) and bool(text)
     return {"text": heard_overlay_text, "visible": heard_overlay_visible}
-
-
-def _get_env_float(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
-    try:
-        value = float(os.getenv(name, default))
-    except (TypeError, ValueError):
-        value = float(default)
-    if minimum is not None:
-        value = max(minimum, value)
-    if maximum is not None:
-        value = min(maximum, value)
-    return value
-
-
-def _get_env_color(name: str, default):
-    raw = str(os.getenv(name, "") or "").strip()
-    if not raw:
-        return default
-    try:
-        parts = [int(part.strip()) for part in raw.split(",")]
-    except Exception:
-        return default
-    if len(parts) != 3:
-        return default
-    r, g, b = [max(0, min(255, value)) for value in parts]
-    return (b, g, r)
-
-
-def draw_mouth_overlay(frame):
-    """
-    在当前表情帧下半部叠加简单嘴部开合动画。
-
-    可调环境变量：
-    EXPRESSION_MOUTH_X_RATIO / Y_RATIO: 嘴巴中心位置比例
-    EXPRESSION_MOUTH_WIDTH_RATIO: 嘴巴宽度占画面宽度比例
-    EXPRESSION_MOUTH_CLOSED_HEIGHT_RATIO: 闭合时高度占画面高度比例
-    EXPRESSION_MOUTH_OPEN_HEIGHT_RATIO: 张开时额外高度占画面高度比例
-    EXPRESSION_MOUTH_SPEED: 开合速度
-    EXPRESSION_MOUTH_COLOR: RGB, 例如 35,10,65
-    EXPRESSION_MOUTH_LIP_COLOR: RGB, 例如 95,35,120
-    """
-    with state_lock:
-        enabled = mouth_overlay_enabled
-        started_at = mouth_overlay_started_at
-    if not enabled:
-        return frame
-
-    height, width = frame.shape[:2]
-    x_ratio = _get_env_float("EXPRESSION_MOUTH_X_RATIO", 0.5, 0.0, 1.0)
-    y_ratio = _get_env_float("EXPRESSION_MOUTH_Y_RATIO", 0.76, 0.0, 1.0)
-    width_ratio = _get_env_float("EXPRESSION_MOUTH_WIDTH_RATIO", 0.15, 0.02, 0.6)
-    closed_height_ratio = _get_env_float("EXPRESSION_MOUTH_CLOSED_HEIGHT_RATIO", 0.014, 0.002, 0.2)
-    open_height_ratio = _get_env_float("EXPRESSION_MOUTH_OPEN_HEIGHT_RATIO", 0.055, 0.0, 0.3)
-    speed = _get_env_float("EXPRESSION_MOUTH_SPEED", 7.5, 1.0, 20.0)
-
-    elapsed = max(0.0, time.monotonic() - started_at)
-    pulse = 0.5 + 0.5 * np.sin(elapsed * speed * np.pi)
-    pulse = 0.25 + 0.75 * pulse
-
-    center = (int(width * x_ratio), int(height * y_ratio))
-    mouth_w = max(10, int(width * width_ratio))
-    mouth_h = max(3, int(height * (closed_height_ratio + open_height_ratio * pulse)))
-    thickness = max(2, int(min(width, height) * 0.006))
-    shadow_offset = max(1, int(mouth_h * 0.18))
-
-    mouth_color = _get_env_color("EXPRESSION_MOUTH_COLOR", (42, 8, 58))
-    lip_color = _get_env_color("EXPRESSION_MOUTH_LIP_COLOR", (92, 35, 116))
-
-    overlay = frame.copy()
-    cv2.ellipse(
-        overlay,
-        (center[0], center[1] + shadow_offset),
-        (mouth_w // 2, max(2, mouth_h // 2)),
-        0,
-        0,
-        360,
-        (0, 0, 0),
-        -1,
-        cv2.LINE_AA,
-    )
-    cv2.ellipse(
-        overlay,
-        center,
-        (mouth_w // 2, max(2, mouth_h // 2)),
-        0,
-        0,
-        360,
-        mouth_color,
-        -1,
-        cv2.LINE_AA,
-    )
-    cv2.ellipse(
-        overlay,
-        center,
-        (mouth_w // 2, max(2, mouth_h // 2)),
-        0,
-        0,
-        360,
-        lip_color,
-        thickness,
-        cv2.LINE_AA,
-    )
-    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
-    return frame
-
-
-def draw_frame_overlays(frame):
-    frame = draw_mouth_overlay(frame)
-    frame = draw_status_overlay(frame)
-    frame = draw_heard_overlay(frame)
-    frame = draw_recording_overlay(frame)
-    return frame
 
 
 def run_api_server():
@@ -531,20 +410,22 @@ def play_image(image_path: str):
     width = int(os.getenv("EXPRESSION_VIDEO_WIDTH", "1024"))
     height = int(os.getenv("EXPRESSION_VIDEO_HEIGHT", "600"))
     frame = cv2.resize(frame, (width, height))
+    frame = draw_status_overlay(frame)
+    frame = draw_heard_overlay(frame)
+    frame = draw_recording_overlay(frame)
 
     deadline = time.monotonic() + IMAGE_DISPLAY_SECONDS
     print(f"Displaying image: {image_path} ({IMAGE_DISPLAY_SECONDS}s)")
 
     while time.monotonic() < deadline and not stop_event.is_set():
-        cv2.imshow("Expression", draw_frame_overlays(frame.copy()))
+        cv2.imshow("Expression", frame)
         if cv2.waitKey(40) & 0xFF == ord("q"):
             break
 
 
-def play_video(video_path, loop=True):
+def play_video(video_path):
     """
-    根据传入的视频路径使用 cv2 播放视频。
-    loop=True 时循环播放；loop=False 时播放一遍后返回。
+    根据传入的视频路径使用 cv2 播放视频，可循环播放。
     当 stop_event 被置位，结束当前视频的播放，返回函数以便切换到新视频。
     """
     if video_path is None:
@@ -573,15 +454,15 @@ def play_video(video_path, loop=True):
             frame_delay = float(os.getenv("EXPRESSION_FRAME_DELAY", "0.04"))
             time.sleep(frame_delay)
             if not ret:
-                if loop:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                else:
-                    break
+                # 视频播放完毕后，从头开始重放
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
             width = int(os.getenv("EXPRESSION_VIDEO_WIDTH", "1024"))
             height = int(os.getenv("EXPRESSION_VIDEO_HEIGHT", "600"))
             frame = cv2.resize(frame, (width, height))
-            frame = draw_frame_overlays(frame)
+            frame = draw_status_overlay(frame)
+            frame = draw_heard_overlay(frame)
+            frame = draw_recording_overlay(frame)
             cv2.imshow("Expression", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -592,17 +473,14 @@ def play_video(video_path, loop=True):
 def play_video_continuously():
     """
     主线程循环，持续播放视频。
-    优先从 expression_queue 取表情，队列为空时循环播放当前表情。
-    当 stop_event 被置位，回到循环顶部取出队列中的下一个表情。
+    每次调用 play_video 完成后，检查是否收到切换请求（stop_event 被置位），
+    如果是则根据全局变量 current_video 播放新的视频。
     """
-    global current_expression, expression_queue, stop_event, expressions
+    #global current_video, stop_event
+    global current_expression, stop_event, expressions
 
     while True:
         stop_event.clear()
-        if expression_queue:
-            current_expression = expression_queue.popleft()
-            print(f"Dequeued expression: {current_expression} (remaining: {len(expression_queue)})")
-            stop_event.clear()
         path = _resolve_expression_path(current_expression)
         if path is None:
             print(f"Expression '{current_expression}' not found, resetting to default")
@@ -611,12 +489,10 @@ def play_video_continuously():
         if is_image_path(path):
             play_image(path)
         else:
-            play_video(path, loop=not bool(expression_queue))
-        if expression_queue:
-            print("Switching to next queued video...")
-            continue
+            play_video(path)
         if stop_event.is_set():
             print("Switching video...")
+            stop_event.clear()
 
 
 if __name__ == "__main__":

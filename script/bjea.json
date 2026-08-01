@@ -1,0 +1,211 @@
+{
+  "name": "demo",
+  "steps": [
+    {
+      "text": "大家好，我是小算算，今天由我为大家介绍北京亦庄实验中学。",
+      "expression": "happy",
+      "gesture": "greet()",
+      "image": "bjea/01.png",
+      "delay": 2
+    },
+    {
+      "text": "。北京亦庄实验中学坚持创新教育理念，紧跟时代步伐。它究竟有着怎样的师资、课程，风光？让我们一同揭开它的神秘面纱。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",
+      "image": "bjea/01.png",
+      "delay": 2
+    },    
+    {
+      "text": "本次介绍我将围绕北京亦庄实验中学的八个方面展开。分别是：学校概况，师资与课程，学校风光，国际交流，学校标识，吉祥物，以及愿景与使命。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",      
+      "image": "bjea/02.png",
+      "delay": 1
+    },    
+    {
+      "text": "北京亦庄实验中学由北京市十一学校与经开区联办，是公立完全中学，也是教育城乡一体化工程与改革实验校。",
+      "expression": "neutral",
+      "gesture": "arm_right_up(45)",
+      "head_control_deg": {"x": 18, "y": 0},
+      "image": "bjea/03.png",
+      "delay": 1
+    },
+    {
+      "text": "学校践行十一学校的教育理念和课程体系，实行选课走班、一制三化（导师制、小班化、个别化、 国际化）的育人模式。",
+      "expression": "neutral",
+      "gesture": "reset()",
+      "head_control_deg": {"x": 18, "y": 0},
+      "image": "bjea/03.png",
+      "delay": 1
+    },
+    {
+      "text": "学校坚持“创造适合每一位学生发展的教育”理念，扎根亦庄新城沃土，与时俱进、守正创新。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand(45)",
+      "image": "bjea/03.png",
+      "delay": 1
+    },    
+    {
+      "text": "自二零一六年招生以来，学校为亦庄经济技术开发区的基础教育开创了新局面，在落实素质教育理念的同时，中高考成绩屡创佳绩。",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",
+      "image": "bjea/03.png",
+      "delay": 1
+    },      
+    {
+      "text": "学校师资力量雄厚，倾力打造高品质教师队伍。目前共有一线教师二百四十二人，其中市级/区级骨干二十六人，省级骨干名师四人，特级教师一人，",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",      
+      "image": "bjea/04.png",
+      "delay": 1
+    },
+    {
+      "text": "博士教师二十八人，硕士教师绝大多数毕业于九八五高校，其中不乏清华、北大、北师大等名校的青年才俊。为学生成长提供坚实保障。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",      
+      "image": "bjea/04.png",      
+      "delay": 1
+    },
+    {
+      "text": "北京亦庄实验中学自二零一一年开始全面实施选课走班，逐步形成了一套分层、分类、综合、特需的课程体系，让每一位学生都可以选择适合自己的课程，生成个人的专属课表，以满足学生的个性发展。",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",          
+      "image": "bjea/05.png",       
+      "delay": 1
+    },
+    {
+      "text": "学校在分层、分类、综合、特需的基础上，形成了集基础、拓展和研究三级课程为主、三类特色课程为辅的学校课程体系。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",          
+      "image": "bjea/06.png",       
+      "delay": 1
+    },
+    {
+      "text": "特色课程是在主体课程之外，基于学校的校园文化、周边资源和教师的专业特色开设的，包括“研学”、“综合实践”、“科学+”三类特色课程群。为学生发展提供多元路径。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",           
+      "image": "bjea/06.png",       
+      "delay": 1
+    },      
+    {
+      "text": "北京亦庄实验中学创办的“南海子科创营”，打造科学教育品牌，推动资源共享。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",          
+      "image": "bjea/07.png",       
+      "delay": 1
+    },  
+    {
+      "text": "通过邀请国内著名科学家举行报告会、开展丰富多彩的科创项目体验、野外科学考察等活动，为区内青少年送上一场家门口的免费“科学教育盛宴”，教育部作为典型案例向全国推广；",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",           
+      "image": "bjea/07.png",       
+      "delay": 1
+    }, 
+    {
+      "text": "连续举办八届大型科技节，邀请航天、人工智能等领域青年才俊入校报告讲学；面向全校师生的职业生涯策划多场AI体验活动，以数智之光照亮学生未来发展之路。",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",           
+      "image": "bjea/07.png",       
+      "delay": 1
+    },
+    {
+      "text": "北京亦庄实验中学作为北京大学“博雅人才共育基地”，依托北大制定方案，发挥自身资源优势，成立“南海子·博雅科创班”。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",           
+      "image": "bjea/08.png",       
+      "delay": 1
+    },    
+    {
+      "text": "为经开学子提供一个全面、系统、高质量的教育平台，让有兴趣、有潜能、有目标的学生早发现、早受益、早成才，以实际行动走出拔尖创新人才培养的新路子。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",           
+      "image": "bjea/08.png",       
+      "delay": 1
+    },
+    {
+      "text": "接下来，让我们把目光投向学校的人文设计，学校的整体设计自由而温暖，注重建筑教育专业性的同时，为师生提供了充足的学习和交流空间。",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",            
+      "image": "bjea/09.png",       
+      "delay": 1
+    },
+    {
+      "text": "多功能体育馆、大剧场、排练厅、健身房、演播室、中央图书馆……学校的公共场馆一应俱全。校内大小庭院十余个，春夏秋冬、次第花开，四通八达的校园连廊，串起学生选课走班的脚步。",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",           
+      "image": "bjea/09.png",       
+      "delay": 1
+    },
+    {
+      "text": "北京亦庄实验中学中美合作高中课程（AP），秉承北京市十一学校国际部办学理念，旨在培育有“中国灵魂、世界眼光与多元文化理解能力”的优秀学生。",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",   
+      "head_control_deg": {"x": -12, "y": 0},         
+      "image": "bjea/10.png",       
+      "delay": 1
+    }, 
+    {
+      "text": "两校的中美合作项目在学制与课程设置、升学指导、管理模式等方面共通，实现资源最大化共享，为学生提供更优质国际教育。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",          
+      "image": "bjea/10.png",       
+      "delay": 1
+    },
+    {
+      "text": "学校标识颇具深意。方和圆构成的无限符号，体现学校以培养志向高远、诚信笃行、思想活跃、言行规范的杰出人才为宗旨。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",           
+      "image": "bjea/11.png",       
+      "delay": 1
+    },
+    {
+      "text": "“十”，“一”二字不仅是校名，又是象征正与负，阴与阳，多与少，加与减等对立统一的哲学概念的符号。六种颜色国旗红，秋实黄，太空蓝，春华绿，银鹰灰，大地黑，意喻十一学校秉持因材施教的教育思想寓意学校因材施教，尊重个性，建立多样培养模式，助学生成为自己。",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",           
+      "image": "bjea/11.png",       
+      "delay": 1
+    },
+    {
+      "text": "学校吉祥物以南海子皇家猎苑中的麋鹿为原型，融入《诗经》中“呦呦鹿鸣”宁静而深远的教育意境，寓意着知识的传递和智慧的启迪。它不仅是学校文化和教育理念象征，更会鼓励学生追求知识，培养品德，成为学生成长路上的精神伙伴。",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",          
+      "image": "bjea/12.png",       
+      "delay": 1
+    },
+    {
+      "text": "我们坚信：成长方式能够定义未来人生，今天丰富，多样，可选择的学校生活，将让您拥有应对不确定世界的优秀品格，核心素养，关键能力，笃定时代新人的责任，使命，价值观。",
+      "expression": "neutral",
+      "gesture": "wave_left_hand()",          
+      "image": "bjea/13.png",       
+      "delay": 1
+    },
+    {
+      "text": "感谢大家的专注聆听。希望通过我的分享，大家对北京亦庄实验中学有了更深入的了解。",
+      "expression": "neutral",
+      "gesture": "wave_right_hand()",            
+      "image": "bjea/14.png",       
+      "delay": 1
+    },
+    {
+      "text": "学校多元的课程、丰富的活动、优美的环境，都为学生成长提供了优质土壤。",
+      "expression": "happy",
+      "gesture": "wave_left_hand()",          
+      "image": "bjea/14.png",       
+      "delay": 1
+    },
+    {
+      "text": "愿我们共同期待学生们在这里绽放光彩。",
+      "expression": "happy",
+      "gesture": "wave_right_hand()",          
+      "image": "bjea/14.png",       
+      "delay": 1
+    },
+    {
+      "text": "",
+      "expression": "happy",
+      "gesture": "reset()",        
+      "image": "bjea/14.png",       
+      "delay": 1
+    }         
+  ]
+}

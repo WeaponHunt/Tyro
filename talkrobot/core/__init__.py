@@ -1,13 +1,19 @@
-"""
-TalkRobot 核心模块
-"""
+"""TalkRobot core modules."""
 
-from talkrobot.core.audio_recorder import AudioRecorder
-from talkrobot.core.conversation_manager import ConversationManager
-from talkrobot.core.video_recorder import VideoRecorder
+__all__ = ["AudioRecorder", "ConversationManager", "VideoRecorder"]
 
-__all__ = [
-    "AudioRecorder",
-    "ConversationManager",
-    "VideoRecorder",
-]
+
+def __getattr__(name):
+    if name == "AudioRecorder":
+        from talkrobot.core.audio_recorder import AudioRecorder
+
+        return AudioRecorder
+    if name == "ConversationManager":
+        from talkrobot.core.conversation_manager import ConversationManager
+
+        return ConversationManager
+    if name == "VideoRecorder":
+        from talkrobot.core.video_recorder import VideoRecorder
+
+        return VideoRecorder
+    raise AttributeError(name)

@@ -77,6 +77,10 @@ python -m talkrobot.main chat --language zh
 # 使用持续监听模式（无需按键，直接说话即可）
 python -m talkrobot.main --user ljc --listen-mode continuous
 
+# 使用 duplex 模式（AEC回声消除 + VAD/EOT结束判断 + 语音打断）
+python -m talkrobot.main setup-duplex
+python -m talkrobot.main chat --user ljc --listen-mode duplex
+
 # 使用按键模式（按住Q键说话，默认行为）
 python -m talkrobot.main --user ljc --listen-mode push
 
@@ -138,7 +142,9 @@ python -m talkrobot.tests.test_memory
 - `PERSONA_PROFILE_PATH`: 用户人格配置文件路径（默认 `talkrobot/persona_profiles.json`）
 - `GLOBAL_SYSTEM_PROMPT`: 全局提示词（会拼接在用户人格 prompt 后）
 - `ENABLE_PERSONA_AUTO_UPDATE`: 是否启用后台人格自动更新（默认开启）
-- `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous")
+- `DEFAULT_LISTEN_MODE`: 默认监听模式 ("push" / "continuous" / "intercom" / "duplex")
+- `DUPLEX_*`: duplex 模式参数，包括 WebRTC AEC、WebRTC VAD、EOT 结束判断和语音打断阈值
+- `EOT_*`: FireRedChat turn detector 模型、tokenizer 和阈值配置
 - `SLIDING_WINDOW_ROUNDS`: 滑动窗口历史轮数（0 表示关闭）
 - `VAD_CHECK_INTERVAL`: VAD 检测间隔（秒，默认 0.25）
 - `VAD_SILENCE_DURATION`: 静默多久判定说话结束（秒）
@@ -223,6 +229,16 @@ python -m talkrobot.main chat --disable-persona-auto-update
 7. 按 `Ctrl+C` 退出程序
 
 > **提示**: 持续监听模式使用 [Silero VAD](https://github.com/snakers4/silero-vad) 进行语音检测，相关参数可在 `config.py` 中调整。
+
+### Duplex 模式 (`--listen-mode duplex`)
+
+1. 首次使用先运行 `python -m talkrobot.main setup-duplex` 下载并检查 EOT/VAD/AEC 资源
+2. 使用同一个全双工音频流播放 TTS 和采集麦克风
+3. 麦克风输入先经过 WebRTC APM AEC 回声消除
+4. WebRTC VAD 检测语音段，ASR 转文字后由 FireRedChat EOT 判断用户是否说完
+5. 机器人播报期间继续监听 AEC 后的人声；确认用户说话后会停止当前 TTS，并把打断语音作为新一轮输入
+
+> duplex 模式需要完整 TTS 音频作为 AEC far-end 参考，因此会自动关闭 `--streaming`。
 
 ### 终端输入模式 (`--no-asr`)
 

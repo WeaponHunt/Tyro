@@ -60,6 +60,7 @@ class ConversationManager:
                  script_image_force_window_size: bool = True,
                  script_image_force_resize_image: bool = False,
                  no_face_response_timeout_seconds: float = 10.0,
+                 tts_playback_handler: Optional[Callable[[str], None]] = None,
                  ros2_bridge=None):
         """
         初始化对话管理器
@@ -110,6 +111,7 @@ class ConversationManager:
         self.streaming = streaming
         self.expression = expression_module
         self.ros2_bridge = ros2_bridge
+        self.tts_playback_handler = tts_playback_handler
         self._robot_status = None
         self.audio_recorder = audio_recorder
         self.audio_min_duration = audio_min_duration
@@ -287,6 +289,18 @@ class ConversationManager:
             set_status(self._robot_status_text(status))
         except Exception as e:
             logger.debug(f"更新机器人状态文字失败: {e}")
+
+    def _set_mouth_speaking(self, speaking: bool) -> None:
+        """更新表情窗口的嘴部说话动画。"""
+        if not self.expression or not self.expression.is_available:
+            return
+        set_mouth_speaking = getattr(self.expression, "set_mouth_speaking", None)
+        if not callable(set_mouth_speaking):
+            return
+        try:
+            set_mouth_speaking(bool(speaking))
+        except Exception as e:
+            logger.debug(f"更新嘴部说话动画失败: {e}")
 
     def _current_idle_robot_status(self) -> str:
         if self._sleep_mode:
@@ -1436,8 +1450,13 @@ class ConversationManager:
         if self.audio_recorder:
             self.audio_recorder.is_tts_playing = True
         try:
-            self.tts.synthesize(text, play_audio=True)
+            self._set_mouth_speaking(True)
+            if self.tts_playback_handler is not None:
+                self.tts_playback_handler(text)
+            else:
+                self.tts.synthesize(text, play_audio=True)
         finally:
+            self._set_mouth_speaking(False)
             if self.audio_recorder:
                 self.audio_recorder.is_tts_playing = False
             self._restore_idle_robot_status()
@@ -2135,11 +2154,13 @@ class ConversationManager:
                 tts_start = time.perf_counter()
                 self._set_robot_status("speaking")
                 try:
+                    self._set_mouth_speaking(True)
                     self.tts.synthesize(_stream_with_capture(), play_audio=True)
                     tts_elapsed = time.perf_counter() - tts_start
                     self._print_stage_timing("TTS合成", tts_elapsed)
                     tts_played_in_streaming = True
                 finally:
+                    self._set_mouth_speaking(False)
                     if self.audio_recorder:
                         logger.debug("设置 is_tts_playing = False")
                         self.audio_recorder.is_tts_playing = False
@@ -2226,12 +2247,17 @@ class ConversationManager:
             tts_start = time.perf_counter()
             self._set_robot_status("speaking")
             try:
+                self._set_mouth_speaking(True)
                 logger.debug("开始调用 tts.synthesize()")
-                self.tts.synthesize(response, play_audio=True)
+                if self.tts_playback_handler is not None:
+                    self.tts_playback_handler(response)
+                else:
+                    self.tts.synthesize(response, play_audio=True)
                 tts_elapsed = time.perf_counter() - tts_start
                 self._print_stage_timing("TTS合成", tts_elapsed)
                 logger.debug("tts.synthesize() 返回")
             finally:
+                self._set_mouth_speaking(False)
                 # 先恢复录音器状态，daemon 监听器自动退出，无需显式 stop()
                 if self.audio_recorder:
                     logger.debug("设置 is_tts_playing = False")
@@ -2382,6 +2408,50 @@ class ConversationManager:
             self._restore_idle_robot_status()
             logger.error(f"文本对话处理出错: {e}", exc_info=True)
             print(f"❌ 处理出错: {e}")
+
+    def process_recognized_text(self, user_text: str) -> None:
+        """处理外部语音前端已经识别出的文本。"""
+        try:
+            if not user_text or user_text.strip() == "":
+                print(self._msg("⚠️ 未识别到有效内容,请重试", "⚠️ No valid speech recognized, please try again"))
+                return
+
+            user_text = user_text.strip()
+            self._mark_asr_activity()
+            print(f"👤 {self._msg('您说', 'You said')}: {user_text}")
+            self._set_heard_text(user_text)
+            if self.ros2_bridge is not None:
+                try:
+                    self.ros2_bridge.publish_asr_text(user_text)
+                except Exception as e:
+                    logger.debug(f"发布 ASR 文本到 ROS2 失败: {e}")
+
+            if self._handle_visualizer_toggle_voice_command(user_text):
+                return
+
+            if self._handle_mode_toggle_voice_command(user_text):
+                return
+
+            if self._sleep_mode or self._script_mode:
+                logger.debug("当前在睡眠/脚本模式，忽略非模式切换语音输入")
+                if self._script_mode:
+                    print(self._msg("🎬 脚本模式进行中：可说“别介绍了”退出", "🎬 Script mode active: say 'stop the introduction' to exit"))
+                elif self._sleep_mode:
+                    print(self._msg("😴 睡眠模式中：可说“可以说话了”唤醒", "😴 Sleep mode active: say 'can speak' to wake"))
+                return
+
+            if self._maybe_trigger_script_mode(user_text):
+                return
+            if not self._handle_continuous_mode_command(user_text):
+                return
+
+            self._process_user_text(user_text)
+        except Exception as e:
+            self._restore_idle_robot_status()
+            logger.error(f"语音文本对话处理出错: {e}", exc_info=True)
+            print(f"❌ 处理出错: {e}")
+        finally:
+            self._clear_heard_text()
     
     def process_audio_async(self, audio_data: np.ndarray) -> None:
         """

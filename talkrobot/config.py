@@ -89,19 +89,19 @@ class Config:
             "name": "music_demo",
             "file": "music.json",
             "key": None,
-            "keywords": {"zh": ["音乐演示"], "en": ["music demo"]},
+            "keywords": {"zh": ["播放音乐"], "en": ["music demo","play music"]},
         },
         {
             "name": "sing_lzlh",
             "file": "lzlh.json",
             "key": None,
-            "keywords": {"zh": ["唱首歌"], "en": ["sing a song"]},
+            "keywords": {"zh": ["唱首儿歌"], "en": ["sing a song","begin singing","play kids"]},
         },
         {
             "name": "bjea_intro",
             "file": "bjea.json",
             "key": None,
-            "keywords": {"zh": ["介绍亦庄实验中学"], "en": ["introduce bj ea middle school"]},
+            "keywords": {"zh": ["介绍亦庄实验中学"], "en": ["introduce bjea middle school"]},
         },
     ]
 
@@ -136,6 +136,32 @@ class Config:
     # 对讲机模式配置（阈值按 int16 幅值）
     INTERCOM_PTT_TRIGGER_THRESHOLD = 10000
     INTERCOM_PTT_DEBOUNCE_TIME = 0.2
+
+    # Duplex 语音模式配置：AEC + VAD + ASR + EOT + 语音打断
+    DUPLEX_AEC_ENABLED = True
+    DUPLEX_AEC_STREAM_DELAY_MS = 120
+    DUPLEX_AEC_FRAME_MS = 10
+    DUPLEX_AEC_LATENCY = "high"
+    DUPLEX_AEC_HIGH_PASS_FILTER = True
+    DUPLEX_AEC_NOISE_SUPPRESSION = False
+    DUPLEX_AEC_AUTO_GAIN_CONTROL = False
+    # WebRTC VAD aggressiveness: 0 least aggressive, 3 most aggressive
+    DUPLEX_WEBRTC_VAD_MODE = 2
+    DUPLEX_VAD_ACTIVATION_THRESHOLD = 0.5
+    DUPLEX_SHORT_SILENCE_SECONDS = 0.35
+    DUPLEX_EXTRA_WAIT_SECONDS = 2.0
+    DUPLEX_PRE_SPEECH_PADDING_SECONDS = 0.4
+    DUPLEX_MIN_SEGMENT_SECONDS = 0.1
+    DUPLEX_INTERRUPT_VAD_THRESHOLD = 0.75
+    DUPLEX_INTERRUPT_MIN_SPEECH_SECONDS = 0.25
+    DUPLEX_INTERRUPT_MAX_SECONDS = 30.0
+
+    # FireRedChat EOT 配置
+    EOT_REPO_ID = "FireRedTeam/FireRedChat-turn-detector"
+    EOT_MODEL_FILE = "chinese_best_model_q8.onnx"
+    EOT_TOKENIZER = "google-bert/bert-base-multilingual-cased"
+    EOT_THRESHOLD = 0.7
+    EOT_MAX_LENGTH = 128
     
     # 音频过滤配置（ASR 前置检查）
     AUDIO_MIN_DURATION = 0          # 最短音频时长（秒），低于此值不送 ASR
@@ -150,12 +176,12 @@ class Config:
     LANGUAGE = "en"  # 统一语言开关，可选: zh / en（同时作用于TTS和LLM）
     TTS_LANG_CODE = 'e'  # 英文
     TTS_VOICE = 'zf_xiaoyi'
-    TTS_SPEED = 1
+    TTS_SPEED = 1 # 语速，0.1~2.0，默认1.0
     TTS_PLAYBACK_SPEED = 1.0  # 播放速度倍率，<1.0 更慢，>1.0 更快
     TTS_SAMPLE_RATE = 24000
     
     # LLM 配置
-    LLM_API_KEY = "api-key = sk-d52f47086a8547f3948305790c408beb"
+    LLM_API_KEY = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     LLM_MODEL = "qwen-flash"#"qwen-plus"
     
@@ -172,7 +198,7 @@ class Config:
     FACE_MODEL_NAME = "buffalo_s"
     FACE_RECOGNITION_THRESHOLD = 0.3
     # continuous 响应模式下，视野无人脸且机器人说完后多久未收到 ASR 就退出响应模式；<=0 表示禁用
-    FACE_NO_RESPONSE_TIMEOUT_SECONDS = 0
+    FACE_NO_RESPONSE_TIMEOUT_SECONDS = 300
     FACE_UNKNOWN_USER = "guest"
     FACE_KNOWN_FACES_DIR = os.path.join(
         os.path.dirname(__file__),

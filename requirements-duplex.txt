@@ -1,0 +1,9 @@
+# Duplex voice mode dependencies:
+#   .venv/bin/python -m pip install -r requirements-duplex.txt
+numpy
+sounddevice
+webrtcvad-wheels
+onnxruntime
+huggingface_hub
+transformers
+livekit

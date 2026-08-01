@@ -129,6 +129,30 @@ class ExpressionModule:
             logger.error(f"设置表情录像提示请求出错: {e}")
             return False
 
+    def set_mouth_speaking(self, speaking: bool) -> bool:
+        """
+        设置表情窗口的嘴部说话动画叠加层。
+
+        Args:
+            speaking: True 开启嘴部动画，False 关闭
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self._available:
+            return False
+        state = "true" if speaking else "false"
+        try:
+            resp = requests.post(f"{self.server_url}/mouth/{state}", timeout=3)
+            if resp.status_code == 200:
+                logger.debug(f"嘴部说话动画已{'开启' if speaking else '关闭'}")
+                return True
+            logger.warning(f"设置嘴部说话动画失败: speaking={speaking}, status={resp.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"设置嘴部说话动画请求出错: {e}")
+            return False
+
     def set_status(self, status: str, visible: bool = True) -> bool:
         """
         设置表情窗口的机器人状态文字叠加层。

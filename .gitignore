@@ -3,11 +3,13 @@ talkrobot/mem_db/
 talkrobot/logs/
 talkrobot/__pycache__/
 talkrobot/**/__pycache__/
+talkrobot/resources/
 agent/
 talkrobot/modules/face_recognize/known_faces/
 expression_video/*.mp4
 note.txt
 script/assets/
 script/pictures/
+video/
 .DS_Store
 *.pyc
