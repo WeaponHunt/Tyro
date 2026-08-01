@@ -10,6 +10,7 @@ expression_video/*.mp4
 note.txt
 script/assets/
 script/pictures/
+script/
 video/
 .DS_Store
 *.pyc
